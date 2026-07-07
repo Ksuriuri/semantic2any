@@ -1,0 +1,26 @@
+[project]
+name = "semantic2any"
+version = "0.1.0"
+description = "IndexTTS2.5-style semantic-to-mel flow matching training with a ZipFormer estimator."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate",
+    "numpy",
+    "omegaconf",
+    "safetensors",
+    "torch",
+    "torchaudio",
+    "tqdm",
+    "transformers",
+]
+
+[project.scripts]
+train-s2mel-zipformer = "trainers.train_s2mel_zipformer:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["semantic2any*", "trainers*"]
