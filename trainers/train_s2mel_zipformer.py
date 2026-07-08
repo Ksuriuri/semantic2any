@@ -19,7 +19,11 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
-from semantic2any.data.s2mel_dataset import S2MelCollator, S2MelJsonlDataset
+from semantic2any.data.s2mel_dataset import (
+    S2MelCollator,
+    S2MelJsonlDataset,
+    S2MelSpeechDataDataset,
+)
 from semantic2any.models import Semantic2MelModel
 from semantic2any.utils.checkpoint import load_compatible_checkpoint, save_compatible_checkpoint
 from semantic2any.utils.indextts_adapters import IndexTTSFeatureAdapter, move_feature_batch_to_device
@@ -34,6 +38,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="configs/s2mel_zipformer.yaml")
     parser.add_argument("--train-jsonl", default=None)
     parser.add_argument("--valid-jsonl", default=None)
+    parser.add_argument("--train-speechdata-dir", default=None)
+    parser.add_argument("--valid-speechdata-dir", default=None)
+    parser.add_argument("--speechdata-cache-dir", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--indextts-root", default=None)
     parser.add_argument("--model-dir", default=None)
@@ -51,6 +58,12 @@ def apply_overrides(cfg, args: argparse.Namespace):
         cfg.data.train_jsonl = args.train_jsonl
     if args.valid_jsonl is not None:
         cfg.data.valid_jsonl = args.valid_jsonl
+    if args.train_speechdata_dir is not None:
+        cfg.data.train_speechdata_dir = args.train_speechdata_dir
+    if args.valid_speechdata_dir is not None:
+        cfg.data.valid_speechdata_dir = args.valid_speechdata_dir
+    if args.speechdata_cache_dir is not None:
+        cfg.data.speechdata_cache_dir = args.speechdata_cache_dir
     if args.output_dir is not None:
         cfg.train.output_dir = args.output_dir
     if args.indextts_root is not None:
@@ -79,8 +92,25 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def make_dataloader(cfg, manifest: str, shuffle: bool) -> DataLoader:
-    dataset = S2MelJsonlDataset(manifest)
+def _looks_like_speechdata_source(source: str) -> bool:
+    if source.startswith("gs://"):
+        return True
+    path = Path(source).expanduser()
+    if path.is_file():
+        return path.parent.name == "metadata"
+    if path.is_dir():
+        return (path / "metadata").is_dir() or path.name == "metadata"
+    return False
+
+
+def make_dataloader(cfg, source: str, shuffle: bool, *, speechdata: bool = False) -> DataLoader:
+    if speechdata or _looks_like_speechdata_source(source):
+        dataset = S2MelSpeechDataDataset(
+            source,
+            cache_dir=_get(cfg.data, "speechdata_cache_dir", None),
+        )
+    else:
+        dataset = S2MelJsonlDataset(source)
     spect = cfg.preprocess_params.spect_params
     collator = S2MelCollator(
         hop_length=int(spect.hop_length),
@@ -103,6 +133,13 @@ def make_dataloader(cfg, manifest: str, shuffle: bool) -> DataLoader:
         drop_last=shuffle,
         **kwargs,
     )
+
+
+def _split_source(cfg, split: str) -> tuple[str, bool]:
+    speechdata_source = str(_get(cfg.data, f"{split}_speechdata_dir", "") or "")
+    if speechdata_source:
+        return speechdata_source, True
+    return str(_get(cfg.data, f"{split}_jsonl", "") or ""), False
 
 
 def rotate_checkpoints(output_dir: Path, keep_last: int) -> None:
@@ -193,8 +230,13 @@ def save_training_checkpoint(
 def main() -> None:
     args = parse_args()
     cfg = apply_overrides(OmegaConf.load(args.config), args)
-    if not cfg.data.train_jsonl:
-        raise ValueError("Set data.train_jsonl or pass --train-jsonl")
+    train_source, train_is_speechdata = _split_source(cfg, "train")
+    valid_source, valid_is_speechdata = _split_source(cfg, "valid")
+    if not train_source:
+        raise ValueError(
+            "Set data.train_jsonl/data.train_speechdata_dir or pass "
+            "--train-jsonl/--train-speechdata-dir"
+        )
 
     set_seed(int(cfg.seed))
     accelerator = Accelerator(
@@ -203,9 +245,19 @@ def main() -> None:
         log_with=None if bool(cfg.train.no_wandb) else "wandb",
     )
     if not bool(cfg.train.no_wandb):
+        wandb_project = str(_get(cfg.train, "wandb_project", "semantic2mel") or "semantic2mel")
+        wandb_entity = str(_get(cfg.train, "wandb_entity", "") or "")
+        wandb_run_name = str(_get(cfg.train, "wandb_run_name", "") or "")
+        wandb_kwargs = {}
+        if wandb_entity:
+            wandb_kwargs["entity"] = wandb_entity
+        if wandb_run_name:
+            wandb_kwargs["name"] = wandb_run_name
+        tracker_kwargs = {"init_kwargs": {"wandb": wandb_kwargs}} if wandb_kwargs else {}
         accelerator.init_trackers(
-            "semantic2any-s2mel",
+            wandb_project,
             config=OmegaConf.to_container(cfg, resolve=True),
+            **tracker_kwargs,
         )
 
     output_dir = Path(cfg.train.output_dir)
@@ -214,8 +266,10 @@ def main() -> None:
         OmegaConf.save(cfg, output_dir / "config.resolved.yaml")
     accelerator.wait_for_everyone()
 
-    train_loader = make_dataloader(cfg, cfg.data.train_jsonl, shuffle=True)
-    valid_loader = make_dataloader(cfg, cfg.data.valid_jsonl, shuffle=False) if cfg.data.valid_jsonl else None
+    train_loader = make_dataloader(cfg, train_source, shuffle=True, speechdata=train_is_speechdata)
+    valid_loader = (
+        make_dataloader(cfg, valid_source, shuffle=False, speechdata=valid_is_speechdata) if valid_source else None
+    )
 
     model = Semantic2MelModel(cfg.s2mel)
     resume_from = str(cfg.train.resume_from or "")

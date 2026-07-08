@@ -1,0 +1,5 @@
+[Feature] Initializing frozen IndexTTS feature adapter
+/mnt/data_sdd/hhy/noiz-tts/semantic2any/.venv/lib/python3.13/site-packages/torch/nn/utils/weight_norm.py:144: FutureWarning: `torch.nn.utils.weight_norm` is deprecated in favor of `torch.nn.utils.parametrizations.weight_norm`.
+  WeightNorm.apply(module, name, dim)
+[Train] epoch=1 step=20 loss=7.21371 lr=2.000e-06
+[Train] epoch=1 step=40 loss=7.57114 lr=4.000e-06

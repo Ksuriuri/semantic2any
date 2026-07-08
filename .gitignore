@@ -6,6 +6,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+.cache/
 
 exp/
 outputs/
@@ -13,5 +14,8 @@ checkpoints/
 *.pth
 *.pt
 *.safetensors
+
+gcs-key.json
+key.json
 
 .DS_Store

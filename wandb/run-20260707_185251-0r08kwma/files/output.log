@@ -1,0 +1,51 @@
+Traceback (most recent call last):
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/trainers/train_s2mel_zipformer.py", line 383, in <module>
+    main()
+    ~~~~^^
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/trainers/train_s2mel_zipformer.py", line 313, in main
+    for raw_batch in train_loader:
+                     ^^^^^^^^^^^^
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/.venv/lib/python3.13/site-packages/accelerate/data_loader.py", line 585, in __iter__
+    current_batch = next(dataloader_iter)
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/.venv/lib/python3.13/site-packages/torch/utils/data/dataloader.py", line 718, in __next__
+    data = self._next_data()
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/.venv/lib/python3.13/site-packages/torch/utils/data/dataloader.py", line 1525, in _next_data
+    return self._process_data(data, worker_id)
+           ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/.venv/lib/python3.13/site-packages/torch/utils/data/dataloader.py", line 1563, in _process_data
+    data.reraise()
+    ~~~~~~~~~~~~^^
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/.venv/lib/python3.13/site-packages/torch/_utils.py", line 774, in reraise
+    raise exception
+RuntimeError: Caught RuntimeError in DataLoader worker process 0.
+Original Traceback (most recent call last):
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/.venv/lib/python3.13/site-packages/torch/utils/data/_utils/worker.py", line 374, in _worker_loop
+    data = fetcher.fetch(index)  # type: ignore[possibly-undefined]
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/.venv/lib/python3.13/site-packages/torch/utils/data/_utils/fetch.py", line 54, in fetch
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+            ~~~~~~~~~~~~^^^^^
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/semantic2any/data/s2mel_dataset.py", line 162, in __getitem__
+    record["audio_path"] = self._materialize_audio(record["_speechdata_root"], audio_path)
+                           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/semantic2any/data/s2mel_dataset.py", line 250, in _materialize_audio
+    local_tar_path = self._local_tar_path(tar_path)
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/semantic2any/data/s2mel_dataset.py", line 277, in _local_tar_path
+    with self._open_binary(tar_path) as in_file, tmp_path.open("wb") as out_file:
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/semantic2any/data/s2mel_dataset.py", line 179, in _open_binary
+    return self._get_fs().open(_strip_gcs_scheme(path), "rb")
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/.venv/lib/python3.13/site-packages/fsspec/spec.py", line 1358, in open
+    f = self._open(
+        path,
+    ...<4 lines>...
+        **kwargs,
+    )
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/.venv/lib/python3.13/site-packages/gcsfs/extended_gcsfs.py", line 339, in _open
+    bucket_type = self._sync_lookup_bucket_type(bucket)
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/.venv/lib/python3.13/site-packages/fsspec/asyn.py", line 118, in wrapper
+    return sync(self.loop, func, *args, **kwargs)
+                ^^^^^^^^^
+  File "/mnt/data_sdd/hhy/noiz-tts/semantic2any/.venv/lib/python3.13/site-packages/fsspec/asyn.py", line 356, in loop
+    raise RuntimeError("This class is not fork-safe")
+RuntimeError: This class is not fork-safe

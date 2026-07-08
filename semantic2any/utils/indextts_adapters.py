@@ -105,7 +105,7 @@ class IndexTTSFeatureAdapter(nn.Module):
             str(w2v_bert_dir), local_files_only=True
         )
         semantic_model, semantic_mean, semantic_std = build_semantic_model(
-            str(w2v_stat), model_path=str(w2v_bert_dir)
+            str(w2v_stat), bert_path=str(w2v_bert_dir)
         )
         self.semantic_model = semantic_model.eval()
         self.register_buffer("semantic_mean", semantic_mean.float())

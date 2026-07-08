@@ -42,6 +42,35 @@ Tensor conventions:
   discrete codebooks when using a discrete length regulator
 - `style`: `[192]`
 
+## SpeechData Shards
+
+The ZipFormer trainer can also read normalized SpeechData outputs with this
+layout:
+
+```text
+<dataset>/
+  audio/<dataset>-000000.tar
+  metadata/<dataset>-000000.jsonl
+```
+
+Each metadata row should contain `audio_path` like
+`audio/<dataset>-000000.tar/<sample_id>.flac`. The trainer extracts tar members
+to a local cache and then reuses the existing online IndexTTS feature extractor:
+
+```bash
+accelerate launch trainers/train_s2mel_zipformer.py \
+  --config configs/s2mel_zipformer.yaml \
+  --train-speechdata-dir gs://noiz-taiwan-audio-data/preprocessed/expresso \
+  --speechdata-cache-dir /tmp/semantic2any-speechdata \
+  --output-dir exp/s2mel_zipformer-expresso
+```
+
+For local shards, pass the local dataset directory instead, for example
+`/mnt/data_3t_2/datasets/raw_data/preprocessed/expresso`.
+
+See `docs/gcs-datasets.md` for GCS authentication, dataset layout, and training
+examples.
+
 ## Train
 
 ```bash
