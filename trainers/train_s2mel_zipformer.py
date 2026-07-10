@@ -24,6 +24,7 @@ from semantic2any.data.s2mel_dataset import (
     S2MelCollator,
     S2MelInMemoryDataset,
     S2MelJsonlDataset,
+    S2MelSpeakerPairedDataset,
     S2MelSpeechDataDataset,
 )
 from semantic2any.models import Semantic2MelModel
@@ -143,6 +144,8 @@ def make_dataloader(
         min_prompt_seconds=float(cfg.data.min_prompt_seconds),
         max_prompt_seconds=float(cfg.data.max_prompt_seconds),
         min_generated_frames=int(cfg.data.min_generated_frames),
+        max_pair_seconds=float(_get(cfg.data, "max_pair_seconds", 30.0)),
+        min_pair_prompt_seconds=float(_get(cfg.data, "min_pair_prompt_seconds", 3.0)),
     )
     kwargs: dict[str, Any] = {}
     if int(cfg.data.num_workers) > 0:
@@ -217,6 +220,22 @@ def preload_dataset_features(
     return S2MelInMemoryDataset(records)
 
 
+def make_speaker_paired_dataset(
+    cfg,
+    dataset: Dataset,
+    *,
+    fallback_prompt_dataset: Dataset | None = None,
+) -> S2MelSpeakerPairedDataset:
+    spect = cfg.preprocess_params.spect_params
+    return S2MelSpeakerPairedDataset(
+        dataset,
+        min_prompt_seconds=float(_get(cfg.data, "min_pair_prompt_seconds", 3.0)),
+        hop_length=int(spect.hop_length),
+        sample_rate=int(cfg.preprocess_params.sr),
+        fallback_prompt_dataset=fallback_prompt_dataset,
+    )
+
+
 def rotate_checkpoints(output_dir: Path, keep_last: int) -> None:
     if keep_last <= 0:
         return
@@ -281,6 +300,11 @@ def build_training_batch(
             print("[Feature] Initializing frozen IndexTTS feature adapter")
         feature_adapter_ref[0] = IndexTTSFeatureAdapter(cfg).to(accelerator.device)
         feature_adapter_ref[0].eval()
+    if batch.get("is_paired", False):
+        return feature_adapter_ref[0].extract_paired_from_audio_paths(
+            batch["prompt_audio_paths"],
+            batch["target_audio_paths"],
+        )
     return feature_adapter_ref[0].extract_from_audio_paths(batch["audio_paths"])
 
 
@@ -293,6 +317,7 @@ def forward_loss(model, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         batch["style"],
         semantic_is_mu=False,
         semantic_lens=batch.get("semantic_lens"),
+        prompt_semantic_lens=batch.get("prompt_semantic_lens"),
     )
     return loss
 
@@ -438,6 +463,28 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         accelerator.wait_for_everyone()
+
+    if bool(_get(cfg.data, "pair_same_speaker", True)):
+        train_prompt_dataset = train_dataset
+        valid_prompt_dataset = valid_dataset
+        train_dataset = make_speaker_paired_dataset(cfg, train_prompt_dataset)
+        if valid_prompt_dataset is not None:
+            valid_dataset = make_speaker_paired_dataset(
+                cfg,
+                valid_prompt_dataset,
+                fallback_prompt_dataset=train_prompt_dataset,
+            )
+        if accelerator.is_main_process:
+            print(
+                f"[Pairing] train: {len(train_dataset)} same-speaker targets; "
+                f"missing speaker_id: {train_dataset.missing_speaker_count}"
+            )
+            if valid_dataset is not None:
+                print(
+                    f"[Pairing] valid: {len(valid_dataset)} same-speaker targets; "
+                    f"train-prompt fallbacks: {valid_dataset.fallback_target_count}; "
+                    f"missing speaker_id: {valid_dataset.missing_speaker_count}"
+                )
 
     train_loader = make_dataloader(
         cfg,

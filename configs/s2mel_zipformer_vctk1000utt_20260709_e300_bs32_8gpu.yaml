@@ -14,7 +14,10 @@ data:
   train_speechdata_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/datasets/vctk_10pct_speaker_stratified/metadata/vctk_train_minus_test_1000utt_speaker_stratified_seed1234.jsonl
   valid_speechdata_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/datasets/vctk_10pct_speaker_stratified/metadata/vctk_test_10pct.jsonl
   speechdata_cache_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/.cache/speechdata
-  max_audio_seconds: 20.0
+  max_audio_seconds: 30.0
+  pair_same_speaker: true
+  max_pair_seconds: 30.0
+  min_pair_prompt_seconds: 3.0
   min_prompt_seconds: 1.0
   max_prompt_seconds: 5.0
   min_generated_frames: 8

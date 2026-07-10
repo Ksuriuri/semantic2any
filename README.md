@@ -18,11 +18,20 @@ checkout. By default it expects `/mnt/data_sdd/hhy/index-tts`; override this wit
 
 ## Manifest
 
-Training reads JSONL. The simplest record is:
+Training reads JSONL. Same-speaker pairing is enabled by default, so every row
+must include `speaker_id`; `duration` is recommended so references shorter than
+the configured three-second minimum can be filtered before loading:
 
 ```json
-{"audio_path": "/path/to/audio.wav"}
+{"audio_path": "/path/to/audio.wav", "speaker_id": "speaker-001", "duration": 4.2}
 ```
+
+Each target is paired at runtime with a different utterance carrying the same
+`speaker_id`. The reference mel and style come from that prompt utterance, while
+the generated suffix comes from the target. Their combined duration is capped
+at 30 seconds: the prompt is shortened first but never below three seconds,
+then the target is shortened if necessary. Set `data.pair_same_speaker: false`
+to retain the legacy single-utterance random-prefix behavior.
 
 Optional precomputed fields are supported for faster iteration:
 
@@ -54,8 +63,9 @@ layout:
 ```
 
 Each metadata row should contain `audio_path` like
-`audio/<dataset>-000000.tar/<sample_id>.flac`. The trainer extracts tar members
-to a local cache and then reuses the existing online IndexTTS feature extractor:
+`audio/<dataset>-000000.tar/<sample_id>.flac`, plus `speaker_id` and preferably
+`duration` for same-speaker pairing. The trainer extracts tar members to a local
+cache and then reuses the existing online IndexTTS feature extractor:
 
 ```bash
 accelerate launch trainers/train_s2mel_zipformer.py \
@@ -72,6 +82,17 @@ See `docs/gcs-datasets.md` for GCS authentication, dataset layout, and training
 examples.
 
 ## Train
+
+Run all training and other long-running jobs in a descriptively named `tmux`
+session so they survive terminal or Cursor disconnections. Check existing
+sessions first to avoid duplicate jobs:
+
+```bash
+tmux list-sessions
+tmux new-session -s s2mel-train
+```
+
+Detach with `Ctrl-b d` and reconnect with `tmux attach -t s2mel-train`.
 
 ```bash
 accelerate launch trainers/train_s2mel_zipformer.py \

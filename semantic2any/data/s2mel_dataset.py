@@ -6,6 +6,7 @@ import os
 import random
 import shutil
 import tarfile
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +91,71 @@ def choose_prompt_len(
     if upper <= min_frames:
         return max(1, min(upper, mel_len - 1))
     return random.randint(min_frames, upper)
+
+
+def trim_paired_feature_lengths(
+    prompt_mel_frames: int,
+    target_mel_frames: int,
+    prompt_semantic_frames: int,
+    target_semantic_frames: int,
+    *,
+    hop_length: int,
+    sample_rate: int,
+    max_pair_seconds: float,
+    min_prompt_seconds: float,
+    min_generated_frames: int,
+) -> tuple[int, int, int, int]:
+    """Return prefix lengths after enforcing the paired-audio duration budget."""
+    max_total_frames = max(1, int(max_pair_seconds * sample_rate / hop_length))
+    min_prompt_frames = max(1, int(min_prompt_seconds * sample_rate / hop_length))
+    if max_total_frames < min_prompt_frames + min_generated_frames:
+        raise ValueError(
+            "max_pair_seconds is too small for min_pair_prompt_seconds plus "
+            "min_generated_frames"
+        )
+    if prompt_mel_frames < min_prompt_frames:
+        raise ValueError(
+            f"Prompt has {prompt_mel_frames} mel frames, fewer than the required "
+            f"{min_prompt_frames}"
+        )
+    if target_mel_frames < min_generated_frames:
+        raise ValueError(
+            f"Target has {target_mel_frames} mel frames, fewer than the required "
+            f"{min_generated_frames}"
+        )
+    if prompt_semantic_frames <= 0 or target_semantic_frames <= 0:
+        raise ValueError("Prompt and target semantic features must not be empty")
+
+    original_prompt_frames = prompt_mel_frames
+    original_target_frames = target_mel_frames
+    excess = max(0, prompt_mel_frames + target_mel_frames - max_total_frames)
+
+    prompt_trim = min(excess, prompt_mel_frames - min_prompt_frames)
+    prompt_mel_frames -= prompt_trim
+    excess -= prompt_trim
+    if excess:
+        target_mel_frames -= excess
+    if target_mel_frames < min_generated_frames:
+        raise ValueError(
+            "Paired sample cannot fit the duration budget while retaining the "
+            "minimum prompt and target lengths"
+        )
+
+    def scaled_semantic_length(length: int, kept_mel: int, original_mel: int) -> int:
+        if kept_mel >= original_mel:
+            return length
+        return max(1, min(length, round(length * kept_mel / original_mel)))
+
+    return (
+        prompt_mel_frames,
+        target_mel_frames,
+        scaled_semantic_length(
+            prompt_semantic_frames, prompt_mel_frames, original_prompt_frames
+        ),
+        scaled_semantic_length(
+            target_semantic_frames, target_mel_frames, original_target_frames
+        ),
+    )
 
 
 class S2MelJsonlDataset(Dataset):
@@ -297,6 +363,289 @@ class S2MelInMemoryDataset(Dataset):
         return self.records[index]
 
 
+def _dataset_records(dataset: Dataset) -> list[dict[str, Any]]:
+    records = getattr(dataset, "records", None)
+    if not isinstance(records, list):
+        raise TypeError("Speaker pairing requires a dataset with an in-memory records list")
+    return records
+
+
+def _record_identity(record: dict[str, Any], index: int) -> str:
+    for key in ("id", "_speechdata_audio_path", "audio_path"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return f"{key}:{value}"
+    return f"index:{index}"
+
+
+def _record_can_be_prompt(
+    record: dict[str, Any],
+    *,
+    min_prompt_seconds: float,
+    hop_length: int,
+    sample_rate: int,
+) -> bool:
+    mel = record.get("mel")
+    if isinstance(mel, torch.Tensor):
+        min_frames = max(1, int(min_prompt_seconds * sample_rate / hop_length))
+        return mel.size(-1) >= min_frames
+    duration = record.get("duration")
+    if isinstance(duration, (int, float)):
+        return float(duration) >= min_prompt_seconds
+    # Generic manifests do not require duration. The collator performs the
+    # authoritative frame-level check once their features are available.
+    return True
+
+
+class S2MelSpeakerPairedDataset(Dataset):
+    """Pair every target with a distinct prompt utterance from the same speaker."""
+
+    def __init__(
+        self,
+        target_dataset: Dataset,
+        *,
+        min_prompt_seconds: float,
+        hop_length: int,
+        sample_rate: int,
+        fallback_prompt_dataset: Dataset | None = None,
+    ) -> None:
+        self.target_dataset = target_dataset
+        self.fallback_prompt_dataset = fallback_prompt_dataset
+        target_records = _dataset_records(target_dataset)
+
+        def build_prompt_groups(dataset: Dataset) -> dict[str, list[tuple[Dataset, int, str]]]:
+            groups: dict[str, list[tuple[Dataset, int, str]]] = defaultdict(list)
+            for index, record in enumerate(_dataset_records(dataset)):
+                speaker_id = record.get("speaker_id")
+                if not isinstance(speaker_id, str) or not speaker_id:
+                    continue
+                if not _record_can_be_prompt(
+                    record,
+                    min_prompt_seconds=min_prompt_seconds,
+                    hop_length=hop_length,
+                    sample_rate=sample_rate,
+                ):
+                    continue
+                groups[speaker_id].append((dataset, index, _record_identity(record, index)))
+            return groups
+
+        local_groups = build_prompt_groups(target_dataset)
+        fallback_groups = (
+            build_prompt_groups(fallback_prompt_dataset)
+            if fallback_prompt_dataset is not None and fallback_prompt_dataset is not target_dataset
+            else {}
+        )
+
+        self.target_indices: list[int] = []
+        self.prompt_candidates: list[list[tuple[Dataset, int]]] = []
+        self.fallback_target_count = 0
+        self.missing_speaker_count = 0
+        for target_index, target_record in enumerate(target_records):
+            speaker_id = target_record.get("speaker_id")
+            if not isinstance(speaker_id, str) or not speaker_id:
+                self.missing_speaker_count += 1
+                continue
+            target_identity = _record_identity(target_record, target_index)
+            candidates = [
+                (dataset, index)
+                for dataset, index, identity in local_groups.get(speaker_id, [])
+                if identity != target_identity
+            ]
+            used_fallback = False
+            if not candidates:
+                candidates = [
+                    (dataset, index)
+                    for dataset, index, identity in fallback_groups.get(speaker_id, [])
+                    if identity != target_identity
+                ]
+                used_fallback = bool(candidates)
+            if not candidates:
+                continue
+            self.target_indices.append(target_index)
+            self.prompt_candidates.append(candidates)
+            self.fallback_target_count += int(used_fallback)
+
+        if not self.target_indices:
+            raise ValueError(
+                "No same-speaker prompt/target pairs are available. Each target needs "
+                "speaker_id and a distinct prompt utterance of at least "
+                f"{min_prompt_seconds:g} seconds."
+            )
+
+    def __len__(self) -> int:
+        return len(self.target_indices)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        target_index = self.target_indices[index]
+        prompt_dataset, prompt_index = random.choice(self.prompt_candidates[index])
+        prompt = prompt_dataset[prompt_index]
+        target = self.target_dataset[target_index]
+        return {
+            "prompt": prompt,
+            "target": target,
+            "speaker_id": target["speaker_id"],
+        }
+
+
+def _normalize_mel(mel: torch.Tensor) -> torch.Tensor:
+    mel = mel.float()
+    if mel.ndim == 3 and mel.size(0) == 1:
+        mel = mel.squeeze(0)
+    if mel.ndim != 2:
+        raise ValueError(f"mel must be [channels, T], got {tuple(mel.shape)}")
+    return mel
+
+
+def _normalize_semantic(semantic: torch.Tensor) -> torch.Tensor:
+    if torch.is_floating_point(semantic):
+        if semantic.ndim == 3 and semantic.size(0) == 1:
+            semantic = semantic.squeeze(0)
+        if semantic.ndim != 2:
+            raise ValueError(f"Continuous semantic must be [T, C], got {tuple(semantic.shape)}")
+        return semantic
+    if semantic.ndim == 1:
+        semantic = semantic.unsqueeze(0)
+    if semantic.ndim != 2:
+        raise ValueError(f"Discrete semantic must be [Q, T], got {tuple(semantic.shape)}")
+    return semantic
+
+
+def _semantic_length(semantic: torch.Tensor) -> int:
+    return semantic.size(0) if torch.is_floating_point(semantic) else semantic.size(-1)
+
+
+def _load_record_features(record: dict[str, Any]) -> dict[str, torch.Tensor]:
+    mel_value = record.get("mel")
+    semantic_value = record.get("semantic")
+    style_value = record.get("style")
+    mel = mel_value if isinstance(mel_value, torch.Tensor) else _load_tensor(record["mel_path"])
+    semantic = (
+        semantic_value
+        if isinstance(semantic_value, torch.Tensor)
+        else _load_tensor(record["semantic_path"])
+    )
+    style = style_value if isinstance(style_value, torch.Tensor) else _load_tensor(record["style_path"])
+    style = style.float().view(-1)
+    if style.numel() != 192:
+        raise ValueError(f"style must contain 192 values, got {style.numel()}")
+    return {
+        "mel": _normalize_mel(mel),
+        "semantic": _normalize_semantic(semantic),
+        "style": style,
+    }
+
+
+def collate_paired_features(
+    prompt_features: list[dict[str, torch.Tensor]],
+    target_features: list[dict[str, torch.Tensor]],
+    *,
+    hop_length: int,
+    sample_rate: int,
+    max_pair_seconds: float,
+    min_prompt_seconds: float,
+    min_generated_frames: int,
+    records: list[dict[str, Any]] | None = None,
+    is_precomputed: bool = False,
+) -> dict[str, Any]:
+    """Assemble [prompt, target] timelines using prompt style and both semantics."""
+    if not prompt_features or len(prompt_features) != len(target_features):
+        raise ValueError("Prompt and target feature lists must have the same non-zero length")
+
+    mels = []
+    semantics = []
+    styles = []
+    prompt_lens = []
+    prompt_semantic_lens = []
+    for prompt_item, target_item in zip(prompt_features, target_features, strict=True):
+        prompt_mel = _normalize_mel(prompt_item["mel"])
+        target_mel = _normalize_mel(target_item["mel"])
+        prompt_semantic = _normalize_semantic(prompt_item["semantic"])
+        target_semantic = _normalize_semantic(target_item["semantic"])
+        if torch.is_floating_point(prompt_semantic) != torch.is_floating_point(target_semantic):
+            raise TypeError("Prompt and target semantic features must use the same representation")
+
+        prompt_keep, target_keep, prompt_semantic_keep, target_semantic_keep = (
+            trim_paired_feature_lengths(
+                prompt_mel.size(-1),
+                target_mel.size(-1),
+                _semantic_length(prompt_semantic),
+                _semantic_length(target_semantic),
+                hop_length=hop_length,
+                sample_rate=sample_rate,
+                max_pair_seconds=max_pair_seconds,
+                min_prompt_seconds=min_prompt_seconds,
+                min_generated_frames=min_generated_frames,
+            )
+        )
+        paired_mel = torch.cat(
+            [prompt_mel[:, :prompt_keep], target_mel[:, :target_keep]], dim=-1
+        )
+        if torch.is_floating_point(prompt_semantic):
+            paired_semantic = torch.cat(
+                [
+                    prompt_semantic[:prompt_semantic_keep],
+                    target_semantic[:target_semantic_keep],
+                ],
+                dim=0,
+            )
+        else:
+            if prompt_semantic.size(0) != target_semantic.size(0):
+                raise ValueError("Prompt and target must have the same number of codebooks")
+            paired_semantic = torch.cat(
+                [
+                    prompt_semantic[:, :prompt_semantic_keep],
+                    target_semantic[:, :target_semantic_keep],
+                ],
+                dim=-1,
+            )
+
+        style = prompt_item["style"].float().view(-1)
+        if style.numel() != 192:
+            raise ValueError(f"style must contain 192 values, got {style.numel()}")
+        mels.append(paired_mel.transpose(0, 1))
+        semantics.append(paired_semantic)
+        styles.append(style)
+        prompt_lens.append(prompt_keep)
+        prompt_semantic_lens.append(prompt_semantic_keep)
+
+    device = mels[0].device
+    mel_lens = torch.tensor([x.size(0) for x in mels], dtype=torch.long, device=device)
+    mel = pad_sequence(mels, batch_first=True, padding_value=0.0).transpose(1, 2)
+    if torch.is_floating_point(semantics[0]):
+        semantic_lens = torch.tensor(
+            [x.size(0) for x in semantics], dtype=torch.long, device=device
+        )
+        semantic = pad_sequence(
+            [x.float() for x in semantics], batch_first=True, padding_value=0.0
+        )
+    else:
+        q = semantics[0].size(0)
+        sem_lens = [x.size(-1) for x in semantics]
+        semantic_lens = torch.tensor(sem_lens, dtype=torch.long, device=device)
+        semantic = torch.zeros(
+            len(semantics), q, max(sem_lens), dtype=torch.long, device=device
+        )
+        for index, item in enumerate(semantics):
+            semantic[index, :, : item.size(-1)] = item.long()
+
+    batch: dict[str, Any] = {
+        "mel": mel,
+        "mel_lens": mel_lens,
+        "semantic": semantic,
+        "semantic_lens": semantic_lens,
+        "style": torch.stack(styles),
+        "prompt_lens": torch.tensor(prompt_lens, dtype=torch.long, device=device),
+        "prompt_semantic_lens": torch.tensor(
+            prompt_semantic_lens, dtype=torch.long, device=device
+        ),
+        "is_precomputed": is_precomputed,
+        "is_paired": True,
+    }
+    if records is not None:
+        batch["records"] = records
+    return batch
+
+
 class S2MelCollator:
     def __init__(
         self,
@@ -306,12 +655,40 @@ class S2MelCollator:
         min_prompt_seconds: float,
         max_prompt_seconds: float,
         min_generated_frames: int,
+        max_pair_seconds: float = 30.0,
+        min_pair_prompt_seconds: float = 3.0,
     ) -> None:
         self.hop_length = hop_length
         self.sample_rate = sample_rate
         self.min_prompt_seconds = min_prompt_seconds
         self.max_prompt_seconds = max_prompt_seconds
         self.min_generated_frames = min_generated_frames
+        self.max_pair_seconds = max_pair_seconds
+        self.min_pair_prompt_seconds = min_pair_prompt_seconds
+
+    @staticmethod
+    def _has_precomputed(record: dict[str, Any]) -> bool:
+        return (
+            all(isinstance(record.get(key), torch.Tensor) for key in ("mel", "semantic", "style"))
+            or bool(
+                record.get("mel_path")
+                and record.get("semantic_path")
+                and record.get("style_path")
+            )
+        )
+
+    def _collate_paired_precomputed(self, records: list[dict[str, Any]]) -> dict[str, Any]:
+        return collate_paired_features(
+            [_load_record_features(record["prompt"]) for record in records],
+            [_load_record_features(record["target"]) for record in records],
+            hop_length=self.hop_length,
+            sample_rate=self.sample_rate,
+            max_pair_seconds=self.max_pair_seconds,
+            min_prompt_seconds=self.min_pair_prompt_seconds,
+            min_generated_frames=self.min_generated_frames,
+            records=records,
+            is_precomputed=True,
+        )
 
     def _collate_precomputed(self, records: list[dict[str, Any]]) -> dict[str, Any]:
         mels = []
@@ -386,13 +763,40 @@ class S2MelCollator:
         }
 
     def __call__(self, records: list[dict[str, Any]]) -> dict[str, Any]:
-        has_precomputed = [
-            (
-                all(isinstance(r.get(key), torch.Tensor) for key in ("mel", "semantic", "style"))
-                or bool(r.get("mel_path") and r.get("semantic_path") and r.get("style_path"))
-            )
-            for r in records
+        paired = [
+            isinstance(record.get("prompt"), dict) and isinstance(record.get("target"), dict)
+            for record in records
         ]
+        if any(paired) and not all(paired):
+            raise ValueError("Do not mix paired and single-utterance records in one batch")
+        if all(paired):
+            prompt_records = [record["prompt"] for record in records]
+            target_records = [record["target"] for record in records]
+            has_precomputed = [
+                self._has_precomputed(prompt) and self._has_precomputed(target)
+                for prompt, target in zip(prompt_records, target_records, strict=True)
+            ]
+            partially_precomputed = [
+                self._has_precomputed(prompt) or self._has_precomputed(target)
+                for prompt, target in zip(prompt_records, target_records, strict=True)
+            ]
+            if all(has_precomputed):
+                return self._collate_paired_precomputed(records)
+            if any(partially_precomputed):
+                raise ValueError("Both sides of every pair must use the same feature mode")
+            prompt_audio_paths = [record.get("audio_path") for record in prompt_records]
+            target_audio_paths = [record.get("audio_path") for record in target_records]
+            if any(path is None for path in prompt_audio_paths + target_audio_paths):
+                raise ValueError("Paired records must contain prompt and target audio_path")
+            return {
+                "prompt_audio_paths": prompt_audio_paths,
+                "target_audio_paths": target_audio_paths,
+                "records": records,
+                "is_precomputed": False,
+                "is_paired": True,
+            }
+
+        has_precomputed = [self._has_precomputed(record) for record in records]
         if all(has_precomputed):
             return self._collate_precomputed(records)
         if any(has_precomputed):

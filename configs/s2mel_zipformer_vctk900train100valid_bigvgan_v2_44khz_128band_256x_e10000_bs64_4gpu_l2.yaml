@@ -8,11 +8,16 @@ paths:
   w2v_bert_dir: w2v-bert-2.0
   w2v_stat: wav2vec2bert_stats.pt
 
+vocoder:
+  model_id: nvidia/bigvgan_v2_44khz_128band_256x
+  cache_dir: /mnt/data_sdd/hhy/noiz-tts/vae-eval/.hf_cache
+  local_files_only: true
+
 data:
   train_jsonl: ""
   valid_jsonl: ""
-  train_speechdata_dir: ""
-  valid_speechdata_dir: ""
+  train_speechdata_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/datasets/vctk_10pct_speaker_stratified/metadata/vctk_train_900utt_from1000_speaker_stratified_seed1234.jsonl
+  valid_speechdata_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/datasets/vctk_10pct_speaker_stratified/metadata/vctk_valid_100utt_from1000_speaker_stratified_seed1234.jsonl
   speechdata_cache_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/.cache/speechdata
   max_audio_seconds: 30.0
   pair_same_speaker: true
@@ -21,31 +26,32 @@ data:
   min_prompt_seconds: 1.0
   max_prompt_seconds: 5.0
   min_generated_frames: 8
-  # w2v-bert 2.0 features / MaskGCT semantic codec run at 50 Hz (IndexTTS2 uses code_lens * 1.72 -> mel frames).
   semantic_fps: 50.0
   sample_rate_16k: 16000
-  sample_rate_mel: 22050
+  sample_rate_mel: 44100
   num_workers: 8
   prefetch_factor: 2
   feature_batch_size: 16
+  preload_features: true
+  preload_batch_size: 16
 
 preprocess_params:
-  sr: 22050
+  sr: 44100
   spect_params:
     n_fft: 1024
     win_length: 1024
     hop_length: 256
-    n_mels: 80
+    n_mels: 128
     fmin: 0
     fmax: "None"
 
 s2mel:
   dit_type: ZipFormer
-  reg_loss_type: l1
+  reg_loss_type: l2
   use_gpt_latent: false
   inference_steps: 25
   inference_cfg_rate: 0.7
-  length_ratio: 1.72
+  length_ratio: 3.4453125
   style_encoder:
     dim: 192
   length_regulator:
@@ -59,7 +65,7 @@ s2mel:
     f0_condition: false
     n_f0_bins: 512
   DiT:
-    in_channels: 80
+    in_channels: 128
     content_dim: 512
     zero_prompt_speech_token: false
   ZipFormer:
@@ -80,22 +86,24 @@ s2mel:
     use_conv: true
 
 train:
-  output_dir: exp/s2mel_zipformer
-  batch_size: 4
-  epochs: 10
+  output_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/exp/vctk_900train100valid_bigvgan_v2_44khz_128band_256x_e10000_bs64eff_mbs32_acc2_4gpu_l2/checkpoints
+  # 256x has twice the mel frame rate of 512x. Accumulate two micro-batches
+  # to retain an effective per-rank batch of 64 without exceeding 48 GB VRAM.
+  batch_size: 32
+  epochs: 10000
   max_steps: 0
-  grad_accumulation: 1
+  grad_accumulation: 2
   learning_rate: 1.0e-4
   weight_decay: 0.01
   warmup_steps: 1000
   grad_clip: 1.0
   mixed_precision: fp16
   log_interval: 20
-  valid_interval: 500
-  save_interval: 10000
+  valid_interval: 1000
+  save_interval: 250
   keep_last: 5
   resume_from: ""
   no_wandb: false
   wandb_entity: haoyuanhuang22-jcxy
   wandb_project: semantic2mel
-  wandb_run_name: s2mel_zipformer-vctk-8gpu
+  wandb_run_name: s2mel-vctk900train100valid-bigvgan-v2-44khz-128band-256x-e10000-bs64eff-mbs32-acc2-4gpu-l2

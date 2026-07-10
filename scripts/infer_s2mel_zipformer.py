@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="outputs/s2mel_zipformer-vctk-8gpu")
     parser.add_argument("--indextts-root", default=None)
     parser.add_argument("--model-dir", default=None)
+    parser.add_argument("--vocoder-model", default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
         "--dtype",
@@ -82,12 +83,44 @@ def load_vocoder(cfg, device: torch.device, dtype: torch.dtype):
 
     from indextts.s2mel.modules.bigvgan import bigvgan
 
-    vocoder = bigvgan.BigVGAN.from_pretrained(str(model_dir / "bigvgan"))
+    vocoder_cfg = _get(cfg, "vocoder", None)
+    model_id = str(_get(vocoder_cfg, "model_id", "") or "")
+    source = model_id or str(model_dir / "bigvgan")
+    cache_dir = str(_get(vocoder_cfg, "cache_dir", "") or "")
+    load_kwargs = {}
+    if model_id:
+        load_kwargs["cache_dir"] = cache_dir or None
+        load_kwargs["local_files_only"] = bool(
+            _get(vocoder_cfg, "local_files_only", False)
+        )
+    vocoder = bigvgan.BigVGAN.from_pretrained(source, **load_kwargs)
+
+    preprocess = _get(cfg, "preprocess_params")
+    spect = _get(preprocess, "spect_params")
+    expected = {
+        "sampling_rate": int(_get(preprocess, "sr", 22050)),
+        "num_mels": int(_get(spect, "n_mels", 80)),
+        "n_fft": int(_get(spect, "n_fft", 1024)),
+        "hop_size": int(_get(spect, "hop_length", 256)),
+        "win_size": int(_get(spect, "win_length", 1024)),
+    }
+    mismatches = {
+        key: (value, int(_get(vocoder.h, key)))
+        for key, value in expected.items()
+        if int(_get(vocoder.h, key)) != value
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{key}: config={config_value}, vocoder={vocoder_value}"
+            for key, (config_value, vocoder_value) in mismatches.items()
+        )
+        raise ValueError(f"BigVGAN mel configuration mismatch: {details}")
+
     vocoder = vocoder.to(device=device, dtype=dtype)
     vocoder.remove_weight_norm()
     vocoder.eval()
     print(f">> IndexTTS root: {indextts_root}")
-    print(f">> BigVGAN restored from: {model_dir / 'bigvgan'}")
+    print(f">> BigVGAN restored from: {source}")
     return vocoder
 
 
@@ -171,6 +204,10 @@ def main() -> None:
         cfg.paths.indextts_root = args.indextts_root
     if args.model_dir is not None:
         cfg.paths.model_dir = args.model_dir
+    if args.vocoder_model is not None:
+        if _get(cfg, "vocoder", None) is None:
+            cfg.vocoder = {}
+        cfg.vocoder.model_id = args.vocoder_model
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():

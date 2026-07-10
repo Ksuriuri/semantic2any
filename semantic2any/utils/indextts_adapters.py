@@ -9,7 +9,7 @@ import torchaudio
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 
-from semantic2any.data.s2mel_dataset import choose_prompt_len
+from semantic2any.data.s2mel_dataset import choose_prompt_len, collate_paired_features
 
 
 def _get(obj, name: str, default=None):
@@ -149,9 +149,26 @@ class IndexTTSFeatureAdapter(nn.Module):
         self.min_prompt_seconds = float(_get(data_cfg, "min_prompt_seconds", 1.0))
         self.max_prompt_seconds = float(_get(data_cfg, "max_prompt_seconds", 5.0))
         self.min_generated_frames = int(_get(data_cfg, "min_generated_frames", 8))
+        self.max_pair_seconds = float(_get(data_cfg, "max_pair_seconds", 30.0))
+        self.min_pair_prompt_seconds = float(
+            _get(data_cfg, "min_pair_prompt_seconds", 3.0)
+        )
         self.sample_rate_16k = int(_get(data_cfg, "sample_rate_16k", 16000))
         self.sample_rate_mel = int(_get(data_cfg, "sample_rate_mel", self.mel_args["sampling_rate"]))
         self.feature_batch_size = max(1, int(_get(data_cfg, "feature_batch_size", 16)))
+        if self.sample_rate_mel != self.mel_args["sampling_rate"]:
+            raise ValueError(
+                "data.sample_rate_mel must match preprocess_params.sr "
+                f"({self.sample_rate_mel} != {self.mel_args['sampling_rate']})"
+            )
+        s2mel_cfg = _get(cfg, "s2mel")
+        dit_cfg = _get(s2mel_cfg, "DiT")
+        model_mel_channels = int(_get(dit_cfg, "in_channels", self.mel_args["num_mels"]))
+        if model_mel_channels != self.mel_args["num_mels"]:
+            raise ValueError(
+                "s2mel.DiT.in_channels must match preprocess mel bands "
+                f"({model_mel_channels} != {self.mel_args['num_mels']})"
+            )
 
         for module in (self.semantic_model, self.semantic_codec, self.campplus_model):
             module.requires_grad_(False)
@@ -278,10 +295,39 @@ class IndexTTSFeatureAdapter(nn.Module):
             "prompt_lens": prompt_lens_tensor,
         }
 
+    @torch.no_grad()
+    def extract_paired_from_audio_paths(
+        self,
+        prompt_audio_paths: list[str],
+        target_audio_paths: list[str],
+    ) -> dict[str, torch.Tensor]:
+        if not prompt_audio_paths or len(prompt_audio_paths) != len(target_audio_paths):
+            raise ValueError("Prompt and target path lists must have the same non-zero length")
+        batch_size = len(prompt_audio_paths)
+        features = self.extract_utterance_features(prompt_audio_paths + target_audio_paths)
+        return collate_paired_features(
+            features[:batch_size],
+            features[batch_size:],
+            hop_length=self.mel_args["hop_size"],
+            sample_rate=self.sample_rate_mel,
+            max_pair_seconds=self.max_pair_seconds,
+            min_prompt_seconds=self.min_pair_prompt_seconds,
+            min_generated_frames=self.min_generated_frames,
+            is_precomputed=False,
+        )
+
 
 def move_feature_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     out = dict(batch)
-    for key in ("mel", "mel_lens", "semantic", "semantic_lens", "style", "prompt_lens"):
+    for key in (
+        "mel",
+        "mel_lens",
+        "semantic",
+        "semantic_lens",
+        "style",
+        "prompt_lens",
+        "prompt_semantic_lens",
+    ):
         if key in out and isinstance(out[key], torch.Tensor):
             out[key] = out[key].to(device)
     return out

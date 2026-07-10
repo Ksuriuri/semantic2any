@@ -1,0 +1,13 @@
+---
+description: Run training and other long-running jobs in tmux
+alwaysApply: true
+---
+
+# Use tmux for long-running jobs
+
+- Always start training, inference services, preprocessing, downloads, and other long-running commands in a named tmux session.
+- Before launching, check existing tmux sessions and running processes to avoid duplicates.
+- Use a descriptive session name related to the experiment.
+- After launching, inspect the tmux output and verify that the job reached a healthy running state.
+- Tell the user the session name and the `tmux attach -t <session>` command.
+- Short checks, tests, and one-off commands do not require tmux.
