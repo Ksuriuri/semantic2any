@@ -11,8 +11,8 @@ paths:
 data:
   train_jsonl: ""
   valid_jsonl: ""
-  train_speechdata_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/datasets/vctk_10pct_speaker_stratified/metadata/vctk_train_minus_test_10pct.jsonl
-  valid_speechdata_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/datasets/vctk_10pct_speaker_stratified/metadata/vctk_test_10pct.jsonl
+  train_speechdata_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/datasets/vctk_10pct_speaker_stratified/metadata/vctk_train_900utt_from1000_speaker_stratified_seed1234.jsonl
+  valid_speechdata_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/datasets/vctk_10pct_speaker_stratified/metadata/vctk_valid_100utt_from1000_speaker_stratified_seed1234.jsonl
   speechdata_cache_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/.cache/speechdata
   max_audio_seconds: 20.0
   min_prompt_seconds: 1.0
@@ -21,8 +21,9 @@ data:
   semantic_fps: 50.0
   sample_rate_16k: 16000
   sample_rate_mel: 22050
-  num_workers: 0
+  num_workers: 8
   prefetch_factor: 2
+  feature_batch_size: 16
 
 preprocess_params:
   sr: 22050
@@ -75,9 +76,9 @@ s2mel:
     use_conv: true
 
 train:
-  output_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/exp/vctk_10pct_speaker_stratified_20260708_e30_bs32/checkpoints
-  batch_size: 32
-  epochs: 30
+  output_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/exp/vctk_900train100valid_speaker_stratified_20260709_e300_bs16_8gpu_melscale01_ema/checkpoints
+  batch_size: 16
+  epochs: 300
   max_steps: 0
   grad_accumulation: 1
   learning_rate: 1.0e-4
@@ -86,11 +87,11 @@ train:
   grad_clip: 1.0
   mixed_precision: fp16
   log_interval: 20
-  valid_interval: 500
-  save_interval: 2500
+  valid_interval: 100
+  save_interval: 250
   keep_last: 5
   resume_from: ""
   no_wandb: false
   wandb_entity: haoyuanhuang22-jcxy
   wandb_project: semantic2mel
-  wandb_run_name: s2mel_zipformer-vctk-20260708-e30-bs32
+  wandb_run_name: s2mel_zipformer-vctk900train100valid-20260709-e300-bs16-8gpu-melscale01-ema

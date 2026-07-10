@@ -52,16 +52,31 @@ class Semantic2MelModel(nn.Module):
         target_lengths,
         n_quantizers: int | None = None,
         f0=None,
+        semantic_lens: torch.Tensor | None = None,
     ):
         return self.models["length_regulator"](
             semantic,
             ylens=target_lengths,
             n_quantizers=n_quantizers,
             f0=f0,
+            xlens=semantic_lens,
         )[0]
 
-    def forward(self, mel, mel_lens, prompt_lens, semantic_or_mu, style, semantic_is_mu: bool = False):
-        mu = semantic_or_mu if semantic_is_mu else self.build_condition(semantic_or_mu, mel_lens)
+    def forward(
+        self,
+        mel,
+        mel_lens,
+        prompt_lens,
+        semantic_or_mu,
+        style,
+        semantic_is_mu: bool = False,
+        semantic_lens: torch.Tensor | None = None,
+    ):
+        mu = (
+            semantic_or_mu
+            if semantic_is_mu
+            else self.build_condition(semantic_or_mu, mel_lens, semantic_lens=semantic_lens)
+        )
         return self.models["cfm"](mel, mel_lens, prompt_lens, mu, style)
 
     def enable_torch_compile(self) -> None:

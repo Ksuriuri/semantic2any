@@ -80,13 +80,13 @@ class BASECFM(nn.Module, ABC):
                 stacked_mu = torch.cat([mu, torch.zeros_like(mu)], dim=0)
                 stacked_x = torch.cat([x, x], dim=0)
                 stacked_lens = torch.cat([x_lens, x_lens], dim=0)
-                stacked_t = torch.cat([t[None], t[None]], dim=0)
+                stacked_t = t.reshape(1).expand(stacked_x.size(0))
                 dphi_dt, cfg_dphi_dt = self.estimator(
                     stacked_x, stacked_prompt_x, stacked_lens, stacked_t, stacked_style, stacked_mu
                 ).chunk(2, dim=0)
                 dphi_dt = (1.0 + inference_cfg_rate) * dphi_dt - inference_cfg_rate * cfg_dphi_dt
             else:
-                dphi_dt = self.estimator(x, prompt_x, x_lens, t[None], style, mu)
+                dphi_dt = self.estimator(x, prompt_x, x_lens, t.reshape(1).expand(x.size(0)), style, mu)
 
             x = x + dt * dphi_dt
             t = t + dt

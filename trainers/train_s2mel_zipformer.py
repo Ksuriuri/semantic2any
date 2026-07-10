@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import gc
+import json
 import math
 import random
 import shutil
@@ -12,15 +14,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import numpy as np
 import torch
 from accelerate import Accelerator
+from accelerate.utils import set_seed
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
-from transformers import get_cosine_schedule_with_warmup
+from torch.utils.data import DataLoader, Dataset
 
 from semantic2any.data.s2mel_dataset import (
     S2MelCollator,
+    S2MelInMemoryDataset,
     S2MelJsonlDataset,
     S2MelSpeechDataDataset,
 )
@@ -85,11 +87,22 @@ def apply_overrides(cfg, args: argparse.Namespace):
     return cfg
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+def cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int):
+    """Cosine LR with warmup, clamped at the end.
+
+    Unlike transformers.get_cosine_schedule_with_warmup, stepping past
+    num_training_steps (e.g. after a resume replay) keeps the LR at 0 instead
+    of climbing back up the cosine curve.
+    """
+
+    def lr_lambda(current_step: int) -> float:
+        if current_step < num_warmup_steps:
+            return current_step / max(1, num_warmup_steps)
+        progress = (current_step - num_warmup_steps) / max(1, num_training_steps - num_warmup_steps)
+        progress = min(progress, 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def _looks_like_speechdata_source(source: str) -> bool:
@@ -103,14 +116,26 @@ def _looks_like_speechdata_source(source: str) -> bool:
     return False
 
 
-def make_dataloader(cfg, source: str, shuffle: bool, *, speechdata: bool = False) -> DataLoader:
+def make_source_dataset(cfg, source: str, *, speechdata: bool = False) -> Dataset:
     if speechdata or _looks_like_speechdata_source(source):
-        dataset = S2MelSpeechDataDataset(
+        return S2MelSpeechDataDataset(
             source,
             cache_dir=_get(cfg.data, "speechdata_cache_dir", None),
         )
-    else:
-        dataset = S2MelJsonlDataset(source)
+    return S2MelJsonlDataset(source)
+
+
+def make_dataloader(
+    cfg,
+    source: str,
+    shuffle: bool,
+    *,
+    speechdata: bool = False,
+    persistent_workers: bool = True,
+    dataset: Dataset | None = None,
+) -> DataLoader:
+    if dataset is None:
+        dataset = make_source_dataset(cfg, source, speechdata=speechdata)
     spect = cfg.preprocess_params.spect_params
     collator = S2MelCollator(
         hop_length=int(spect.hop_length),
@@ -122,7 +147,9 @@ def make_dataloader(cfg, source: str, shuffle: bool, *, speechdata: bool = False
     kwargs: dict[str, Any] = {}
     if int(cfg.data.num_workers) > 0:
         kwargs["prefetch_factor"] = int(cfg.data.prefetch_factor)
-        kwargs["persistent_workers"] = True
+        # Validation loaders re-create workers per pass so that the seeded RNG
+        # fork in validate() also controls worker seeding (deterministic prompts).
+        kwargs["persistent_workers"] = persistent_workers
     return DataLoader(
         dataset,
         batch_size=int(cfg.train.batch_size),
@@ -142,6 +169,54 @@ def _split_source(cfg, split: str) -> tuple[str, bool]:
     return str(_get(cfg.data, f"{split}_jsonl", "") or ""), False
 
 
+@torch.no_grad()
+def preload_dataset_features(
+    dataset: Dataset,
+    *,
+    split: str,
+    cfg,
+    adapter: IndexTTSFeatureAdapter,
+    accelerator: Accelerator,
+) -> S2MelInMemoryDataset:
+    """Extract each utterance once and retain compact features in CPU RAM.
+
+    Every DDP rank keeps its own copy so shuffled sampling never causes cache
+    misses or cross-process synchronization during training.
+    """
+
+    batch_size = max(
+        1,
+        int(_get(cfg.data, "preload_batch_size", _get(cfg.data, "feature_batch_size", 16))),
+    )
+    records: list[dict[str, Any]] = []
+    feature_bytes = 0
+    total = len(dataset)
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        source_records = [dataset[index] for index in range(start, end)]
+        audio_paths = [record.get("audio_path") for record in source_records]
+        if any(not isinstance(path, str) or not path for path in audio_paths):
+            raise ValueError(f"{split} preload encountered a record without audio_path")
+        features = adapter.extract_utterance_features(audio_paths)
+        for source_record, feature in zip(source_records, features, strict=True):
+            mel = feature["mel"].detach().to(device="cpu", dtype=torch.float16).contiguous()
+            semantic = feature["semantic"].detach().to(device="cpu", dtype=torch.float16).contiguous()
+            style = feature["style"].detach().to(device="cpu", dtype=torch.float32).contiguous()
+            record = dict(source_record)
+            record.update({"mel": mel, "semantic": semantic, "style": style})
+            records.append(record)
+            feature_bytes += sum(tensor.numel() * tensor.element_size() for tensor in (mel, semantic, style))
+        if accelerator.is_main_process and (end == total or end % (batch_size * 10) == 0):
+            print(f"[Preload] {split}: {end}/{total} utterances")
+
+    if accelerator.is_main_process:
+        print(
+            f"[Preload] {split}: loaded {len(records)} utterances into "
+            f"{feature_bytes / (1024**3):.2f} GiB CPU RAM per rank"
+        )
+    return S2MelInMemoryDataset(records)
+
+
 def rotate_checkpoints(output_dir: Path, keep_last: int) -> None:
     if keep_last <= 0:
         return
@@ -152,6 +227,43 @@ def rotate_checkpoints(output_dir: Path, keep_last: int) -> None:
     weights = sorted(output_dir.glob("s2mel_step*.pth"), key=lambda p: p.stat().st_mtime)
     for path in weights[: max(0, len(weights) - keep_last)]:
         path.unlink(missing_ok=True)
+
+
+def _parse_checkpoint_step(path: Path) -> int | None:
+    if not path.name.startswith("checkpoint-"):
+        return None
+    try:
+        return int(path.name.removeprefix("checkpoint-"))
+    except ValueError:
+        return None
+
+
+def _read_compatible_checkpoint_metadata(path: Path) -> tuple[int, int]:
+    state = torch.load(path, map_location="cpu")
+    return int(state.get("epoch", 0)), int(state.get("iters", state.get("step", 0)))
+
+
+def load_training_resume_state(resume_dir: Path) -> tuple[int, int, int]:
+    """Recover (epoch, global_step, epoch_step) for an Accelerator checkpoint directory."""
+    trainer_state = resume_dir / "trainer_state.json"
+    if trainer_state.is_file():
+        with trainer_state.open("r", encoding="utf-8") as f:
+            state = json.load(f)
+        return (
+            int(state.get("epoch", 0)),
+            int(state.get("global_step", 0)),
+            int(state.get("epoch_step", 0)),
+        )
+
+    step = _parse_checkpoint_step(resume_dir)
+    if step is None:
+        return 0, 0, 0
+
+    companion = resume_dir.parent / f"s2mel_step{step}.pth"
+    if companion.is_file():
+        epoch, iters = _read_compatible_checkpoint_metadata(companion)
+        return epoch, iters, 0
+    return 0, step, 0
 
 
 def build_training_batch(
@@ -180,27 +292,44 @@ def forward_loss(model, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         batch["semantic"],
         batch["style"],
         semantic_is_mu=False,
+        semantic_lens=batch.get("semantic_lens"),
     )
     return loss
 
 
 @torch.no_grad()
 def validate(model, loader, cfg, accelerator: Accelerator, feature_adapter_ref) -> float:
+    """Deterministic validation: fixed RNG so t / noise / prompt lengths are
+    identical across evaluations, making valid/loss comparable over training."""
     model.eval()
-    losses = []
-    for batch in loader:
-        train_batch = build_training_batch(
-            batch,
-            cfg=cfg,
-            accelerator=accelerator,
-            feature_adapter_ref=feature_adapter_ref,
-        )
-        loss = forward_loss(model, train_batch)
-        losses.append(accelerator.gather_for_metrics(loss.detach()).mean())
-    model.train()
-    if not losses:
+    seed = int(cfg.seed)
+    devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+    py_state = random.getstate()
+    total = torch.zeros((), device=accelerator.device)
+    count = torch.zeros((), device=accelerator.device)
+    try:
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(seed)
+            random.seed(seed)
+            for batch in loader:
+                train_batch = build_training_batch(
+                    batch,
+                    cfg=cfg,
+                    accelerator=accelerator,
+                    feature_adapter_ref=feature_adapter_ref,
+                )
+                loss = forward_loss(model, train_batch)
+                batch_size = train_batch["mel"].size(0)
+                total = total + loss.detach() * batch_size
+                count = count + batch_size
+    finally:
+        random.setstate(py_state)
+        model.train()
+    total = accelerator.reduce(total, reduction="sum")
+    count = accelerator.reduce(count, reduction="sum")
+    if count.item() == 0:
         return float("nan")
-    return torch.stack(losses).mean().item()
+    return (total / count).item()
 
 
 def save_training_checkpoint(
@@ -211,10 +340,21 @@ def save_training_checkpoint(
     output_dir: Path,
     epoch: int,
     global_step: int,
+    epoch_step: int = 0,
 ) -> None:
     save_dir = output_dir / f"checkpoint-{global_step}"
     accelerator.save_state(str(save_dir))
     if accelerator.is_main_process:
+        with (save_dir / "trainer_state.json").open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "epoch": int(epoch),
+                    "global_step": int(global_step),
+                    "epoch_step": int(epoch_step),
+                },
+                f,
+                indent=2,
+            )
         unwrapped = accelerator.unwrap_model(model)
         save_compatible_checkpoint(
             output_dir / f"s2mel_step{global_step}.pth",
@@ -238,12 +378,15 @@ def main() -> None:
             "--train-jsonl/--train-speechdata-dir"
         )
 
-    set_seed(int(cfg.seed))
     accelerator = Accelerator(
         gradient_accumulation_steps=int(cfg.train.grad_accumulation),
         mixed_precision=str(cfg.train.mixed_precision),
         log_with=None if bool(cfg.train.no_wandb) else "wandb",
     )
+    # device_specific=True offsets the seed by the process index so DDP ranks
+    # draw independent flow-matching timesteps / noise; the data-loader shuffle
+    # generator is still synchronized across ranks by accelerate.
+    set_seed(int(cfg.seed), device_specific=True)
     if not bool(cfg.train.no_wandb):
         wandb_project = str(_get(cfg.train, "wandb_project", "semantic2mel") or "semantic2mel")
         wandb_entity = str(_get(cfg.train, "wandb_entity", "") or "")
@@ -266,19 +409,66 @@ def main() -> None:
         OmegaConf.save(cfg, output_dir / "config.resolved.yaml")
     accelerator.wait_for_everyone()
 
-    train_loader = make_dataloader(cfg, train_source, shuffle=True, speechdata=train_is_speechdata)
+    train_dataset = make_source_dataset(cfg, train_source, speechdata=train_is_speechdata)
+    valid_dataset = (
+        make_source_dataset(cfg, valid_source, speechdata=valid_is_speechdata) if valid_source else None
+    )
+    if bool(_get(cfg.data, "preload_features", False)):
+        if accelerator.is_main_process:
+            print("[Preload] Initializing frozen IndexTTS feature adapter")
+        preload_adapter = IndexTTSFeatureAdapter(cfg).to(accelerator.device)
+        preload_adapter.eval()
+        train_dataset = preload_dataset_features(
+            train_dataset,
+            split="train",
+            cfg=cfg,
+            adapter=preload_adapter,
+            accelerator=accelerator,
+        )
+        if valid_dataset is not None:
+            valid_dataset = preload_dataset_features(
+                valid_dataset,
+                split="valid",
+                cfg=cfg,
+                adapter=preload_adapter,
+                accelerator=accelerator,
+            )
+        del preload_adapter
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        accelerator.wait_for_everyone()
+
+    train_loader = make_dataloader(
+        cfg,
+        train_source,
+        shuffle=True,
+        speechdata=train_is_speechdata,
+        dataset=train_dataset,
+    )
     valid_loader = (
-        make_dataloader(cfg, valid_source, shuffle=False, speechdata=valid_is_speechdata) if valid_source else None
+        make_dataloader(
+            cfg,
+            valid_source,
+            shuffle=False,
+            speechdata=valid_is_speechdata,
+            persistent_workers=False,
+            dataset=valid_dataset,
+        )
+        if valid_dataset is not None
+        else None
     )
 
     model = Semantic2MelModel(cfg.s2mel)
     resume_from = str(cfg.train.resume_from or "")
+    resume_path = Path(resume_from).expanduser() if resume_from else None
     start_epoch = 0
     global_step = 0
-    if resume_from and Path(resume_from).is_file():
-        start_epoch, global_step = load_compatible_checkpoint(model, resume_from, strict=False)
+    resume_epoch_step = 0
+    if resume_path is not None and resume_path.is_file():
+        start_epoch, global_step = load_compatible_checkpoint(model, resume_path, strict=False)
         if accelerator.is_main_process:
-            print(f"[Resume] Loaded compatible checkpoint {resume_from} at step={global_step}")
+            print(f"[Resume] Loaded compatible checkpoint {resume_path} at step={global_step}")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -287,11 +477,23 @@ def main() -> None:
     )
     updates_per_epoch = math.ceil(len(train_loader) / int(cfg.train.grad_accumulation))
     total_steps = int(cfg.train.max_steps) if int(cfg.train.max_steps) > 0 else int(cfg.train.epochs) * updates_per_epoch
-    scheduler = get_cosine_schedule_with_warmup(
+    scheduler = cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=int(cfg.train.warmup_steps),
         num_training_steps=max(1, total_steps),
     )
+    if resume_path is not None and resume_path.is_file() and global_step > 0:
+        # Weights-only checkpoints carry no scheduler state. Fast-forward the LR
+        # schedule so training does not restart warmup at full LR. The prepared
+        # scheduler ticks num_processes times per optimizer step, so replay the
+        # equivalent number of raw ticks here (before accelerator.prepare).
+        for _ in range(global_step * accelerator.num_processes):
+            scheduler.step()
+        if accelerator.is_main_process:
+            print(
+                f"[Resume] Fast-forwarded LR scheduler by {global_step} steps "
+                f"(lr={scheduler.get_last_lr()[0]:.3e}); optimizer moments start fresh"
+            )
 
     if valid_loader is None:
         model, optimizer, train_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, scheduler)
@@ -300,17 +502,31 @@ def main() -> None:
             model, optimizer, train_loader, valid_loader, scheduler
         )
 
-    if resume_from and Path(resume_from).is_dir():
-        accelerator.load_state(resume_from)
+    if resume_path is not None and resume_path.is_dir():
+        start_epoch, global_step, resume_epoch_step = load_training_resume_state(resume_path)
+        accelerator.load_state(str(resume_path))
         if accelerator.is_main_process:
-            print(f"[Resume] Loaded accelerator state {resume_from}")
+            print(
+                f"[Resume] Loaded accelerator state {resume_path} "
+                f"at epoch={start_epoch + 1} step={global_step} epoch_step={resume_epoch_step}"
+            )
 
     feature_adapter_ref: list[IndexTTSFeatureAdapter | None] = [None]
     model.train()
     last_saved_step = global_step
+    # Per-rank optimizer steps per epoch (prepared loader is already sharded).
+    steps_per_epoch = max(1, math.ceil(len(train_loader) / int(cfg.train.grad_accumulation)))
 
     for epoch in range(start_epoch, int(cfg.train.epochs)):
-        for raw_batch in train_loader:
+        epoch_step = 0
+        epoch_loader = train_loader
+        if epoch == start_epoch and resume_epoch_step > 0:
+            skip_batches = resume_epoch_step * int(cfg.train.grad_accumulation)
+            epoch_loader = accelerator.skip_first_batches(train_loader, skip_batches)
+            epoch_step = resume_epoch_step
+            if accelerator.is_main_process:
+                print(f"[Resume] Skipping first {skip_batches} batches of epoch {epoch + 1}")
+        for raw_batch in epoch_loader:
             if int(cfg.train.max_steps) > 0 and global_step >= int(cfg.train.max_steps):
                 break
             with accelerator.accumulate(model):
@@ -330,12 +546,18 @@ def main() -> None:
 
             if accelerator.sync_gradients:
                 global_step += 1
-                reduced_loss = accelerator.gather_for_metrics(loss.detach()).mean().item()
+                epoch_step += 1
                 if global_step % int(cfg.train.log_interval) == 0:
+                    reduced_loss = accelerator.gather_for_metrics(loss.detach()).mean().item()
                     lr = scheduler.get_last_lr()[0]
+                    # Fractional completed epochs, e.g. 1.0 == first epoch done.
+                    epoch_progress = epoch + min(1.0, epoch_step / steps_per_epoch)
                     if accelerator.is_main_process:
                         print(f"[Train] epoch={epoch + 1} step={global_step} loss={reduced_loss:.5f} lr={lr:.3e}")
-                    accelerator.log({"train/loss": reduced_loss, "train/lr": lr}, step=global_step)
+                    accelerator.log(
+                        {"train/loss": reduced_loss, "train/lr": lr, "train/epoch": epoch_progress},
+                        step=global_step,
+                    )
 
                 if valid_loader is not None and global_step % int(cfg.train.valid_interval) == 0:
                     val_loss = validate(model, valid_loader, cfg, accelerator, feature_adapter_ref)
@@ -351,6 +573,7 @@ def main() -> None:
                         output_dir=output_dir,
                         epoch=epoch,
                         global_step=global_step,
+                        epoch_step=epoch_step,
                     )
                     last_saved_step = global_step
 

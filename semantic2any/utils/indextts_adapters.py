@@ -151,15 +151,34 @@ class IndexTTSFeatureAdapter(nn.Module):
         self.min_generated_frames = int(_get(data_cfg, "min_generated_frames", 8))
         self.sample_rate_16k = int(_get(data_cfg, "sample_rate_16k", 16000))
         self.sample_rate_mel = int(_get(data_cfg, "sample_rate_mel", self.mel_args["sampling_rate"]))
+        self.feature_batch_size = max(1, int(_get(data_cfg, "feature_batch_size", 16)))
 
         for module in (self.semantic_model, self.semantic_codec, self.campplus_model):
             module.requires_grad_(False)
 
     @torch.no_grad()
-    def _semantic_from_audio(self, audio_16k: torch.Tensor) -> torch.Tensor:
+    def _quantize_semantic(self, feat: torch.Tensor) -> torch.Tensor:
+        """Quantize a single-utterance feature [1, T, C] -> [T, C] embedding."""
+        _, semantic = self.semantic_codec.quantize(feat)
+        if not torch.is_floating_point(semantic):
+            semantic = self.semantic_codec.quantizer.vq2emb(semantic.unsqueeze(1))
+            if semantic.ndim == 3 and semantic.size(1) != feat.size(1):
+                semantic = semantic.transpose(1, 2)
+        elif semantic.ndim == 3 and semantic.size(1) != feat.size(1) and semantic.size(2) == feat.size(1):
+            semantic = semantic.transpose(1, 2)
+        return semantic.squeeze(0).float()
+
+    @torch.no_grad()
+    def _semantic_from_waveforms(self, waveforms: list) -> list[torch.Tensor]:
+        """Batched w2v-bert forward, then per-utterance codec quantization.
+
+        The codec's ConvNeXt encoder has no padding mask, so quantizing a padded
+        batch flips codes near sequence tails; quantize trimmed features instead.
+        """
         device = self.semantic_mean.device
-        waveform = audio_16k.squeeze(0).detach().cpu().numpy()
-        inputs = self.extract_features(waveform, sampling_rate=self.sample_rate_16k, return_tensors="pt")
+        inputs = self.extract_features(
+            waveforms, sampling_rate=self.sample_rate_16k, return_tensors="pt", padding=True
+        )
         input_features = inputs["input_features"].to(device)
         attention_mask = inputs["attention_mask"].to(device)
         out = self.semantic_model(
@@ -169,14 +188,16 @@ class IndexTTSFeatureAdapter(nn.Module):
         )
         feat = out.hidden_states[17]
         feat = (feat - self.semantic_mean) / self.semantic_std
-        _, semantic = self.semantic_codec.quantize(feat)
-        if not torch.is_floating_point(semantic):
-            semantic = self.semantic_codec.quantizer.vq2emb(semantic.unsqueeze(1))
-            if semantic.ndim == 3 and semantic.size(1) != feat.size(1):
-                semantic = semantic.transpose(1, 2)
-        elif semantic.ndim == 3 and semantic.size(1) != feat.size(1) and semantic.size(2) == feat.size(1):
-            semantic = semantic.transpose(1, 2)
-        return semantic.squeeze(0).float()
+        lengths = attention_mask.sum(dim=1).long()
+        return [
+            self._quantize_semantic(feat[idx : idx + 1, : int(lengths[idx])])
+            for idx in range(feat.size(0))
+        ]
+
+    @torch.no_grad()
+    def _semantic_from_audio(self, audio_16k: torch.Tensor) -> torch.Tensor:
+        waveform = audio_16k.squeeze(0).detach().cpu().numpy()
+        return self._semantic_from_waveforms([waveform])[0]
 
     @torch.no_grad()
     def _style_from_audio(self, audio_16k: torch.Tensor) -> torch.Tensor:
@@ -191,21 +212,44 @@ class IndexTTSFeatureAdapter(nn.Module):
         return self.campplus_model(feat.unsqueeze(0)).squeeze(0).float()
 
     @torch.no_grad()
-    def extract_from_audio_paths(self, audio_paths: list[str]) -> dict[str, torch.Tensor]:
+    def extract_utterance_features(self, audio_paths: list[str]) -> list[dict[str, torch.Tensor]]:
+        """Extract per-utterance features. w2v-bert runs batched (chunked by
+        ``feature_batch_size``); mel, campplus and codec quantization stay
+        per-sample to keep parity with the single-utterance IndexTTS pipeline."""
         device = self.semantic_mean.device
         mels = []
-        semantics = []
         styles = []
-        prompt_lens = []
+        waveforms_16k = []
 
         for path in audio_paths:
             audio, sr = _load_audio(path, self.max_audio_seconds)
             audio_22k = _resample(audio, sr, self.sample_rate_mel).to(device)
             audio_16k = _resample(audio, sr, self.sample_rate_16k)
 
-            mel = self.mel_spectrogram(audio_22k.float(), **self.mel_args).squeeze(0)
-            semantic = self._semantic_from_audio(audio_16k)
-            style = self._style_from_audio(audio_16k)
+            mels.append(self.mel_spectrogram(audio_22k.float(), **self.mel_args).squeeze(0))
+            styles.append(self._style_from_audio(audio_16k))
+            waveforms_16k.append(audio_16k.squeeze(0).detach().cpu().numpy())
+
+        semantics: list[torch.Tensor] = []
+        for start in range(0, len(waveforms_16k), self.feature_batch_size):
+            semantics.extend(self._semantic_from_waveforms(waveforms_16k[start : start + self.feature_batch_size]))
+
+        return [
+            {"mel": mel, "semantic": semantic, "style": style}
+            for mel, semantic, style in zip(mels, semantics, styles, strict=True)
+        ]
+
+    @torch.no_grad()
+    def extract_from_audio_paths(self, audio_paths: list[str]) -> dict[str, torch.Tensor]:
+        device = self.semantic_mean.device
+        features = self.extract_utterance_features(audio_paths)
+
+        mels = []
+        semantics = []
+        styles = []
+        prompt_lens = []
+        for item in features:
+            mel = item["mel"]
             prompt_len = choose_prompt_len(
                 mel.size(-1),
                 hop_length=self.mel_args["hop_size"],
@@ -214,10 +258,9 @@ class IndexTTSFeatureAdapter(nn.Module):
                 max_prompt_seconds=self.max_prompt_seconds,
                 min_generated_frames=self.min_generated_frames,
             )
-
             mels.append(mel.transpose(0, 1))
-            semantics.append(semantic)
-            styles.append(style)
+            semantics.append(item["semantic"])
+            styles.append(item["style"])
             prompt_lens.append(prompt_len)
 
         mel_lens = torch.tensor([x.size(0) for x in mels], dtype=torch.long, device=device)

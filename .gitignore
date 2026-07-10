@@ -12,8 +12,10 @@ venv/
 wandb/
 
 exp/
+assets/
 outputs/
 checkpoints/
+datasets/
 *.pth
 *.pt
 *.safetensors

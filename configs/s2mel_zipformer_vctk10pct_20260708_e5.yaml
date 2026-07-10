@@ -11,14 +11,14 @@ paths:
 data:
   train_jsonl: ""
   valid_jsonl: ""
-  train_speechdata_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/exp/vctk_10pct_speaker_stratified_20260708_e5/data/metadata/vctk_train_minus_test_10pct.jsonl
-  valid_speechdata_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/exp/vctk_10pct_speaker_stratified_20260708_e5/data/metadata/vctk_test_10pct.jsonl
-  speechdata_cache_dir: /tmp/semantic2any-speechdata
+  train_speechdata_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/datasets/vctk_10pct_speaker_stratified/metadata/vctk_train_minus_test_10pct.jsonl
+  valid_speechdata_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/datasets/vctk_10pct_speaker_stratified/metadata/vctk_test_10pct.jsonl
+  speechdata_cache_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/.cache/speechdata
   max_audio_seconds: 20.0
   min_prompt_seconds: 1.0
   max_prompt_seconds: 5.0
   min_generated_frames: 8
-  semantic_fps: 25.0
+  semantic_fps: 50.0
   sample_rate_16k: 16000
   sample_rate_mel: 22050
   num_workers: 0
@@ -40,7 +40,7 @@ s2mel:
   use_gpt_latent: false
   inference_steps: 25
   inference_cfg_rate: 0.7
-  length_ratio: 3.44
+  length_ratio: 1.72
   style_encoder:
     dim: 192
   length_regulator:

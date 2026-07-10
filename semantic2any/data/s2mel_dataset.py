@@ -282,6 +282,21 @@ class S2MelSpeechDataDataset(Dataset):
         return str(target)
 
 
+class S2MelInMemoryDataset(Dataset):
+    """Precomputed s2mel features retained in CPU memory."""
+
+    def __init__(self, records: list[dict[str, Any]]) -> None:
+        if not records:
+            raise ValueError("In-memory s2mel dataset must not be empty")
+        self.records = records
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        return self.records[index]
+
+
 class S2MelCollator:
     def __init__(
         self,
@@ -304,13 +319,24 @@ class S2MelCollator:
         styles = []
         prompt_lens = []
         for record in records:
-            mel = _load_tensor(record["mel_path"]).float()
+            mel_value = record.get("mel")
+            mel = mel_value.float() if isinstance(mel_value, torch.Tensor) else _load_tensor(record["mel_path"]).float()
             if mel.ndim == 3 and mel.size(0) == 1:
                 mel = mel.squeeze(0)
             if mel.ndim != 2:
                 raise ValueError(f"mel must be [80, T], got {tuple(mel.shape)}")
-            semantic = _load_tensor(record["semantic_path"])
-            style = _load_tensor(record["style_path"]).float().view(-1)
+            semantic_value = record.get("semantic")
+            semantic = (
+                semantic_value
+                if isinstance(semantic_value, torch.Tensor)
+                else _load_tensor(record["semantic_path"])
+            )
+            style_value = record.get("style")
+            style = (
+                style_value.float().view(-1)
+                if isinstance(style_value, torch.Tensor)
+                else _load_tensor(record["style_path"]).float().view(-1)
+            )
             if style.numel() != 192:
                 raise ValueError(f"style must contain 192 values, got {style.numel()}")
 
@@ -361,7 +387,11 @@ class S2MelCollator:
 
     def __call__(self, records: list[dict[str, Any]]) -> dict[str, Any]:
         has_precomputed = [
-            bool(r.get("mel_path") and r.get("semantic_path") and r.get("style_path")) for r in records
+            (
+                all(isinstance(r.get(key), torch.Tensor) for key in ("mel", "semantic", "style"))
+                or bool(r.get("mel_path") and r.get("semantic_path") and r.get("style_path"))
+            )
+            for r in records
         ]
         if all(has_precomputed):
             return self._collate_precomputed(records)

@@ -13,16 +13,18 @@ data:
   valid_jsonl: ""
   train_speechdata_dir: ""
   valid_speechdata_dir: ""
-  speechdata_cache_dir: /tmp/semantic2any-speechdata
+  speechdata_cache_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/.cache/speechdata
   max_audio_seconds: 20.0
   min_prompt_seconds: 1.0
   max_prompt_seconds: 5.0
   min_generated_frames: 8
-  semantic_fps: 25.0
+  # w2v-bert 2.0 features / MaskGCT semantic codec run at 50 Hz (IndexTTS2 uses code_lens * 1.72 -> mel frames).
+  semantic_fps: 50.0
   sample_rate_16k: 16000
   sample_rate_mel: 22050
-  num_workers: 0
+  num_workers: 8
   prefetch_factor: 2
+  feature_batch_size: 16
 
 preprocess_params:
   sr: 22050
@@ -40,7 +42,7 @@ s2mel:
   use_gpt_latent: false
   inference_steps: 25
   inference_cfg_rate: 0.7
-  length_ratio: 3.44
+  length_ratio: 1.72
   style_encoder:
     dim: 192
   length_regulator:

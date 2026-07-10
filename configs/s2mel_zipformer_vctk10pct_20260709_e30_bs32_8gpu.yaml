@@ -18,11 +18,13 @@ data:
   min_prompt_seconds: 1.0
   max_prompt_seconds: 5.0
   min_generated_frames: 8
+  # w2v-bert 2.0 features / MaskGCT semantic codec run at 50 Hz (IndexTTS2 uses code_lens * 1.72 -> mel frames).
   semantic_fps: 50.0
   sample_rate_16k: 16000
   sample_rate_mel: 22050
-  num_workers: 0
+  num_workers: 8
   prefetch_factor: 2
+  feature_batch_size: 16
 
 preprocess_params:
   sr: 22050
@@ -40,6 +42,7 @@ s2mel:
   use_gpt_latent: false
   inference_steps: 25
   inference_cfg_rate: 0.7
+  # mel fps (22050/256 = 86.13) / semantic fps (50) = 1.72, matching IndexTTS2 inference.
   length_ratio: 1.72
   style_encoder:
     dim: 192
@@ -75,7 +78,7 @@ s2mel:
     use_conv: true
 
 train:
-  output_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/exp/vctk_10pct_speaker_stratified_20260708_e30_bs32/checkpoints
+  output_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/exp/vctk_10pct_speaker_stratified_20260709_e30_bs32_8gpu/checkpoints
   batch_size: 32
   epochs: 30
   max_steps: 0
@@ -87,10 +90,10 @@ train:
   mixed_precision: fp16
   log_interval: 20
   valid_interval: 500
-  save_interval: 2500
+  save_interval: 1000
   keep_last: 5
   resume_from: ""
   no_wandb: false
   wandb_entity: haoyuanhuang22-jcxy
   wandb_project: semantic2mel
-  wandb_run_name: s2mel_zipformer-vctk-20260708-e30-bs32
+  wandb_run_name: s2mel_zipformer-vctk-20260709-e30-bs32-8gpu

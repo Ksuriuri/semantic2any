@@ -131,6 +131,7 @@ def infer_one(
     mel = batch["mel"].to(device=device, dtype=dtype)
     mel_lens = batch["mel_lens"].to(device=device)
     semantic = batch["semantic"].to(device=device, dtype=dtype)
+    semantic_lens = batch["semantic_lens"].to(device=device)
     style = batch["style"].to(device=device, dtype=dtype)
 
     mel_len = int(mel_lens[0].item())
@@ -138,7 +139,7 @@ def infer_one(
     if mel_len <= prompt_len:
         raise ValueError(f"Audio is too short for prompt-only split: {audio_path}")
 
-    mu = model.build_condition(semantic, mel_lens)
+    mu = model.build_condition(semantic, mel_lens, semantic_lens=semantic_lens)
     prompt = mel[:, :, :prompt_len]
     generated = model.models["cfm"].inference(
         mu=mu,
