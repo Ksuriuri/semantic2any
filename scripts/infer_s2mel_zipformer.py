@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run semantic2any ZipFormer s2mel inference on audio files. "
-            "The output keeps the original prompt segment and vocodes the generated continuation."
+            "The output contains only the generated target segment."
         )
     )
     parser.add_argument("--config", default="exp/s2mel_zipformer-vctk-8gpu/config.resolved.yaml")
@@ -186,9 +186,8 @@ def infer_one(
         show_progress=show_progress,
     )
     generated = generated[:, :, prompt_len:mel_len]
-    prompted_continuation = torch.cat([prompt, generated], dim=-1)
 
-    wav = vocoder(prompted_continuation.to(device=device, dtype=dtype))[0]
+    wav = vocoder(generated.to(device=device, dtype=dtype))[0]
     sample_rate = int(_get(_get(cfg, "preprocess_params"), "sr", 22050))
     save_wav(output_path, wav, sample_rate)
     print(

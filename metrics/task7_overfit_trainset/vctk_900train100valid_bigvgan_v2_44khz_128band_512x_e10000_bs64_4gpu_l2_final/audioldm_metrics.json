@@ -1,0 +1,20 @@
+{
+  "reference_dir": "/mnt/data_sdd/hhy/noiz-tts/semantic2any/outputs/task7_overfit_trainset/reference_tail_prompt1p5_filtered",
+  "generated_dir": "/mnt/data_sdd/hhy/noiz-tts/semantic2any/outputs/task7_overfit_trainset/vctk_900train100valid_bigvgan_v2_44khz_128band_512x_e10000_bs64_4gpu_l2_final_overfit_trainset_prompt1p5_cfg0_temp07",
+  "sample_rate": 16000,
+  "device": "cuda:0",
+  "limit": null,
+  "metrics": {
+    "frechet_distance": 1.1110403909264193,
+    "frechet_audio_distance": 0.4337758776584728,
+    "kullback_leibler_divergence_sigmoid": 0.08107269555330276,
+    "kullback_leibler_divergence_softmax": 0.036135222762823105,
+    "lsd": NaN,
+    "psnr": NaN,
+    "ssim": NaN,
+    "inception_score_mean": 1.190190076406792,
+    "inception_score_std": 0.04534749882629807,
+    "kernel_inception_distance_mean": NaN,
+    "kernel_inception_distance_std": NaN
+  }
+}

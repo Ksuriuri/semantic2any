@@ -1,0 +1,4 @@
+model	pairs	si_sdr_mean	lsd_mean	fad	fd	is_mean	is_std	kl_sigmoid	kl_softmax	speaker_similarity_mean	speaker_similarity_count
+vctk_900train100valid_bigvgan_v2_22khz_80band_256x_e10000_bs32_8gpu_l2_final	877	-24.2318	8.25729	0.220499	1.2658	1.18468	0.0441529	0.106935	0.0348506	0.743252	877
+vctk_900train100valid_bigvgan_v2_44khz_128band_256x_e10000_bs64eff_mbs32_acc2_4gpu_l2_final	877	-24.8229	8.88082	0.421282	1.30315	1.195	0.038332	0.0607859	0.0484495	0.659743	877
+vctk_900train100valid_bigvgan_v2_44khz_128band_512x_e10000_bs64_4gpu_l2_final	877	-26.6807	8.49865	0.433776	1.11104	1.19019	0.0453475	0.0810727	0.0361352	0.676961	877

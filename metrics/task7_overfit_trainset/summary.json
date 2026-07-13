@@ -1,0 +1,44 @@
+[
+  {
+    "model": "vctk_900train100valid_bigvgan_v2_22khz_80band_256x_e10000_bs32_8gpu_l2_final",
+    "pairs": 877,
+    "si_sdr_mean": -24.23178292394636,
+    "lsd_mean": 8.257285820581487,
+    "fad": 0.2204988006212254,
+    "fd": 1.2658039229606786,
+    "is_mean": 1.1846848394234752,
+    "is_std": 0.04415289024084619,
+    "kl_sigmoid": 0.10693531483411789,
+    "kl_softmax": 0.03485064208507538,
+    "speaker_similarity_mean": 0.743252443419419,
+    "speaker_similarity_count": 877
+  },
+  {
+    "model": "vctk_900train100valid_bigvgan_v2_44khz_128band_256x_e10000_bs64eff_mbs32_acc2_4gpu_l2_final",
+    "pairs": 877,
+    "si_sdr_mean": -24.822932958602905,
+    "lsd_mean": 8.880824928544675,
+    "fad": 0.42128162387550816,
+    "fd": 1.3031485380641357,
+    "is_mean": 1.1949953280871102,
+    "is_std": 0.03833200106405798,
+    "kl_sigmoid": 0.060785923153162,
+    "kl_softmax": 0.048449475318193436,
+    "speaker_similarity_mean": 0.659742964603678,
+    "speaker_similarity_count": 877
+  },
+  {
+    "model": "vctk_900train100valid_bigvgan_v2_44khz_128band_512x_e10000_bs64_4gpu_l2_final",
+    "pairs": 877,
+    "si_sdr_mean": -26.680671837881736,
+    "lsd_mean": 8.498652443510641,
+    "fad": 0.4337758776584728,
+    "fd": 1.1110403909264193,
+    "is_mean": 1.190190076406792,
+    "is_std": 0.04534749882629807,
+    "kl_sigmoid": 0.08107269555330276,
+    "kl_softmax": 0.036135222762823105,
+    "speaker_similarity_mean": 0.6769610950287894,
+    "speaker_similarity_count": 877
+  }
+]
