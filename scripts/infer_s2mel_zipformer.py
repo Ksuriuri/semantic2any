@@ -51,6 +51,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--inference-steps", type=int, default=None)
     parser.add_argument("--inference-cfg-rate", type=float, default=None)
+    parser.add_argument(
+        "--style-mode",
+        choices=("reference", "none"),
+        default="reference",
+        help="Use the reference style embedding or mask it after projection.",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--show-progress", action="store_true")
     return parser.parse_args()
@@ -159,6 +165,7 @@ def infer_one(
     inference_cfg_rate: float,
     temperature: float,
     show_progress: bool,
+    style_mode: str,
 ) -> None:
     batch = feature_adapter.extract_from_audio_paths([str(audio_path)])
     mel = batch["mel"].to(device=device, dtype=dtype)
@@ -184,6 +191,7 @@ def infer_one(
         temperature=temperature,
         inference_cfg_rate=inference_cfg_rate,
         show_progress=show_progress,
+        drop_style=style_mode == "none",
     )
     generated = generated[:, :, prompt_len:mel_len]
 
@@ -192,7 +200,8 @@ def infer_one(
     save_wav(output_path, wav, sample_rate)
     print(
         f">> wrote {output_path} "
-        f"(frames={mel_len}, prompt_frames={prompt_len}, generated_frames={mel_len - prompt_len})"
+        f"(style_mode={style_mode}, frames={mel_len}, prompt_frames={prompt_len}, "
+        f"generated_frames={mel_len - prompt_len})"
     )
 
 
@@ -237,9 +246,13 @@ def main() -> None:
         if args.inference_cfg_rate is not None
         else float(_get(cfg.s2mel, "inference_cfg_rate", 0.7))
     )
+    model.models["cfm"].setup_estimator_caches(
+        max_batch_size=2 if inference_cfg_rate > 0 else 1,
+        max_seq_length=int(_get(_get(cfg.s2mel, "DiT"), "block_size", 1)),
+    )
     output_dir = Path(args.output_dir)
     for audio_path in input_paths:
-        output_path = output_dir / f"{audio_path.stem}_s2mel.wav"
+        output_path = output_dir / f"{audio_path.stem}_s2mel_style-{args.style_mode}.wav"
         infer_one(
             audio_path=audio_path,
             output_path=output_path,
@@ -255,6 +268,7 @@ def main() -> None:
             inference_cfg_rate=inference_cfg_rate,
             temperature=args.temperature,
             show_progress=args.show_progress,
+            style_mode=args.style_mode,
         )
 
 

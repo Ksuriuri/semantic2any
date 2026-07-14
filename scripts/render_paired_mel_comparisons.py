@@ -41,6 +41,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inference-steps", type=int, default=None)
     parser.add_argument("--inference-cfg-rate", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument(
+        "--style-mode",
+        choices=("reference", "none"),
+        default="reference",
+        help="Use the prompt reference style embedding or mask it after projection.",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     return parser.parse_args()
 
@@ -137,6 +143,10 @@ def main() -> None:
     sample_rate = int(_get(preprocess, "sr"))
     hop_length = int(_get(spect, "hop_length"))
     inference_steps = args.inference_steps or int(_get(cfg.s2mel, "inference_steps", 25))
+    model.models["cfm"].setup_estimator_caches(
+        max_batch_size=2 if args.inference_cfg_rate > 0 else 1,
+        max_seq_length=int(_get(_get(cfg.s2mel, "DiT"), "block_size", 1)),
+    )
     output_rows = []
 
     for row in rows:
@@ -171,11 +181,12 @@ def main() -> None:
             temperature=args.temperature,
             inference_cfg_rate=args.inference_cfg_rate,
             show_progress=False,
+            drop_style=args.style_mode == "none",
         )
         target_mel = mel[0, :, prompt_len:mel_len]
         generated_mel = sampled[0, :, prompt_len:mel_len]
 
-        output_name = f"{Path(row['output_path']).stem}_mel.png"
+        output_name = f"{Path(row['output_path']).stem}_style-{args.style_mode}_mel.png"
         output_path = output_dir / output_name
         render_comparison(
             target=target_mel,
@@ -196,6 +207,7 @@ def main() -> None:
             "checkpoint": str(Path(args.checkpoint).expanduser().resolve()),
             "checkpoint_epoch": epoch,
             "checkpoint_step": step,
+            "style_mode": args.style_mode,
             "inference_cfg_rate": args.inference_cfg_rate,
             "temperature": args.temperature,
             "sample_rate": sample_rate,

@@ -23,7 +23,6 @@ data:
   max_prompt_seconds: 5.0
   min_target_seconds: null
   min_generated_frames: 8
-  # w2v-bert 2.0 features / MaskGCT semantic codec run at 50 Hz (IndexTTS2 uses code_lens * 1.72 -> mel frames).
   semantic_fps: 50.0
   sample_rate_16k: 16000
   sample_rate_mel: 22050
@@ -44,7 +43,7 @@ preprocess_params:
     fmax: "None"
 
 s2mel:
-  dit_type: ZipFormer
+  dit_type: DiT
   reg_loss_type: l1
   use_gpt_latent: false
   inference_steps: 25
@@ -63,28 +62,33 @@ s2mel:
     f0_condition: false
     n_f0_bins: 512
   DiT:
-    in_channels: 80
-    content_dim: 512
-    zero_prompt_speech_token: false
-  ZipFormer:
     hidden_dim: 512
-    feedforward_dim: 4096
-    num_heads: 4
-    downsampling_factor: [1, 2, 4, 2, 1]
-    num_layers: [2, 2, 4, 4, 4]
-    cnn_module_kernel: [31, 15, 7, 15, 31]
-    query_head_dim: 32
-    value_head_dim: 12
-    pos_head_dim: 4
-    pos_dim: 48
-    time_embed_dim: 192
-    style_condition: true
+    num_heads: 8
+    depth: 13
     class_dropout_prob: 0.1
-    condition_dropout_prob: 0.1
-    use_conv: true
+    block_size: 8192
+    in_channels: 80
+    style_condition: true
+    final_layer_type: wavenet
+    content_dim: 512
+    content_codebook_size: 1024
+    content_type: continuous
+    is_causal: false
+    long_skip_connection: true
+    zero_prompt_speech_token: false
+    time_as_token: false
+    style_as_token: false
+    uvit_skip_connection: true
+  wavenet:
+    hidden_dim: 512
+    num_layers: 8
+    kernel_size: 5
+    dilation_rate: 1
+    p_dropout: 0.2
+    style_condition: true
 
 train:
-  output_dir: exp/s2mel_zipformer
+  output_dir: exp/s2mel_dit
   batch_size: 4
   epochs: 10
   max_steps: 0
@@ -105,4 +109,4 @@ train:
   no_wandb: false
   wandb_entity: haoyuanhuang22-jcxy
   wandb_project: semantic2mel
-  wandb_run_name: s2mel_zipformer-vctk-8gpu
+  wandb_run_name: s2mel_dit

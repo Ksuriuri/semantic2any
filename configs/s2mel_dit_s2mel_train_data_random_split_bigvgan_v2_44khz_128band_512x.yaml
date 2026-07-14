@@ -14,8 +14,6 @@ vocoder:
   local_files_only: true
 
 data:
-  # A directory source loads every *.jsonl manifest in lexical order. Relative
-  # audio paths are resolved from the directory containing each manifest.
   train_jsonl: /mnt/data_3t_1/datasets/preprocess/s2mel-train-data/splits/seed1234_valid1000/train.jsonl
   valid_jsonl: /mnt/data_3t_1/datasets/preprocess/s2mel-train-data/splits/seed1234_valid1000/valid.jsonl
   train_speechdata_dir: ""
@@ -25,7 +23,6 @@ data:
   pair_same_speaker: false
   random_split_audio: true
   min_prompt_seconds: 3.0
-  # null means the split may occur anywhere that leaves the minimum target.
   max_prompt_seconds: null
   min_target_seconds: 3.0
   min_generated_frames: 8
@@ -51,7 +48,7 @@ preprocess_params:
     fmax: "None"
 
 s2mel:
-  dit_type: ZipFormer
+  dit_type: DiT
   reg_loss_type: l2
   use_gpt_latent: false
   inference_steps: 25
@@ -70,32 +67,38 @@ s2mel:
     f0_condition: false
     n_f0_bins: 512
   DiT:
-    in_channels: 128
-    content_dim: 512
-    zero_prompt_speech_token: false
-  ZipFormer:
     hidden_dim: 512
-    feedforward_dim: 4096
-    num_heads: 4
-    downsampling_factor: [1, 2, 4, 2, 1]
-    num_layers: [2, 2, 4, 4, 4]
-    cnn_module_kernel: [31, 15, 7, 15, 31]
-    query_head_dim: 32
-    value_head_dim: 12
-    pos_head_dim: 4
-    pos_dim: 48
-    time_embed_dim: 192
-    style_condition: true
+    num_heads: 8
+    depth: 13
     class_dropout_prob: 0.1
-    condition_dropout_prob: 0.1
-    use_conv: true
+    block_size: 8192
+    in_channels: 128
+    style_condition: true
+    final_layer_type: wavenet
+    content_dim: 512
+    content_codebook_size: 1024
+    content_type: continuous
+    is_causal: false
+    long_skip_connection: true
+    zero_prompt_speech_token: false
+    time_as_token: false
+    style_as_token: false
+    uvit_skip_connection: true
+  wavenet:
+    hidden_dim: 512
+    num_layers: 8
+    kernel_size: 5
+    dilation_rate: 1
+    p_dropout: 0.2
+    style_condition: true
 
 train:
-  output_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/exp/s2mel_train_data_random_split_bigvgan_v2_44khz_128band_512x
-  batch_size: 32
+  output_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/exp/s2mel_dit_train_data_random_split_bigvgan_v2_44khz_128band_512x
+  # Match the ZipFormer baseline's global batch: 8 × 4 accumulation × 4 GPUs = 128.
+  batch_size: 8
   epochs: 10
   max_steps: 0
-  grad_accumulation: 1
+  grad_accumulation: 4
   learning_rate: 1.0e-4
   min_learning_rate: 1.0e-5
   weight_decay: 0.01
@@ -112,4 +115,4 @@ train:
   no_wandb: false
   wandb_entity: haoyuanhuang22-jcxy
   wandb_project: semantic2mel
-  wandb_run_name: s2mel-train-data-random-split-bigvgan-v2-44khz-128band-512x
+  wandb_run_name: s2mel-dit-train-data-random-split-bigvgan-v2-44khz-128band-512x

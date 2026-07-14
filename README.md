@@ -173,3 +173,15 @@ Checkpoints contain an IndexTTS-style `net` dictionary:
 
 This is intended to make later inference integration close to the IndexTTS2
 `s2mel.pth` loading path.
+
+## Style ablation
+
+See [`docs/style-ablation.md`](docs/style-ablation.md) for the portable
+environment setup, matched style/no-style training commands, runtime style
+masking, paired inference, resume procedure, and reporting checklist.
+
+## Backbone ablation
+
+See [`docs/backbone-ablation.md`](docs/backbone-ablation.md) for the
+parameter-matched ZipFormer versus IndexTTS2-derived DiT experiment protocol,
+portable launch commands, and checkpoint compatibility rules.

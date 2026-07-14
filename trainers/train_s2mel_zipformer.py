@@ -40,8 +40,56 @@ def _optional_float(value) -> float | None:
     return None if value in (None, "None") else float(value)
 
 
+def _dit_type(cfg) -> str:
+    return str(_get(cfg.s2mel, "dit_type", "ZipFormer"))
+
+
+def _set_style_condition(cfg, enabled: bool) -> None:
+    dit_type = _dit_type(cfg)
+    if dit_type == "ZipFormer":
+        cfg.s2mel.ZipFormer.style_condition = enabled
+        return
+    if dit_type == "DiT":
+        cfg.s2mel.DiT.style_condition = enabled
+        cfg.s2mel.wavenet.style_condition = enabled
+        return
+    raise ValueError(f"Unsupported s2mel.dit_type={dit_type!r} for style override")
+
+
+def model_parameter_metadata(model, cfg) -> dict[str, int | str]:
+    cfm = model.models["cfm"]
+    return {
+        "dit_type": _dit_type(cfg),
+        "estimator_parameters": sum(parameter.numel() for parameter in cfm.estimator.parameters()),
+        "cfm_parameters": sum(parameter.numel() for parameter in cfm.parameters()),
+        "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
+    }
+
+
+def validate_resume_backbone(cfg, resume_path: Path | None) -> None:
+    """Fail early instead of silently partially loading another backbone."""
+    if resume_path is None:
+        return
+    checkpoint_config = None
+    if resume_path.is_file():
+        checkpoint_config = torch.load(resume_path, map_location="cpu").get("config")
+    elif resume_path.is_dir():
+        resolved_config = resume_path.parent / "config.resolved.yaml"
+        if resolved_config.is_file():
+            checkpoint_config = OmegaConf.load(resolved_config)
+    if checkpoint_config is None:
+        return
+    checkpoint_s2mel = _get(checkpoint_config, "s2mel")
+    checkpoint_dit_type = str(_get(checkpoint_s2mel, "dit_type", "ZipFormer"))
+    if checkpoint_dit_type != _dit_type(cfg):
+        raise ValueError(
+            f"Cannot resume {checkpoint_dit_type} checkpoint with {_dit_type(cfg)} config. "
+            "Backbone checkpoints are not compatible."
+        )
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train IndexTTS2.5-style ZipFormer semantic2mel.")
+    parser = argparse.ArgumentParser(description="Train an IndexTTS2.5-style semantic2mel estimator.")
     parser.add_argument("--config", default="configs/s2mel_zipformer.yaml")
     parser.add_argument("--train-jsonl", default=None)
     parser.add_argument("--valid-jsonl", default=None)
@@ -58,6 +106,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-from", default=None)
     parser.add_argument("--resume-epoch-step", type=int, default=None)
     parser.add_argument("--no-wandb", action="store_true")
+    style_group = parser.add_mutually_exclusive_group()
+    style_group.add_argument(
+        "--style-condition",
+        dest="style_condition",
+        action="store_true",
+        default=None,
+        help="Include the CAMPPlus style channel in the selected estimator.",
+    )
+    style_group.add_argument(
+        "--no-style-condition",
+        dest="style_condition",
+        action="store_false",
+        default=None,
+        help="Train a no-style baseline from scratch.",
+    )
     return parser.parse_args()
 
 
@@ -90,23 +153,33 @@ def apply_overrides(cfg, args: argparse.Namespace):
         cfg.train.resume_from = args.resume_from
     if args.no_wandb:
         cfg.train.no_wandb = True
+    if args.style_condition is not None:
+        _set_style_condition(cfg, args.style_condition)
     return cfg
 
 
-def cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int):
-    """Cosine LR with warmup, clamped at the end.
+def cosine_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_lr_ratio: float = 0.0,
+):
+    """Cosine LR with warmup, clamped at the configured minimum.
 
     Unlike transformers.get_cosine_schedule_with_warmup, stepping past
-    num_training_steps (e.g. after a resume replay) keeps the LR at 0 instead
-    of climbing back up the cosine curve.
+    num_training_steps (e.g. after a resume replay) keeps the LR at its
+    minimum instead of climbing back up the cosine curve.
     """
+    if not 0.0 <= min_lr_ratio <= 1.0:
+        raise ValueError(f"min_lr_ratio must be in [0, 1], got {min_lr_ratio}")
 
     def lr_lambda(current_step: int) -> float:
         if current_step < num_warmup_steps:
             return current_step / max(1, num_warmup_steps)
         progress = (current_step - num_warmup_steps) / max(1, num_training_steps - num_warmup_steps)
         progress = min(progress, 1.0)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -126,10 +199,20 @@ def make_lr_scheduler(optimizer, cfg, num_training_steps: int):
     schedule = str(_get(cfg.train, "lr_scheduler", "cosine")).lower()
     warmup_steps = int(cfg.train.warmup_steps)
     if schedule == "cosine":
+        learning_rate = float(cfg.train.learning_rate)
+        min_learning_rate = float(_get(cfg.train, "min_learning_rate", 1.0e-5))
+        if learning_rate <= 0.0:
+            raise ValueError(f"train.learning_rate must be positive, got {learning_rate}")
+        if not 0.0 <= min_learning_rate <= learning_rate:
+            raise ValueError(
+                "train.min_learning_rate must be between 0 and train.learning_rate; "
+                f"got {min_learning_rate} and {learning_rate}"
+            )
         return cosine_schedule_with_warmup(
             optimizer,
             num_warmup_steps=warmup_steps,
             num_training_steps=num_training_steps,
+            min_lr_ratio=min_learning_rate / learning_rate,
         )
     if schedule == "constant_with_warmup":
         return constant_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps)
@@ -588,6 +671,27 @@ def main() -> None:
     model = Semantic2MelModel(cfg.s2mel)
     resume_from = str(cfg.train.resume_from or "")
     resume_path = Path(resume_from).expanduser() if resume_from else None
+    validate_resume_backbone(cfg, resume_path)
+    metadata = model_parameter_metadata(model, cfg)
+    if accelerator.is_main_process:
+        (output_dir / "model_metadata.json").write_text(
+            json.dumps(metadata, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(
+            "[Model] "
+            f"dit_type={metadata['dit_type']} "
+            f"estimator_parameters={metadata['estimator_parameters']:,} "
+            f"model_parameters={metadata['model_parameters']:,}"
+        )
+    accelerator.log(
+        {
+            "model/estimator_parameters": metadata["estimator_parameters"],
+            "model/cfm_parameters": metadata["cfm_parameters"],
+            "model/parameters": metadata["model_parameters"],
+        },
+        step=0,
+    )
     start_epoch = 0
     global_step = 0
     resume_epoch_step = 0
@@ -634,6 +738,12 @@ def main() -> None:
                 f"[Resume] Loaded accelerator state {resume_path} "
                 f"at epoch={start_epoch + 1} step={global_step} epoch_step={resume_epoch_step}"
             )
+
+    if _dit_type(cfg) == "DiT":
+        accelerator.unwrap_model(model).models["cfm"].setup_estimator_caches(
+            max_batch_size=int(cfg.train.batch_size),
+            max_seq_length=int(cfg.s2mel.DiT.block_size),
+        )
 
     feature_adapter_ref: list[IndexTTSFeatureAdapter | None] = [None]
     model.train()

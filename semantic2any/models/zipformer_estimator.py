@@ -69,7 +69,7 @@ class ZipFormerEstimator(nn.Module):
         style: Tensor,
         cond: Tensor,
         prompt_lens: Tensor | None = None,
-        mask_content: bool = False,
+        drop_style: bool = False,
     ) -> Tensor:
         del prompt_lens
         batch, _, frames = x.shape
@@ -78,21 +78,19 @@ class ZipFormerEstimator(nn.Module):
         cond = _fit_time(cond, frames)
         cond = self.cond_projection(cond)
 
-        drop_condition = mask_content
         if self.training and self.condition_dropout_prob > 0:
             drop = torch.rand(batch, 1, 1, device=x.device) < self.condition_dropout_prob
             cond = torch.where(drop, torch.zeros_like(cond), cond)
             prompt_in = torch.where(drop, torch.zeros_like(prompt_in), prompt_in)
-            drop_condition = False
 
         parts = [x_in, prompt_in, cond]
         if self.style_condition:
             style = self.style_projection(style)
-            if drop_condition:
+            if drop_style:
                 style = torch.zeros_like(style)
             elif self.training and self.class_dropout_prob > 0:
-                drop_style = torch.rand(batch, 1, device=x.device) < self.class_dropout_prob
-                style = torch.where(drop_style, torch.zeros_like(style), style)
+                style_dropout_mask = torch.rand(batch, 1, device=x.device) < self.class_dropout_prob
+                style = torch.where(style_dropout_mask, torch.zeros_like(style), style)
             parts.append(style.unsqueeze(1).expand(-1, frames, -1))
 
         decoder_in = torch.cat(parts, dim=-1)
