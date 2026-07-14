@@ -131,3 +131,10 @@ gcloud storage cp gs://noiz-taiwan-audio-data/preprocessed/<dataset>/metadata/<s
 
 Do not rely on object ACLs for access control; the bucket uses IAM through
 Uniform Bucket-Level Access.
+
+## Duration-filtered Local Mirror
+
+For the reproducible `duration > 6.0` loose-FLAC mirror used by the random-split
+training setup, see [s2mel-train-data-sync.md](s2mel-train-data-sync.md). It
+documents the centralized metadata layout, the resumable tmux workflow, and the
+checked-in sync script.

@@ -8,48 +8,55 @@ paths:
   w2v_bert_dir: w2v-bert-2.0
   w2v_stat: wav2vec2bert_stats.pt
 
+vocoder:
+  model_id: nvidia/bigvgan_v2_44khz_128band_512x
+  cache_dir: /mnt/data_sdd/hhy/noiz-tts/vae-eval/.hf_cache
+  local_files_only: true
+
 data:
-  train_jsonl: ""
-  valid_jsonl: ""
+  # A directory source loads every *.jsonl manifest in lexical order. Relative
+  # audio paths are resolved from the directory containing each manifest.
+  train_jsonl: /mnt/data_3t_1/datasets/preprocess/s2mel-train-data/splits/seed1234_valid1000/train.jsonl
+  valid_jsonl: /mnt/data_3t_1/datasets/preprocess/s2mel-train-data/splits/seed1234_valid1000/valid.jsonl
   train_speechdata_dir: ""
   valid_speechdata_dir: ""
   speechdata_cache_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/.cache/speechdata
   max_audio_seconds: 30.0
-  pair_same_speaker: true
-  random_split_audio: false
-  max_pair_seconds: 30.0
-  min_pair_prompt_seconds: 3.0
-  min_prompt_seconds: 1.0
-  max_prompt_seconds: 5.0
-  min_target_seconds: null
+  pair_same_speaker: false
+  random_split_audio: true
+  min_prompt_seconds: 3.0
+  # null means the split may occur anywhere that leaves the minimum target.
+  max_prompt_seconds: null
+  min_target_seconds: 3.0
   min_generated_frames: 8
-  # w2v-bert 2.0 features / MaskGCT semantic codec run at 50 Hz (IndexTTS2 uses code_lens * 1.72 -> mel frames).
   semantic_fps: 50.0
   sample_rate_16k: 16000
-  sample_rate_mel: 22050
+  sample_rate_mel: 44100
   num_workers: 8
   prefetch_factor: 2
-  decode_audio_in_worker: false
-  skip_audio_errors: false
+  decode_audio_in_worker: true
+  skip_audio_errors: true
   feature_batch_size: 16
+  preload_features: false
+  preload_batch_size: 16
 
 preprocess_params:
-  sr: 22050
+  sr: 44100
   spect_params:
-    n_fft: 1024
-    win_length: 1024
-    hop_length: 256
-    n_mels: 80
+    n_fft: 2048
+    win_length: 2048
+    hop_length: 512
+    n_mels: 128
     fmin: 0
     fmax: "None"
 
 s2mel:
   dit_type: ZipFormer
-  reg_loss_type: l1
+  reg_loss_type: l2
   use_gpt_latent: false
   inference_steps: 25
   inference_cfg_rate: 0.7
-  length_ratio: 1.72
+  length_ratio: 1.72265625
   style_encoder:
     dim: 192
   length_regulator:
@@ -63,7 +70,7 @@ s2mel:
     f0_condition: false
     n_f0_bins: 512
   DiT:
-    in_channels: 80
+    in_channels: 128
     content_dim: 512
     zero_prompt_speech_token: false
   ZipFormer:
@@ -84,23 +91,24 @@ s2mel:
     use_conv: true
 
 train:
-  output_dir: exp/s2mel_zipformer
-  batch_size: 4
+  output_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/exp/s2mel_train_data_random_split_bigvgan_v2_44khz_128band_512x
+  batch_size: 32
   epochs: 10
   max_steps: 0
   grad_accumulation: 1
   learning_rate: 1.0e-4
   weight_decay: 0.01
   warmup_steps: 1000
+  lr_scheduler: constant_with_warmup
   grad_clip: 1.0
   mixed_precision: fp16
   log_interval: 20
-  valid_interval: 500
-  save_interval: 10000
-  archive_save_interval: 0
-  keep_last: 5
+  valid_interval: 1000
+  save_interval: 1000
+  archive_save_interval: 10000
+  keep_last: 3
   resume_from: ""
   no_wandb: false
   wandb_entity: haoyuanhuang22-jcxy
   wandb_project: semantic2mel
-  wandb_run_name: s2mel_zipformer-vctk-8gpu
+  wandb_run_name: s2mel-train-data-random-split-bigvgan-v2-44khz-128band-512x

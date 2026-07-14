@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import random
 import shutil
 import tarfile
+import warnings
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 import torch
+import torchaudio
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
@@ -82,14 +85,32 @@ def choose_prompt_len(
     hop_length: int,
     sample_rate: int,
     min_prompt_seconds: float,
-    max_prompt_seconds: float,
+    max_prompt_seconds: float | None,
     min_generated_frames: int,
+    min_target_seconds: float | None = None,
 ) -> int:
-    min_frames = max(1, int(min_prompt_seconds * sample_rate / hop_length))
-    max_frames = max(min_frames, int(max_prompt_seconds * sample_rate / hop_length))
-    upper = max(1, min(max_frames, mel_len - min_generated_frames))
-    if upper <= min_frames:
-        return max(1, min(upper, mel_len - 1))
+    min_frames = max(1, math.ceil(min_prompt_seconds * sample_rate / hop_length))
+    max_frames = (
+        mel_len
+        if max_prompt_seconds is None
+        else max(min_frames, int(max_prompt_seconds * sample_rate / hop_length))
+    )
+    min_target_frames = max(1, min_generated_frames)
+    if min_target_seconds is not None:
+        min_target_frames = max(
+            min_target_frames,
+            math.ceil(min_target_seconds * sample_rate / hop_length),
+        )
+    upper = min(max_frames, mel_len - min_target_frames)
+    if upper < min_frames:
+        required_seconds = min_prompt_seconds + (min_target_seconds or 0.0)
+        raise ValueError(
+            f"Audio has {mel_len} mel frames, too short for a "
+            f"{min_prompt_seconds:g}s prompt and {min_target_seconds or 0:g}s target "
+            f"(at least {required_seconds:g}s before STFT boundary effects)"
+        )
+    if upper == min_frames:
+        return min_frames
     return random.randint(min_frames, upper)
 
 
@@ -163,18 +184,31 @@ class S2MelJsonlDataset(Dataset):
 
     def __init__(self, manifest_path: str | Path) -> None:
         self.manifest_path = Path(manifest_path).expanduser()
-        self.base_dir = self.manifest_path.parent
+        if self.manifest_path.is_dir():
+            self.manifest_paths = sorted(self.manifest_path.glob("*.jsonl"))
+            self.base_dir = self.manifest_path
+        elif self.manifest_path.is_file():
+            self.manifest_paths = [self.manifest_path]
+            self.base_dir = self.manifest_path.parent
+        else:
+            raise FileNotFoundError(f"JSONL manifest source not found: {self.manifest_path}")
+        if not self.manifest_paths:
+            raise ValueError(f"No JSONL manifests found under {self.manifest_path}")
+
         self.records: list[dict[str, Any]] = []
-        with self.manifest_path.open("r", encoding="utf-8") as f:
-            for line_no, line in enumerate(f, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                for key in ("audio_path", "mel_path", "semantic_path", "style_path"):
-                    record[key] = _resolve_path(self.base_dir, record.get(key))
-                record["_line_no"] = line_no
-                self.records.append(record)
+        for current_manifest in self.manifest_paths:
+            base_dir = current_manifest.parent
+            with current_manifest.open("r", encoding="utf-8") as f:
+                for line_no, line in enumerate(f, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    for key in ("audio_path", "mel_path", "semantic_path", "style_path"):
+                        record[key] = _resolve_path(base_dir, record.get(key))
+                    record["_line_no"] = line_no
+                    record["_manifest_path"] = str(current_manifest)
+                    self.records.append(record)
         if not self.records:
             raise ValueError(f"No records found in {self.manifest_path}")
 
@@ -653,18 +687,54 @@ class S2MelCollator:
         hop_length: int,
         sample_rate: int,
         min_prompt_seconds: float,
-        max_prompt_seconds: float,
+        max_prompt_seconds: float | None,
         min_generated_frames: int,
+        min_target_seconds: float | None = None,
         max_pair_seconds: float = 30.0,
         min_pair_prompt_seconds: float = 3.0,
+        decode_audio_in_worker: bool = False,
+        skip_audio_errors: bool = False,
+        max_audio_seconds: float | None = None,
     ) -> None:
         self.hop_length = hop_length
         self.sample_rate = sample_rate
         self.min_prompt_seconds = min_prompt_seconds
         self.max_prompt_seconds = max_prompt_seconds
         self.min_generated_frames = min_generated_frames
+        self.min_target_seconds = min_target_seconds
         self.max_pair_seconds = max_pair_seconds
         self.min_pair_prompt_seconds = min_pair_prompt_seconds
+        self.decode_audio_in_worker = decode_audio_in_worker
+        self.skip_audio_errors = skip_audio_errors
+        self.max_audio_seconds = max_audio_seconds
+
+    def _decode_audio_paths(
+        self, audio_paths: list[str]
+    ) -> tuple[list[torch.Tensor], list[int], list[int]]:
+        waveforms = []
+        sample_rates = []
+        valid_indices = []
+        for index, path in enumerate(audio_paths):
+            try:
+                audio, sample_rate = torchaudio.load(path)
+            except (OSError, RuntimeError, ValueError) as exc:
+                if not self.skip_audio_errors:
+                    raise
+                warnings.warn(
+                    f"Skipping undecodable audio file {path}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
+            if audio.size(0) > 1:
+                audio = audio.mean(dim=0, keepdim=True)
+            if self.max_audio_seconds is not None:
+                max_samples = int(self.max_audio_seconds * sample_rate)
+                audio = audio[:, :max_samples]
+            waveforms.append(audio)
+            sample_rates.append(sample_rate)
+            valid_indices.append(index)
+        return waveforms, sample_rates, valid_indices
 
     @staticmethod
     def _has_precomputed(record: dict[str, Any]) -> bool:
@@ -727,6 +797,7 @@ class S2MelCollator:
                     min_prompt_seconds=self.min_prompt_seconds,
                     max_prompt_seconds=self.max_prompt_seconds,
                     min_generated_frames=self.min_generated_frames,
+                    min_target_seconds=self.min_target_seconds,
                 )
             )
             mels.append(mel.transpose(0, 1))
@@ -788,13 +859,62 @@ class S2MelCollator:
             target_audio_paths = [record.get("audio_path") for record in target_records]
             if any(path is None for path in prompt_audio_paths + target_audio_paths):
                 raise ValueError("Paired records must contain prompt and target audio_path")
-            return {
+            batch = {
                 "prompt_audio_paths": prompt_audio_paths,
                 "target_audio_paths": target_audio_paths,
                 "records": records,
                 "is_precomputed": False,
                 "is_paired": True,
             }
+            if self.decode_audio_in_worker:
+                prompt_waveforms, prompt_sample_rates, prompt_indices = self._decode_audio_paths(
+                    prompt_audio_paths
+                )
+                target_waveforms, target_sample_rates, target_indices = self._decode_audio_paths(
+                    target_audio_paths
+                )
+                prompt_decoded = {
+                    index: (waveform, sample_rate)
+                    for index, waveform, sample_rate in zip(
+                        prompt_indices, prompt_waveforms, prompt_sample_rates, strict=True
+                    )
+                }
+                target_decoded = {
+                    index: (waveform, sample_rate)
+                    for index, waveform, sample_rate in zip(
+                        target_indices, target_waveforms, target_sample_rates, strict=True
+                    )
+                }
+                valid_indices = [
+                    index
+                    for index in range(len(records))
+                    if index in prompt_decoded and index in target_decoded
+                ]
+                if not valid_indices:
+                    raise RuntimeError("No fully decodable prompt/target pairs remain in batch")
+                prompt_audio_paths = [prompt_audio_paths[index] for index in valid_indices]
+                target_audio_paths = [target_audio_paths[index] for index in valid_indices]
+                records = [records[index] for index in valid_indices]
+                batch.update(
+                    {
+                        "prompt_audio_paths": prompt_audio_paths,
+                        "target_audio_paths": target_audio_paths,
+                        "records": records,
+                        "prompt_audio_waveforms": [
+                            prompt_decoded[index][0] for index in valid_indices
+                        ],
+                        "prompt_audio_sample_rates": [
+                            prompt_decoded[index][1] for index in valid_indices
+                        ],
+                        "target_audio_waveforms": [
+                            target_decoded[index][0] for index in valid_indices
+                        ],
+                        "target_audio_sample_rates": [
+                            target_decoded[index][1] for index in valid_indices
+                        ],
+                    }
+                )
+            return batch
 
         has_precomputed = [self._has_precomputed(record) for record in records]
         if all(has_precomputed):
@@ -805,8 +925,17 @@ class S2MelCollator:
         if any(path is None for path in audio_paths):
             missing = [r.get("_line_no") for r, path in zip(records, audio_paths, strict=True) if path is None]
             raise ValueError(f"Records missing audio_path: {missing}")
-        return {
+        batch = {
             "audio_paths": audio_paths,
             "records": records,
             "is_precomputed": False,
         }
+        if self.decode_audio_in_worker:
+            waveforms, sample_rates, valid_indices = self._decode_audio_paths(audio_paths)
+            if not valid_indices:
+                raise RuntimeError("No decodable audio files remain in batch")
+            batch["audio_paths"] = [audio_paths[index] for index in valid_indices]
+            batch["records"] = [records[index] for index in valid_indices]
+            batch["audio_waveforms"] = waveforms
+            batch["audio_sample_rates"] = sample_rates
+        return batch

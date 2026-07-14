@@ -36,6 +36,10 @@ def _get(obj, name: str, default=None):
     return getattr(obj, name, obj.get(name, default) if isinstance(obj, dict) else default)
 
 
+def _optional_float(value) -> float | None:
+    return None if value in (None, "None") else float(value)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train IndexTTS2.5-style ZipFormer semantic2mel.")
     parser.add_argument("--config", default="configs/s2mel_zipformer.yaml")
@@ -52,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--resume-from", default=None)
+    parser.add_argument("--resume-epoch-step", type=int, default=None)
     parser.add_argument("--no-wandb", action="store_true")
     return parser.parse_args()
 
@@ -106,19 +111,36 @@ def cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_s
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def _looks_like_speechdata_source(source: str) -> bool:
-    if source.startswith("gs://"):
-        return True
-    path = Path(source).expanduser()
-    if path.is_file():
-        return path.parent.name == "metadata"
-    if path.is_dir():
-        return (path / "metadata").is_dir() or path.name == "metadata"
-    return False
+def constant_schedule_with_warmup(optimizer, num_warmup_steps: int):
+    """Linear warmup followed by a constant learning rate."""
+
+    def lr_lambda(current_step: int) -> float:
+        if current_step < num_warmup_steps:
+            return current_step / max(1, num_warmup_steps)
+        return 1.0
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def make_lr_scheduler(optimizer, cfg, num_training_steps: int):
+    schedule = str(_get(cfg.train, "lr_scheduler", "cosine")).lower()
+    warmup_steps = int(cfg.train.warmup_steps)
+    if schedule == "cosine":
+        return cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+    if schedule == "constant_with_warmup":
+        return constant_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps)
+    raise ValueError(
+        f"Unsupported train.lr_scheduler={schedule!r}; "
+        "expected 'cosine' or 'constant_with_warmup'"
+    )
 
 
 def make_source_dataset(cfg, source: str, *, speechdata: bool = False) -> Dataset:
-    if speechdata or _looks_like_speechdata_source(source):
+    if speechdata:
         return S2MelSpeechDataDataset(
             source,
             cache_dir=_get(cfg.data, "speechdata_cache_dir", None),
@@ -142,10 +164,14 @@ def make_dataloader(
         hop_length=int(spect.hop_length),
         sample_rate=int(cfg.preprocess_params.sr),
         min_prompt_seconds=float(cfg.data.min_prompt_seconds),
-        max_prompt_seconds=float(cfg.data.max_prompt_seconds),
+        max_prompt_seconds=_optional_float(_get(cfg.data, "max_prompt_seconds", 5.0)),
         min_generated_frames=int(cfg.data.min_generated_frames),
+        min_target_seconds=_optional_float(_get(cfg.data, "min_target_seconds", None)),
         max_pair_seconds=float(_get(cfg.data, "max_pair_seconds", 30.0)),
         min_pair_prompt_seconds=float(_get(cfg.data, "min_pair_prompt_seconds", 3.0)),
+        decode_audio_in_worker=bool(_get(cfg.data, "decode_audio_in_worker", False)),
+        skip_audio_errors=bool(_get(cfg.data, "skip_audio_errors", False)),
+        max_audio_seconds=_optional_float(_get(cfg.data, "max_audio_seconds", None)),
     )
     kwargs: dict[str, Any] = {}
     if int(cfg.data.num_workers) > 0:
@@ -236,15 +262,50 @@ def make_speaker_paired_dataset(
     )
 
 
-def rotate_checkpoints(output_dir: Path, keep_last: int) -> None:
+def _weight_checkpoint_step(path: Path) -> int | None:
+    name = path.name
+    if not name.startswith("s2mel_step") or not name.endswith(".pth"):
+        return None
+    try:
+        return int(name.removeprefix("s2mel_step").removesuffix(".pth"))
+    except ValueError:
+        return None
+
+
+def rotate_checkpoints(
+    output_dir: Path,
+    keep_last: int,
+    *,
+    archive_interval: int = 0,
+) -> None:
     if keep_last <= 0:
         return
-    ckpts = sorted(output_dir.glob("checkpoint-*"), key=lambda p: p.stat().st_mtime)
-    stale = ckpts[: max(0, len(ckpts) - keep_last)]
-    for path in stale:
+
+    def is_archived(step: int) -> bool:
+        return archive_interval > 0 and step % archive_interval == 0
+
+    regular_checkpoints = sorted(
+        (
+            (step, path)
+            for path in output_dir.glob("checkpoint-*")
+            if (step := _parse_checkpoint_step(path)) is not None
+            and not is_archived(step)
+        ),
+        key=lambda item: item[0],
+    )
+    for _, path in regular_checkpoints[: max(0, len(regular_checkpoints) - keep_last)]:
         shutil.rmtree(path, ignore_errors=True)
-    weights = sorted(output_dir.glob("s2mel_step*.pth"), key=lambda p: p.stat().st_mtime)
-    for path in weights[: max(0, len(weights) - keep_last)]:
+
+    regular_weights = sorted(
+        (
+            (step, path)
+            for path in output_dir.glob("s2mel_step*.pth")
+            if (step := _weight_checkpoint_step(path)) is not None
+            and not is_archived(step)
+        ),
+        key=lambda item: item[0],
+    )
+    for _, path in regular_weights[: max(0, len(regular_weights) - keep_last)]:
         path.unlink(missing_ok=True)
 
 
@@ -304,8 +365,22 @@ def build_training_batch(
         return feature_adapter_ref[0].extract_paired_from_audio_paths(
             batch["prompt_audio_paths"],
             batch["target_audio_paths"],
+            prompt_waveforms=batch.get("prompt_audio_waveforms"),
+            prompt_sample_rates=batch.get("prompt_audio_sample_rates"),
+            target_waveforms=batch.get("target_audio_waveforms"),
+            target_sample_rates=batch.get("target_audio_sample_rates"),
         )
-    return feature_adapter_ref[0].extract_from_audio_paths(batch["audio_paths"])
+    if bool(_get(cfg.data, "random_split_audio", False)):
+        return feature_adapter_ref[0].extract_random_split_from_audio_paths(
+            batch["audio_paths"],
+            waveforms=batch.get("audio_waveforms"),
+            sample_rates=batch.get("audio_sample_rates"),
+        )
+    return feature_adapter_ref[0].extract_from_audio_paths(
+        batch["audio_paths"],
+        waveforms=batch.get("audio_waveforms"),
+        sample_rates=batch.get("audio_sample_rates"),
+    )
 
 
 def forward_loss(model, batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -388,7 +463,11 @@ def save_training_checkpoint(
             step=global_step,
             config=OmegaConf.to_container(cfg, resolve=True),
         )
-        rotate_checkpoints(output_dir, int(cfg.train.keep_last))
+        rotate_checkpoints(
+            output_dir,
+            int(cfg.train.keep_last),
+            archive_interval=int(_get(cfg.train, "archive_save_interval", 0)),
+        )
         print(f"[Checkpoint] Saved {save_dir}")
 
 
@@ -524,11 +603,7 @@ def main() -> None:
     )
     updates_per_epoch = math.ceil(len(train_loader) / int(cfg.train.grad_accumulation))
     total_steps = int(cfg.train.max_steps) if int(cfg.train.max_steps) > 0 else int(cfg.train.epochs) * updates_per_epoch
-    scheduler = cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(cfg.train.warmup_steps),
-        num_training_steps=max(1, total_steps),
-    )
+    scheduler = make_lr_scheduler(optimizer, cfg, num_training_steps=max(1, total_steps))
     if resume_path is not None and resume_path.is_file() and global_step > 0:
         # Weights-only checkpoints carry no scheduler state. Fast-forward the LR
         # schedule so training does not restart warmup at full LR. The prepared
@@ -552,6 +627,8 @@ def main() -> None:
     if resume_path is not None and resume_path.is_dir():
         start_epoch, global_step, resume_epoch_step = load_training_resume_state(resume_path)
         accelerator.load_state(str(resume_path))
+        if args.resume_epoch_step is not None:
+            resume_epoch_step = args.resume_epoch_step
         if accelerator.is_main_process:
             print(
                 f"[Resume] Loaded accelerator state {resume_path} "
@@ -612,7 +689,11 @@ def main() -> None:
                         print(f"[Valid] step={global_step} loss={val_loss:.5f}")
                     accelerator.log({"valid/loss": val_loss}, step=global_step)
 
-                if global_step % int(cfg.train.save_interval) == 0:
+                save_interval = int(cfg.train.save_interval)
+                archive_interval = int(_get(cfg.train, "archive_save_interval", 0))
+                save_regular = save_interval > 0 and global_step % save_interval == 0
+                save_archive = archive_interval > 0 and global_step % archive_interval == 0
+                if save_regular or save_archive:
                     save_training_checkpoint(
                         accelerator=accelerator,
                         model=model,

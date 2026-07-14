@@ -31,7 +31,23 @@ Each target is paired at runtime with a different utterance carrying the same
 the generated suffix comes from the target. Their combined duration is capped
 at 30 seconds: the prompt is shortened first but never below three seconds,
 then the target is shortened if necessary. Set `data.pair_same_speaker: false`
-to retain the legacy single-utterance random-prefix behavior.
+to disable speaker pairing. With `data.random_split_audio: false`, this retains
+the legacy single-utterance random-prefix behavior.
+
+For local datasets organized as one audio subdirectory per source, the JSONL
+loader also accepts the entire metadata directory:
+
+```text
+<dataset-root>/
+  ears/*.flac
+  expresso/*.flac
+  metadata/ears.jsonl
+  metadata/expresso.jsonl
+```
+
+Relative paths such as `"audio_path": "../ears/example.flac"` are resolved
+relative to the JSONL file. Passing `metadata/` loads every `*.jsonl` in that
+directory.
 
 Optional precomputed fields are supported for faster iteration:
 
@@ -46,7 +62,7 @@ Optional precomputed fields are supported for faster iteration:
 
 Tensor conventions:
 
-- `mel`: `[80, T]`
+- `mel`: `[n_mels, T]` (80 or 128 depending on the config)
 - `semantic`: `[T_sem, 1024]` continuous semantic embeddings or `[Q, T_sem]`
   discrete codebooks when using a discrete length regulator
 - `style`: `[192]`
@@ -93,6 +109,38 @@ tmux new-session -s s2mel-train
 ```
 
 Detach with `Ctrl-b d` and reconnect with `tmux attach -t s2mel-train`.
+
+### Random prompt/target split dataset
+
+The dataset under
+`/mnt/data_3t_1/datasets/preprocess/s2mel-train-data` has a dedicated 44.1 kHz,
+128-band, 512-hop config and launcher. It disables speaker pairing and randomly
+splits each waveform before feature extraction. Both prompt and target contain
+at least three seconds of source audio; mel and semantic features are extracted
+independently for the two segments, and the style embedding is computed from
+the prompt only. DataLoader workers decode and prefetch waveforms. Segments
+sharing a source sample rate are padded into a batch, moved to the feature
+adapter device, and passed through cached 44.1 kHz and 16 kHz GPU resamplers;
+the padded outputs are trimmed back to their individual lengths.
+
+The default launcher loads all `metadata/*.jsonl` files and uses four GPUs:
+
+```bash
+tmux new-session -s s2mel-random-split
+bash scripts/train_s2mel_random_split.sh
+```
+
+Detach with `Ctrl-b d`. To train only EARS:
+
+```bash
+TRAIN_JSONL=/mnt/data_3t_1/datasets/preprocess/s2mel-train-data/metadata/ears.jsonl \
+  bash scripts/train_s2mel_random_split.sh
+```
+
+The launcher supports `DATASET_ROOT`, `TRAIN_JSONL`, `CONFIG`,
+`NUM_PROCESSES`, `NUM_MACHINES`, and `MAIN_PROCESS_PORT` environment
+overrides. Its default config is
+`configs/s2mel_zipformer_s2mel_train_data_random_split_bigvgan_v2_44khz_128band_512x.yaml`.
 
 ```bash
 accelerate launch trainers/train_s2mel_zipformer.py \
