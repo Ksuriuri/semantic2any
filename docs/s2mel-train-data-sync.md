@@ -2,7 +2,8 @@
 
 本文记录 `/mnt/data_3t_1/datasets/preprocess/s2mel-train-data` 的来源、
 筛选规则、目录结构和新机器同步方法。同步入口是
-`scripts/sync_s2mel_train_data.py`。
+`scripts/sync_s2mel_train_data.py`，固定训练/验证划分入口是
+`scripts/split_s2mel_validation.py`。
 
 ## 数据来源
 
@@ -64,6 +65,11 @@ s2mel-train-data/
     StarRail.jsonl
     vctk.jsonl
     WutheringWaves.jsonl
+  splits/
+    seed1234_valid1000/
+      train.jsonl
+      valid.jsonl
+      split_summary.json
   download_summary.json
 ```
 
@@ -190,6 +196,48 @@ python -m json.tool \
   /mnt/data_3t_1/datasets/preprocess/s2mel-train-data/download_summary.json
 ```
 
+## 固定训练/验证划分
+
+当前训练使用 seed `1234`，从全部 439,305 条记录中按数据源规模比例固定抽取
+1,000 条作为验证集，其余 438,305 条作为训练集。验证记录会从训练 manifest 中
+移除，两者没有重叠。
+
+同步完成后，在新机器执行：
+
+```bash
+uv run python scripts/split_s2mel_validation.py \
+  --metadata-dir /mnt/data_3t_1/datasets/preprocess/s2mel-train-data/metadata \
+  --output-dir /mnt/data_3t_1/datasets/preprocess/s2mel-train-data/splits/seed1234_valid1000 \
+  --valid-size 1000 \
+  --seed 1234
+```
+
+脚本按文件名排序读取 `metadata/*.jsonl`，先按各数据源记录数进行比例分配，再用
+largest-remainder 补足到精确的 1,000 条，最后用固定 seed 从各 manifest 的记录
+位置中抽样。生成的 manifest 会把音频路径改写为当前机器上的绝对路径，因此数据根
+目录不同时也应在该机器重新运行脚本，不要直接复制另一台机器生成的 split JSONL。
+
+本次划分结果：
+
+- `Genshin`：训练 248,103 条，验证 566 条
+- `StarRail`：训练 130,084 条，验证 297 条
+- `WutheringWaves`：训练 32,625 条，验证 75 条
+- `ears`：训练 17,086 条，验证 39 条
+- `expresso`：训练 1,012 条，验证 2 条
+- `hi_fi_tts`：训练 7,913 条，验证 18 条
+- `vctk`：训练 1,482 条，验证 3 条
+- `noiz-short`：0 条
+
+检查划分摘要：
+
+```bash
+python -m json.tool \
+  /mnt/data_3t_1/datasets/preprocess/s2mel-train-data/splits/seed1234_valid1000/split_summary.json
+```
+
+摘要中的 `train_records` 应为 `438305`，`valid_records` 应为 `1000`。只要同步后
+各源 manifest 的内容和顺序不变，上述命令会复现相同的验证样本。
+
 ## 训练使用
 
 训练单个数据集时指向对应 JSONL：
@@ -201,3 +249,17 @@ TRAIN_JSONL=/mnt/data_3t_1/datasets/preprocess/s2mel-train-data/metadata/ears.js
 
 加载全部数据集时可传入整个 `metadata/` 目录；loader 会读取其中所有非空
 `*.jsonl`。`noiz-short.jsonl` 当前为空，不提供训练样本。
+
+复现当前 8 卡 random-split 训练时，`scripts/train_s2mel_random_split.sh` 默认
+读取上述固定划分，也可以显式指定：
+
+```bash
+TRAIN_JSONL=/mnt/data_3t_1/datasets/preprocess/s2mel-train-data/splits/seed1234_valid1000/train.jsonl \
+VALID_JSONL=/mnt/data_3t_1/datasets/preprocess/s2mel-train-data/splits/seed1234_valid1000/valid.jsonl \
+NUM_PROCESSES=8 \
+  bash scripts/train_s2mel_random_split.sh
+```
+
+对应配置为
+`configs/s2mel_zipformer_s2mel_train_data_random_split_bigvgan_v2_44khz_128band_512x.yaml`；
+当前每 1,000 step 验证一次。
