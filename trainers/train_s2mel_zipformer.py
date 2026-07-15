@@ -7,6 +7,8 @@ import math
 import random
 import shutil
 import sys
+from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -466,6 +468,152 @@ def build_training_batch(
     )
 
 
+def _record_tensors_on_stream(value: Any, stream: torch.cuda.Stream) -> None:
+    """Keep nested CUDA tensors alive until work on ``stream`` completes."""
+    if isinstance(value, torch.Tensor):
+        if value.is_cuda:
+            value.record_stream(stream)
+        return
+    if isinstance(value, Mapping):
+        for item in value.values():
+            _record_tensors_on_stream(item, stream)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _record_tensors_on_stream(item, stream)
+
+
+class AsyncFeatureBatchBuilder:
+    """Build one training batch ahead on a dedicated thread and CUDA stream."""
+
+    def __init__(
+        self,
+        build_fn: Callable[[dict[str, Any]], dict[str, torch.Tensor]],
+        *,
+        device: torch.device,
+    ) -> None:
+        self.build_fn = build_fn
+        self.device = torch.device(device)
+        self.feature_stream = (
+            torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
+        )
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="s2mel-feature")
+        self.future: Future[
+            tuple[dict[str, torch.Tensor], torch.cuda.Event | None]
+        ] | None = None
+        self.closed = False
+
+    @property
+    def has_pending(self) -> bool:
+        return self.future is not None
+
+    def submit(self, raw_batch: dict[str, Any]) -> None:
+        if self.closed:
+            raise RuntimeError("Cannot submit to a closed feature batch builder")
+        if self.has_pending:
+            raise RuntimeError("Only one feature batch may be in flight")
+
+        input_event = None
+        if self.feature_stream is not None:
+            with torch.cuda.device(self.device):
+                input_event = torch.cuda.Event()
+                input_event.record(torch.cuda.current_stream(self.device))
+        self.future = self.executor.submit(self._build, raw_batch, input_event)
+
+    def _build(
+        self,
+        raw_batch: dict[str, Any],
+        input_event: torch.cuda.Event | None,
+    ) -> tuple[dict[str, torch.Tensor], torch.cuda.Event | None]:
+        if self.feature_stream is None:
+            with torch.no_grad():
+                return self.build_fn(raw_batch), None
+
+        with torch.cuda.device(self.device), torch.cuda.stream(self.feature_stream):
+            if input_event is not None:
+                self.feature_stream.wait_event(input_event)
+            _record_tensors_on_stream(raw_batch, self.feature_stream)
+            # Keep outputs as normal tensors: the trainable model may save
+            # semantic/style inputs for parameter-gradient computation.
+            with torch.no_grad():
+                batch = self.build_fn(raw_batch)
+            ready_event = torch.cuda.Event()
+            ready_event.record(self.feature_stream)
+        return batch, ready_event
+
+    def _take_result(
+        self,
+    ) -> tuple[dict[str, torch.Tensor], torch.cuda.Event | None]:
+        if self.future is None:
+            raise RuntimeError("No feature batch is pending")
+        future = self.future
+        self.future = None
+        return future.result()
+
+    def _prepare_for_consumer(
+        self,
+        result: tuple[dict[str, torch.Tensor], torch.cuda.Event | None],
+    ) -> dict[str, torch.Tensor]:
+        batch, ready_event = result
+        if ready_event is not None:
+            with torch.cuda.device(self.device):
+                consumer_stream = torch.cuda.current_stream(self.device)
+                consumer_stream.wait_event(ready_event)
+                _record_tensors_on_stream(batch, consumer_stream)
+        return batch
+
+    def get(self) -> dict[str, torch.Tensor]:
+        return self._prepare_for_consumer(self._take_result())
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        pending = None
+        if self.future is not None:
+            future = self.future
+            self.future = None
+            try:
+                pending = future.result()
+            except BaseException:
+                pending = None
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        if pending is not None and pending[1] is not None:
+            pending[1].synchronize()
+        if self.feature_stream is not None:
+            self.feature_stream.synchronize()
+
+
+def async_feature_extraction_enabled(cfg, accelerator: Accelerator) -> bool:
+    return (
+        bool(_get(cfg.data, "async_feature_extraction", False))
+        and not bool(_get(cfg.data, "preload_features", False))
+        and accelerator.device.type == "cuda"
+    )
+
+
+def step_requires_async_prefetch_barrier(
+    cfg,
+    *,
+    sync_gradients: bool,
+    next_global_step: int,
+    has_validation: bool,
+) -> bool:
+    """Avoid prefetching across stateful maintenance boundaries."""
+    if not sync_gradients:
+        return False
+    valid_interval = int(cfg.train.valid_interval)
+    save_interval = int(cfg.train.save_interval)
+    archive_interval = int(_get(cfg.train, "archive_save_interval", 0))
+    max_steps = int(cfg.train.max_steps)
+    return (
+        (has_validation and valid_interval > 0 and next_global_step % valid_interval == 0)
+        or (save_interval > 0 and next_global_step % save_interval == 0)
+        or (archive_interval > 0 and next_global_step % archive_interval == 0)
+        or (max_steps > 0 and next_global_step >= max_steps)
+    )
+
+
 def forward_loss(model, batch: dict[str, torch.Tensor]) -> torch.Tensor:
     loss, _ = model(
         batch["mel"],
@@ -746,12 +894,17 @@ def main() -> None:
         )
 
     feature_adapter_ref: list[IndexTTSFeatureAdapter | None] = [None]
+    use_async_features = async_feature_extraction_enabled(cfg, accelerator)
+    if accelerator.is_main_process and use_async_features:
+        print("[Feature] Asynchronous extraction enabled (one batch ahead)")
     model.train()
     last_saved_step = global_step
     # Per-rank optimizer steps per epoch (prepared loader is already sharded).
     steps_per_epoch = max(1, math.ceil(len(train_loader) / int(cfg.train.grad_accumulation)))
 
     for epoch in range(start_epoch, int(cfg.train.epochs)):
+        if int(cfg.train.max_steps) > 0 and global_step >= int(cfg.train.max_steps):
+            break
         epoch_step = 0
         epoch_loader = train_loader
         if epoch == start_epoch and resume_epoch_step > 0:
@@ -760,60 +913,156 @@ def main() -> None:
             epoch_step = resume_epoch_step
             if accelerator.is_main_process:
                 print(f"[Resume] Skipping first {skip_batches} batches of epoch {epoch + 1}")
-        for raw_batch in epoch_loader:
-            if int(cfg.train.max_steps) > 0 and global_step >= int(cfg.train.max_steps):
-                break
-            with accelerator.accumulate(model):
-                train_batch = build_training_batch(
-                    raw_batch,
-                    cfg=cfg,
-                    accelerator=accelerator,
-                    feature_adapter_ref=feature_adapter_ref,
-                )
-                loss = forward_loss(model, train_batch)
-                accelerator.backward(loss)
-                if accelerator.sync_gradients and float(cfg.train.grad_clip) > 0:
-                    accelerator.clip_grad_norm_(model.parameters(), float(cfg.train.grad_clip))
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+        # Construct the DataLoader iterator before starting the feature thread.
+        # On the first epoch this lets multiprocessing workers fork safely.
+        raw_iterator = iter(epoch_loader)
+        async_builder = None
+        async_build_fn = lambda raw_batch: build_training_batch(
+            raw_batch,
+            cfg=cfg,
+            accelerator=accelerator,
+            feature_adapter_ref=feature_adapter_ref,
+        )
+        if use_async_features:
+            async_builder = AsyncFeatureBatchBuilder(
+                async_build_fn,
+                device=accelerator.device,
+            )
 
-            if accelerator.sync_gradients:
-                global_step += 1
-                epoch_step += 1
-                if global_step % int(cfg.train.log_interval) == 0:
-                    reduced_loss = accelerator.gather_for_metrics(loss.detach()).mean().item()
-                    lr = scheduler.get_last_lr()[0]
-                    # Fractional completed epochs, e.g. 1.0 == first epoch done.
-                    epoch_progress = epoch + min(1.0, epoch_step / steps_per_epoch)
-                    if accelerator.is_main_process:
-                        print(f"[Train] epoch={epoch + 1} step={global_step} loss={reduced_loss:.5f} lr={lr:.3e}")
-                    accelerator.log(
-                        {"train/loss": reduced_loss, "train/lr": lr, "train/epoch": epoch_progress},
-                        step=global_step,
-                    )
+        try:
+            try:
+                current_raw_batch = next(raw_iterator)
+            except StopIteration:
+                has_batch = False
+                current_raw_batch = None
+            else:
+                has_batch = True
+                if async_builder is not None:
+                    async_builder.submit(current_raw_batch)
+                    current_raw_batch = None
 
-                if valid_loader is not None and global_step % int(cfg.train.valid_interval) == 0:
-                    val_loss = validate(model, valid_loader, cfg, accelerator, feature_adapter_ref)
-                    if accelerator.is_main_process:
-                        print(f"[Valid] step={global_step} loss={val_loss:.5f}")
-                    accelerator.log({"valid/loss": val_loss}, step=global_step)
+            while has_batch and not (
+                int(cfg.train.max_steps) > 0
+                and global_step >= int(cfg.train.max_steps)
+            ):
+                next_raw_batch = None
+                has_next_batch = False
+                prefetch_barrier = False
+                validation_barrier = False
+                with accelerator.accumulate(model):
+                    if async_builder is not None:
+                        train_batch = async_builder.get()
+                        next_global_step = global_step + int(accelerator.sync_gradients)
+                        prefetch_barrier = step_requires_async_prefetch_barrier(
+                            cfg,
+                            sync_gradients=accelerator.sync_gradients,
+                            next_global_step=next_global_step,
+                            has_validation=valid_loader is not None,
+                        )
+                        valid_interval = int(cfg.train.valid_interval)
+                        validation_barrier = (
+                            accelerator.sync_gradients
+                            and valid_loader is not None
+                            and valid_interval > 0
+                            and next_global_step % valid_interval == 0
+                        )
+                        if not prefetch_barrier:
+                            try:
+                                next_raw_batch = next(raw_iterator)
+                            except StopIteration:
+                                pass
+                            else:
+                                has_next_batch = True
+                                async_builder.submit(next_raw_batch)
+                    else:
+                        assert current_raw_batch is not None
+                        train_batch = async_build_fn(current_raw_batch)
 
-                save_interval = int(cfg.train.save_interval)
-                archive_interval = int(_get(cfg.train, "archive_save_interval", 0))
-                save_regular = save_interval > 0 and global_step % save_interval == 0
-                save_archive = archive_interval > 0 and global_step % archive_interval == 0
-                if save_regular or save_archive:
-                    save_training_checkpoint(
-                        accelerator=accelerator,
-                        model=model,
-                        cfg=cfg,
-                        output_dir=output_dir,
-                        epoch=epoch,
-                        global_step=global_step,
-                        epoch_step=epoch_step,
-                    )
-                    last_saved_step = global_step
+                    loss = forward_loss(model, train_batch)
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients and float(cfg.train.grad_clip) > 0:
+                        accelerator.clip_grad_norm_(model.parameters(), float(cfg.train.grad_clip))
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                if validation_barrier and async_builder is not None:
+                    # Validation workers are recreated on every pass. Tear down
+                    # the producer before they fork and synchronously reuse the
+                    # frozen adapter.
+                    async_builder.close()
+                    async_builder = None
+
+                if accelerator.sync_gradients:
+                    global_step += 1
+                    epoch_step += 1
+                    if global_step % int(cfg.train.log_interval) == 0:
+                        reduced_loss = accelerator.gather_for_metrics(loss.detach()).mean().item()
+                        lr = scheduler.get_last_lr()[0]
+                        # Fractional completed epochs, e.g. 1.0 == first epoch done.
+                        epoch_progress = epoch + min(1.0, epoch_step / steps_per_epoch)
+                        if accelerator.is_main_process:
+                            print(
+                                f"[Train] epoch={epoch + 1} step={global_step} "
+                                f"loss={reduced_loss:.5f} lr={lr:.3e}"
+                            )
+                        accelerator.log(
+                            {"train/loss": reduced_loss, "train/lr": lr, "train/epoch": epoch_progress},
+                            step=global_step,
+                        )
+
+                    if valid_loader is not None and global_step % int(cfg.train.valid_interval) == 0:
+                        val_loss = validate(model, valid_loader, cfg, accelerator, feature_adapter_ref)
+                        if accelerator.is_main_process:
+                            print(f"[Valid] step={global_step} loss={val_loss:.5f}")
+                        accelerator.log({"valid/loss": val_loss}, step=global_step)
+
+                    save_interval = int(cfg.train.save_interval)
+                    archive_interval = int(_get(cfg.train, "archive_save_interval", 0))
+                    save_regular = save_interval > 0 and global_step % save_interval == 0
+                    save_archive = archive_interval > 0 and global_step % archive_interval == 0
+                    if save_regular or save_archive:
+                        save_training_checkpoint(
+                            accelerator=accelerator,
+                            model=model,
+                            cfg=cfg,
+                            output_dir=output_dir,
+                            epoch=epoch,
+                            global_step=global_step,
+                            epoch_step=epoch_step,
+                        )
+                        last_saved_step = global_step
+
+                if use_async_features:
+                    if prefetch_barrier:
+                        if int(cfg.train.max_steps) > 0 and global_step >= int(
+                            cfg.train.max_steps
+                        ):
+                            has_next_batch = False
+                        else:
+                            try:
+                                next_raw_batch = next(raw_iterator)
+                            except StopIteration:
+                                has_next_batch = False
+                            else:
+                                has_next_batch = True
+                                if async_builder is None:
+                                    async_builder = AsyncFeatureBatchBuilder(
+                                        async_build_fn,
+                                        device=accelerator.device,
+                                    )
+                                async_builder.submit(next_raw_batch)
+                    has_batch = has_next_batch
+                else:
+                    try:
+                        current_raw_batch = next(raw_iterator)
+                    except StopIteration:
+                        has_batch = False
+                    else:
+                        has_batch = True
+        finally:
+            if async_builder is not None:
+                async_builder.close()
 
         if int(cfg.train.max_steps) > 0 and global_step >= int(cfg.train.max_steps):
             break

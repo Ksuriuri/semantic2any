@@ -34,6 +34,7 @@ data:
   decode_audio_in_worker: true
   skip_audio_errors: true
   feature_batch_size: 16
+  async_feature_extraction: true
   preload_features: false
   preload_batch_size: 16
 

@@ -32,6 +32,7 @@ data:
   decode_audio_in_worker: false
   skip_audio_errors: false
   feature_batch_size: 16
+  async_feature_extraction: true
 
 preprocess_params:
   sr: 22050
