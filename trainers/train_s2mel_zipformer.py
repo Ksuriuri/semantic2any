@@ -18,7 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import torch
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset
 
@@ -713,10 +713,14 @@ def main() -> None:
             "--train-jsonl/--train-speechdata-dir"
         )
 
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=bool(_get(cfg.train, "find_unused_parameters", False))
+    )
     accelerator = Accelerator(
         gradient_accumulation_steps=int(cfg.train.grad_accumulation),
         mixed_precision=str(cfg.train.mixed_precision),
         log_with=None if bool(cfg.train.no_wandb) else "wandb",
+        kwargs_handlers=[ddp_kwargs],
     )
     # device_specific=True offsets the seed by the process index so DDP ranks
     # draw independent flow-matching timesteps / noise; the data-loader shuffle

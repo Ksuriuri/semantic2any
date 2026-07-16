@@ -4,6 +4,7 @@ import math
 import random
 import sys
 from pathlib import Path
+import inspect
 from typing import Any
 
 import torch
@@ -106,9 +107,15 @@ class IndexTTSFeatureAdapter(nn.Module):
         self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained(
             str(w2v_bert_dir), local_files_only=True
         )
-        semantic_model, semantic_mean, semantic_std = build_semantic_model(
-            str(w2v_stat), bert_path=str(w2v_bert_dir)
-        )
+        semantic_sig = inspect.signature(build_semantic_model)
+        if "model_path" in semantic_sig.parameters:
+            semantic_model, semantic_mean, semantic_std = build_semantic_model(
+                str(w2v_stat), model_path=str(w2v_bert_dir)
+            )
+        else:
+            semantic_model, semantic_mean, semantic_std = build_semantic_model(
+                str(w2v_stat), bert_path=str(w2v_bert_dir)
+            )
         self.semantic_model = semantic_model.eval()
         self.register_buffer("semantic_mean", semantic_mean.float())
         self.register_buffer("semantic_std", semantic_std.float())
