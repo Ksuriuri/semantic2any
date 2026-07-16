@@ -46,10 +46,20 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Dtype for the s2mel model and BigVGAN. Feature extraction stays in float32.",
     )
-    parser.add_argument("--prompt-seconds", type=float, default=1.0)
+    parser.add_argument(
+        "--prompt-seconds",
+        type=float,
+        default=3.0,
+        help="Reference prompt duration in seconds; must be at least 3 seconds.",
+    )
     parser.add_argument("--min-generate-frames", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--inference-steps", type=int, default=None)
+    parser.add_argument(
+        "--inference-steps",
+        type=int,
+        default=50,
+        help="Number of Euler sampling steps (default: 50).",
+    )
     parser.add_argument("--inference-cfg-rate", type=float, default=None)
     parser.add_argument(
         "--style-mode",
@@ -131,13 +141,21 @@ def load_vocoder(cfg, device: torch.device, dtype: torch.dtype):
 
 
 def prompt_frames_from_seconds(cfg, mel_len: int, prompt_seconds: float, min_generate_frames: int) -> int:
+    if prompt_seconds < 3.0:
+        raise ValueError(f"--prompt-seconds must be at least 3.0, got {prompt_seconds}")
     preprocess = _get(cfg, "preprocess_params")
     spect = _get(preprocess, "spect_params")
     sample_rate = int(_get(preprocess, "sr", 22050))
     hop_length = int(_get(spect, "hop_length", 256))
     requested = max(1, int(prompt_seconds * sample_rate / hop_length))
     max_prompt = max(1, mel_len - min_generate_frames)
-    return min(requested, max_prompt)
+    if requested > max_prompt:
+        minimum_audio_seconds = (requested + min_generate_frames) * hop_length / sample_rate
+        raise ValueError(
+            "Audio is too short for the requested prompt and generated target: "
+            f"need at least {minimum_audio_seconds:.3f}s for a {prompt_seconds:.3f}s prompt."
+        )
+    return requested
 
 
 def save_wav(path: Path, wav: torch.Tensor, sample_rate: int) -> None:
@@ -240,7 +258,7 @@ def main() -> None:
 
     vocoder = load_vocoder(cfg, device, dtype)
 
-    inference_steps = args.inference_steps or int(_get(cfg.s2mel, "inference_steps", 25))
+    inference_steps = int(args.inference_steps)
     inference_cfg_rate = (
         args.inference_cfg_rate
         if args.inference_cfg_rate is not None

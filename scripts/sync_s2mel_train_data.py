@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import random
 import shutil
 import tarfile
 import time
@@ -34,6 +35,8 @@ DEFAULT_DATASETS = (
     "WutheringWaves",
 )
 DEFAULT_MIN_DURATION = 6.0
+DEFAULT_MIN_SAMPLE_RATE = 0
+DEFAULT_METADATA_WORKERS = 16
 DEFAULT_WORKERS = 4
 RESERVED_FREE_BYTES = 20 * 1024**3
 COPY_CHUNK_BYTES = 8 * 1024**2
@@ -202,10 +205,48 @@ def read_metadata_rows(
     return rows
 
 
+def iter_metadata_rows_bounded(
+    fs: gcsfs.GCSFileSystem,
+    metadata_paths: list[str],
+    attempts: int,
+    workers: int,
+):
+    """Read metadata concurrently with bounded memory and deterministic order."""
+    path_iter = iter(metadata_paths)
+    pending: deque[tuple[str, Future[list[tuple[int, dict[str, Any]]]]]] = deque()
+
+    def read_with_retry(path: str) -> list[tuple[int, dict[str, Any]]]:
+        return retry(
+            f"read metadata {path}",
+            lambda: read_metadata_rows(fs, path),
+            attempts,
+        )
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for _ in range(min(workers * 2, len(metadata_paths))):
+            path = next(path_iter, None)
+            if path is None:
+                break
+            pending.append((path, executor.submit(read_with_retry, path)))
+
+        while pending:
+            metadata_path, future = pending.popleft()
+            yield metadata_path, future.result()
+            next_path = next(path_iter, None)
+            if next_path is not None:
+                pending.append(
+                    (next_path, executor.submit(read_with_retry, next_path))
+                )
+
+
 def scan_dataset(
     fs: gcsfs.GCSFileSystem,
     dataset: str,
     min_duration: float,
+    min_sample_rate: int,
+    metadata_shard_sample: int,
+    sample_seed: int,
+    metadata_workers: int,
     attempts: int,
 ) -> DatasetPlan:
     dataset_prefix = f"{SOURCE_PREFIX}/{dataset}"
@@ -223,18 +264,26 @@ def scan_dataset(
         raise FileNotFoundError(f"No metadata shards found for {dataset}")
     if not audio_details:
         raise FileNotFoundError(f"No audio tar shards found for {dataset}")
+    source_metadata_shards = len(metadata_paths)
+    if metadata_shard_sample and metadata_shard_sample < len(metadata_paths):
+        metadata_paths = sorted(
+            random.Random(f"{sample_seed}:{dataset}").sample(
+                metadata_paths,
+                metadata_shard_sample,
+            )
+        )
 
     plan = DatasetPlan(name=dataset, metadata_shards=len(metadata_paths))
     seen_ids: dict[str, str] = {}
     seen_basenames: dict[str, str] = {}
     member_occurrences: dict[tuple[str, str], int] = defaultdict(int)
 
-    for metadata_path in metadata_paths:
-        rows = retry(
-            f"read metadata {metadata_path}",
-            lambda metadata_path=metadata_path: read_metadata_rows(fs, metadata_path),
-            attempts,
-        )
+    for metadata_path, rows in iter_metadata_rows_bounded(
+        fs,
+        metadata_paths,
+        attempts,
+        metadata_workers,
+    ):
         for line_number, row in rows:
             plan.source_records += 1
             location = f"{metadata_path}:{line_number}"
@@ -244,6 +293,12 @@ def scan_dataset(
             ):
                 raise ValueError(f"{location}: duration is missing or non-numeric")
             duration = float(raw_duration)
+            raw_sample_rate = row.get("sample_rate")
+            if isinstance(raw_sample_rate, bool) or not isinstance(
+                raw_sample_rate, (int, float)
+            ):
+                raise ValueError(f"{location}: sample_rate is missing or non-numeric")
+            sample_rate = int(raw_sample_rate)
 
             tar_relative, member, member_basename = parse_audio_path(
                 dataset,
@@ -258,7 +313,7 @@ def scan_dataset(
             member_occurrence = member_occurrences[occurrence_key]
             member_occurrences[occurrence_key] += 1
 
-            if duration <= min_duration:
+            if duration <= min_duration or sample_rate < min_sample_rate:
                 continue
 
             record_id = row.get("id")
@@ -316,9 +371,13 @@ def scan_dataset(
         "preflight_dataset",
         dataset=dataset,
         metadata_shards=plan.metadata_shards,
+        source_metadata_shards=source_metadata_shards,
+        sampled_metadata_shards=bool(metadata_shard_sample),
+        metadata_workers=metadata_workers,
         source_records=plan.source_records,
         selected_records=len(plan.selected),
         selected_duration_hours=round(plan.selected_duration_seconds / 3600.0, 3),
+        min_sample_rate=min_sample_rate,
         referenced_tars=len(plan.by_tar),
         referenced_tar_bytes=plan.referenced_tar_bytes,
     )
@@ -546,6 +605,7 @@ def verify_and_finalize_dataset(
     plan: DatasetPlan,
     metadata_tmp: Path,
     min_duration: float,
+    min_sample_rate: int,
 ) -> dict[str, Any]:
     dataset_dir = output_root / plan.name
     expected_names = {selected.basename for selected in plan.selected}
@@ -585,6 +645,15 @@ def verify_and_finalize_dataset(
                 raise ValueError(
                     f"{metadata_tmp}:{line_number}: duration does not pass filter"
                 )
+            sample_rate = row.get("sample_rate")
+            if isinstance(sample_rate, bool) or not isinstance(
+                sample_rate, (int, float)
+            ):
+                raise ValueError(f"{metadata_tmp}:{line_number}: invalid sample_rate")
+            if int(sample_rate) < min_sample_rate:
+                raise ValueError(
+                    f"{metadata_tmp}:{line_number}: sample_rate does not pass filter"
+                )
             audio_path = row.get("audio_path")
             if not isinstance(audio_path, str) or audio_path not in expected_audio_paths:
                 raise ValueError(
@@ -619,6 +688,8 @@ def verify_and_finalize_dataset(
         "selected_records": len(plan.selected),
         "selected_duration_seconds": plan.selected_duration_seconds,
         "selected_duration_hours": plan.selected_duration_seconds / 3600.0,
+        "min_duration_exclusive": min_duration,
+        "min_sample_rate_inclusive": min_sample_rate,
         "referenced_tars": len(plan.by_tar),
         "referenced_tar_bytes": plan.referenced_tar_bytes,
         "output_bytes": total_bytes,
@@ -637,8 +708,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--key-file", type=Path, default=DEFAULT_KEY_FILE)
     parser.add_argument("--min-duration", type=float, default=DEFAULT_MIN_DURATION)
+    parser.add_argument(
+        "--min-sample-rate",
+        type=int,
+        default=DEFAULT_MIN_SAMPLE_RATE,
+        help="Keep rows whose sample_rate is at least this value.",
+    )
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    parser.add_argument(
+        "--metadata-workers",
+        type=int,
+        default=DEFAULT_METADATA_WORKERS,
+        help="Concurrent metadata shard readers with bounded in-flight work.",
+    )
     parser.add_argument("--attempts", type=int, default=4)
+    parser.add_argument(
+        "--sample-metadata",
+        type=int,
+        default=0,
+        help="Print a deterministic reservoir sample of selected metadata rows.",
+    )
+    parser.add_argument("--sample-seed", type=int, default=1234)
+    parser.add_argument(
+        "--metadata-shard-sample",
+        type=int,
+        default=0,
+        help="Randomly scan only this many metadata shards; use with preflight-only.",
+    )
+    parser.add_argument(
+        "--summary-file",
+        type=Path,
+        default=Path("download_summary.json"),
+        help="Summary filename written under output-root.",
+    )
     parser.add_argument(
         "--datasets",
         nargs="+",
@@ -653,10 +755,20 @@ def main() -> None:
     args = parse_args()
     if args.min_duration < 0:
         raise ValueError("--min-duration must be non-negative")
-    if args.workers < 1 or args.attempts < 1:
-        raise ValueError("--workers and --attempts must be positive")
+    if (
+        args.min_sample_rate < 0
+        or args.sample_metadata < 0
+        or args.metadata_shard_sample < 0
+    ):
+        raise ValueError("sample-rate and sampling arguments must be non-negative")
+    if args.workers < 1 or args.metadata_workers < 1 or args.attempts < 1:
+        raise ValueError("--workers, --metadata-workers, and --attempts must be positive")
     if len(args.datasets) != len(set(args.datasets)):
         raise ValueError("--datasets contains duplicate names")
+    if args.summary_file.name != str(args.summary_file):
+        raise ValueError("--summary-file must be a filename under output-root")
+    if args.metadata_shard_sample and not args.preflight_only:
+        raise ValueError("--metadata-shard-sample requires --preflight-only")
 
     key_file = args.key_file.expanduser().resolve()
     if not key_file.is_file():
@@ -673,6 +785,8 @@ def main() -> None:
         output_root=str(output_root),
         datasets=args.datasets,
         min_duration=args.min_duration,
+        min_sample_rate=args.min_sample_rate,
+        metadata_workers=args.metadata_workers,
         workers=args.workers,
     )
 
@@ -681,10 +795,36 @@ def main() -> None:
             fs,
             dataset,
             args.min_duration,
+            args.min_sample_rate,
+            args.metadata_shard_sample,
+            args.sample_seed,
+            args.metadata_workers,
             args.attempts,
         )
         for dataset in args.datasets
     ]
+    if args.sample_metadata:
+        rng = random.Random(args.sample_seed)
+        reservoir: list[tuple[str, dict[str, Any]]] = []
+        seen = 0
+        for plan in plans:
+            for selected in plan.selected:
+                seen += 1
+                candidate = (plan.name, selected.metadata)
+                if len(reservoir) < args.sample_metadata:
+                    reservoir.append(candidate)
+                    continue
+                replacement = rng.randrange(seen)
+                if replacement < args.sample_metadata:
+                    reservoir[replacement] = candidate
+        for sample_index, (dataset, metadata) in enumerate(reservoir, start=1):
+            log(
+                "metadata_sample",
+                sample_index=sample_index,
+                sample_seed=args.sample_seed,
+                dataset=dataset,
+                metadata=metadata,
+            )
     referenced_tar_bytes = sum(plan.referenced_tar_bytes for plan in plans)
     disk = shutil.disk_usage(output_root)
     if referenced_tar_bytes + RESERVED_FREE_BYTES > disk.free:
@@ -703,6 +843,7 @@ def main() -> None:
             sum(plan.selected_duration_seconds for plan in plans) / 3600.0,
             3,
         ),
+        min_sample_rate=args.min_sample_rate,
         referenced_tars=sum(len(plan.by_tar) for plan in plans),
         referenced_tar_bytes=referenced_tar_bytes,
         free_bytes=disk.free,
@@ -731,6 +872,7 @@ def main() -> None:
                 plan,
                 metadata_tmp_paths[plan.name],
                 args.min_duration,
+                args.min_sample_rate,
             )
         )
 
@@ -738,6 +880,7 @@ def main() -> None:
         "source": f"gs://{SOURCE_PREFIX}",
         "output_root": str(output_root),
         "duration_filter": f"> {args.min_duration}",
+        "sample_rate_filter": f">= {args.min_sample_rate}",
         "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "datasets": summaries,
         "totals": {
@@ -754,7 +897,7 @@ def main() -> None:
             "output_bytes": sum(item["output_bytes"] for item in summaries),
         },
     }
-    atomic_write_json(output_root / "download_summary.json", summary)
+    atomic_write_json(output_root / args.summary_file, summary)
     log("ALL_COMPLETE", **summary["totals"])
 
 
