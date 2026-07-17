@@ -14,6 +14,7 @@ wandb/
 exp/
 assets/
 outputs/
+eval_runs/
 checkpoints/
 datasets/
 *.pth
