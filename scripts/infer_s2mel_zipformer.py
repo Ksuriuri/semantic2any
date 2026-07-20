@@ -15,7 +15,14 @@ if str(REPO_ROOT) not in sys.path:
 
 from semantic2any.models import Semantic2MelModel
 from semantic2any.utils.checkpoint import load_compatible_checkpoint
-from semantic2any.utils.indextts_adapters import IndexTTSFeatureAdapter, add_indextts_to_path
+from semantic2any.utils.indextts_adapters import (
+    S2MelFeatureAdapter,
+    add_indextts_to_path,
+    build_feature_adapter,
+)
+from semantic2any.utils.semantic_codecs import (
+    resolve_semantic_codec_config,
+)
 
 
 AUDIO_EXTENSIONS = {".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"}
@@ -38,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="outputs/s2mel_zipformer-vctk-8gpu")
     parser.add_argument("--indextts-root", default=None)
     parser.add_argument("--model-dir", default=None)
+    parser.add_argument("--semantic-codec", choices=("maskgct", "sac"), default=None)
     parser.add_argument("--vocoder-model", default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
@@ -172,7 +180,7 @@ def infer_one(
     audio_path: Path,
     output_path: Path,
     cfg,
-    feature_adapter: IndexTTSFeatureAdapter,
+    feature_adapter: S2MelFeatureAdapter,
     model: Semantic2MelModel,
     vocoder,
     device: torch.device,
@@ -234,6 +242,7 @@ def main() -> None:
         if _get(cfg, "vocoder", None) is None:
             cfg.vocoder = {}
         cfg.vocoder.model_id = args.vocoder_model
+    codec = resolve_semantic_codec_config(cfg, args.semantic_codec)
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -245,16 +254,19 @@ def main() -> None:
     if not input_paths:
         raise ValueError(f"No supported audio files found under {args.input}")
 
-    print(f">> Loading feature adapter on {device}")
-    feature_adapter = IndexTTSFeatureAdapter(cfg).to(device=device)
-    feature_adapter.eval()
-
     print(f">> Loading s2mel checkpoint: {args.checkpoint}")
     model = Semantic2MelModel(cfg.s2mel)
     epoch, step = load_compatible_checkpoint(model, args.checkpoint, strict=True)
     model = model.to(device=device, dtype=dtype)
     model.eval()
     print(f">> s2mel restored at epoch={epoch}, step={step}, dtype={dtype}")
+
+    print(
+        f">> Loading {codec.name} feature adapter on {device} "
+        f"({codec.semantic_fps:g} Hz, {codec.semantic_dim} dims)"
+    )
+    feature_adapter = build_feature_adapter(cfg).to(device=device)
+    feature_adapter.eval()
 
     vocoder = load_vocoder(cfg, device, dtype)
 

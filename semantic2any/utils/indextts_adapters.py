@@ -4,7 +4,6 @@ import math
 import random
 import sys
 from pathlib import Path
-import inspect
 from typing import Any
 
 import torch
@@ -36,31 +35,6 @@ def _resolve_model_path(model_dir: Path, value: str | Path) -> Path:
     return path
 
 
-def _find_semantic_codec_ckpt(model_dir: Path, configured: str | None) -> Path:
-    if configured:
-        path = _resolve_model_path(model_dir, configured)
-        if path.exists():
-            return path
-        raise FileNotFoundError(f"semantic codec checkpoint not found: {path}")
-
-    candidates = [
-        "semantic_codec.safetensors",
-        "semantic_codec/model.safetensors",
-        "semantic_codec.pth",
-        "semantic_codec.pt",
-    ]
-    for candidate in candidates:
-        path = model_dir / candidate
-        if path.exists():
-            return path
-    matches = sorted(model_dir.glob("**/*semantic*codec*.safetensors"))
-    if matches:
-        return matches[0]
-    raise FileNotFoundError(
-        "Could not find semantic codec checkpoint. Set paths.semantic_codec_ckpt in the config."
-    )
-
-
 def _load_audio(path: str | Path, max_audio_seconds: float | None = None) -> tuple[torch.Tensor, int]:
     audio, sr = torchaudio.load(str(path))
     if audio.size(0) > 1:
@@ -71,20 +45,11 @@ def _load_audio(path: str | Path, max_audio_seconds: float | None = None) -> tup
     return audio, sr
 
 
-def _resample(audio: torch.Tensor, src_sr: int, dst_sr: int) -> torch.Tensor:
-    if src_sr == dst_sr:
-        return audio
-    return torchaudio.functional.resample(audio, src_sr, dst_sr)
-
-
-class IndexTTSFeatureAdapter(nn.Module):
-    """Frozen IndexTTS feature stack for online semantic2mel training batches."""
+class S2MelFeatureAdapter(nn.Module):
+    """Frozen mel/style stack with a selectable semantic codec backend."""
 
     def __init__(self, cfg: Any) -> None:
         super().__init__()
-        from omegaconf import OmegaConf
-        import safetensors.torch
-        from transformers import SeamlessM4TFeatureExtractor
 
         paths_cfg = _get(cfg, "paths")
         self.indextts_root = add_indextts_to_path(_get(paths_cfg, "indextts_root"))
@@ -94,41 +59,10 @@ class IndexTTSFeatureAdapter(nn.Module):
 
         from indextts.s2mel.modules.audio import mel_spectrogram
         from indextts.s2mel.modules.campplus.DTDNN import CAMPPlus
-        from indextts.utils.maskgct_utils import build_semantic_codec, build_semantic_model
+        from semantic2any.utils.semantic_codecs import build_semantic_codec
 
-        index_cfg_path = self.model_dir / "config.yaml"
-        index_cfg = OmegaConf.load(index_cfg_path) if index_cfg_path.exists() else cfg
-        semantic_codec_cfg = _get(index_cfg, "semantic_codec", _get(cfg, "semantic_codec", None))
-        if semantic_codec_cfg is None:
-            raise ValueError("semantic_codec config not found in current config or IndexTTS config.yaml")
-
-        w2v_stat = _resolve_model_path(self.model_dir, _get(paths_cfg, "w2v_stat", "wav2vec2bert_stats.pt"))
-        w2v_bert_dir = _resolve_model_path(self.model_dir, _get(paths_cfg, "w2v_bert_dir", "w2v-bert-2.0"))
-        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained(
-            str(w2v_bert_dir), local_files_only=True
-        )
-        semantic_sig = inspect.signature(build_semantic_model)
-        if "model_path" in semantic_sig.parameters:
-            semantic_model, semantic_mean, semantic_std = build_semantic_model(
-                str(w2v_stat), model_path=str(w2v_bert_dir)
-            )
-        else:
-            semantic_model, semantic_mean, semantic_std = build_semantic_model(
-                str(w2v_stat), bert_path=str(w2v_bert_dir)
-            )
-        self.semantic_model = semantic_model.eval()
-        self.register_buffer("semantic_mean", semantic_mean.float())
-        self.register_buffer("semantic_std", semantic_std.float())
-
-        self.semantic_codec = build_semantic_codec(semantic_codec_cfg).eval()
-        semantic_ckpt = _find_semantic_codec_ckpt(
-            self.model_dir, _get(paths_cfg, "semantic_codec_ckpt", "")
-        )
-        if semantic_ckpt.suffix == ".safetensors":
-            safetensors.torch.load_model(self.semantic_codec, str(semantic_ckpt))
-        else:
-            state = torch.load(semantic_ckpt, map_location="cpu")
-            self.semantic_codec.load_state_dict(state.get("state_dict", state), strict=False)
+        self.semantic_backend = build_semantic_codec(cfg, model_dir=self.model_dir)
+        self.register_buffer("_device_anchor", torch.empty(0), persistent=False)
 
         campplus_ckpt = _resolve_model_path(
             self.model_dir, _get(paths_cfg, "campplus_ckpt", "campplus/campplus_cn_common.bin")
@@ -189,46 +123,23 @@ class IndexTTSFeatureAdapter(nn.Module):
                 f"({model_mel_channels} != {self.mel_args['num_mels']})"
             )
 
-        for module in (self.semantic_model, self.semantic_codec, self.campplus_model):
+        for module in (self.semantic_backend, self.campplus_model):
             module.requires_grad_(False)
 
-    @torch.no_grad()
-    def _quantize_semantic(self, feat: torch.Tensor) -> torch.Tensor:
-        """Quantize a single-utterance feature [1, T, C] -> [T, C] embedding."""
-        _, semantic = self.semantic_codec.quantize(feat)
-        if not torch.is_floating_point(semantic):
-            semantic = self.semantic_codec.quantizer.vq2emb(semantic.unsqueeze(1))
-            if semantic.ndim == 3 and semantic.size(1) != feat.size(1):
-                semantic = semantic.transpose(1, 2)
-        elif semantic.ndim == 3 and semantic.size(1) != feat.size(1) and semantic.size(2) == feat.size(1):
-            semantic = semantic.transpose(1, 2)
-        return semantic.squeeze(0).float()
+    def _module_device(self) -> torch.device:
+        anchor = getattr(self, "_device_anchor", None)
+        if isinstance(anchor, torch.Tensor):
+            return anchor.device
+        # Compatibility for tests and older code constructing the adapter
+        # without running __init__.
+        legacy_anchor = getattr(self, "semantic_mean", None)
+        if isinstance(legacy_anchor, torch.Tensor):
+            return legacy_anchor.device
+        return torch.device("cpu")
 
     @torch.no_grad()
     def _semantic_from_waveforms(self, waveforms: list) -> list[torch.Tensor]:
-        """Batched w2v-bert forward, then per-utterance codec quantization.
-
-        The codec's ConvNeXt encoder has no padding mask, so quantizing a padded
-        batch flips codes near sequence tails; quantize trimmed features instead.
-        """
-        device = self.semantic_mean.device
-        inputs = self.extract_features(
-            waveforms, sampling_rate=self.sample_rate_16k, return_tensors="pt", padding=True
-        )
-        input_features = inputs["input_features"].to(device)
-        attention_mask = inputs["attention_mask"].to(device)
-        out = self.semantic_model(
-            input_features=input_features,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-        feat = out.hidden_states[17]
-        feat = (feat - self.semantic_mean) / self.semantic_std
-        lengths = attention_mask.sum(dim=1).long()
-        return [
-            self._quantize_semantic(feat[idx : idx + 1, : int(lengths[idx])])
-            for idx in range(feat.size(0))
-        ]
+        return self.semantic_backend.extract(waveforms)
 
     @torch.no_grad()
     def _semantic_from_audio(self, audio_16k: torch.Tensor) -> torch.Tensor:
@@ -237,7 +148,7 @@ class IndexTTSFeatureAdapter(nn.Module):
 
     @torch.no_grad()
     def _style_from_audio(self, audio_16k: torch.Tensor) -> torch.Tensor:
-        device = self.semantic_mean.device
+        device = self._module_device()
         feat = torchaudio.compliance.kaldi.fbank(
             audio_16k.to(device),
             num_mel_bins=80,
@@ -303,7 +214,7 @@ class IndexTTSFeatureAdapter(nn.Module):
         if not waveforms or len(waveforms) != len(sample_rates):
             raise ValueError("waveforms and sample_rates must have the same non-zero length")
 
-        device = self.semantic_mean.device
+        device = self._module_device()
         grouped_indices: dict[int, list[int]] = {}
         for index, sample_rate in enumerate(sample_rates):
             grouped_indices.setdefault(int(sample_rate), []).append(index)
@@ -391,7 +302,7 @@ class IndexTTSFeatureAdapter(nn.Module):
         sample_rates: list[int] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Randomly split each waveform into prompt and target before feature extraction."""
-        device = self.semantic_mean.device
+        device = self._module_device()
         prompt_mels = []
         target_mels = []
         styles = []
@@ -502,7 +413,7 @@ class IndexTTSFeatureAdapter(nn.Module):
         waveforms: list[torch.Tensor] | None = None,
         sample_rates: list[int] | None = None,
     ) -> dict[str, torch.Tensor]:
-        device = self.semantic_mean.device
+        device = self._module_device()
         features = self.extract_utterance_features(
             audio_paths,
             waveforms=waveforms,
@@ -586,6 +497,14 @@ class IndexTTSFeatureAdapter(nn.Module):
             min_generated_frames=self.min_generated_frames,
             is_precomputed=False,
         )
+
+
+# Backward-compatible import for existing callers and tests.
+IndexTTSFeatureAdapter = S2MelFeatureAdapter
+
+
+def build_feature_adapter(cfg: Any) -> S2MelFeatureAdapter:
+    return S2MelFeatureAdapter(cfg)
 
 
 def move_feature_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:

@@ -9,66 +9,72 @@ paths:
   w2v_stat: wav2vec2bert_stats.pt
 
 semantic_codec:
-  # Switch to "sac" for 12.5 Hz, 1280-dim SAC raw semantic embeddings.
-  type: maskgct
+  type: sac
   source_model: Soul-AILab/SAC-16k-62_5Hz
   tokenizer_model: zai-org/glm-4-voice-tokenizer
   revision: a5f2404e63c84e92f5238908e1706316324ebafa
   tokenizer_path: ""
-  cache_dir: ""
-  local_files_only: false
+  cache_dir: /home/tanhe/.cache/huggingface/hub
+  local_files_only: true
   max_chunk_seconds: 30.0
-  chunk_batch_size: 16
+  # Keep the frozen WhisperVQ peak low while the trainable model holds a
+  # local batch of eight long 44.1 kHz examples.
+  chunk_batch_size: 2
+
+vocoder:
+  model_id: nvidia/bigvgan_v2_44khz_128band_512x
+  cache_dir: /mnt/data_sdd/hhy/noiz-tts/vae-eval/.hf_cache
+  local_files_only: true
 
 data:
-  train_jsonl: ""
-  valid_jsonl: ""
+  train_jsonl: /mnt/data_3t_1/datasets/preprocess/s2mel-train-data/splits/seed1234_valid1000/train.jsonl
+  valid_jsonl: /mnt/data_3t_1/datasets/preprocess/s2mel-train-data/splits/seed1234_valid1000/valid.jsonl
   train_speechdata_dir: ""
   valid_speechdata_dir: ""
   speechdata_cache_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/.cache/speechdata
   max_audio_seconds: 30.0
-  pair_same_speaker: true
-  random_split_audio: false
-  max_pair_seconds: 30.0
-  min_pair_prompt_seconds: 3.0
-  min_prompt_seconds: 1.0
-  max_prompt_seconds: 5.0
-  min_target_seconds: null
+  pair_same_speaker: false
+  random_split_audio: true
+  min_prompt_seconds: 3.0
+  max_prompt_seconds: null
+  min_target_seconds: 3.0
   min_generated_frames: 8
-  # w2v-bert 2.0 features / MaskGCT semantic codec run at 50 Hz (IndexTTS2 uses code_lens * 1.72 -> mel frames).
-  semantic_fps: 50.0
+  semantic_fps: 12.5
   sample_rate_16k: 16000
-  sample_rate_mel: 22050
+  sample_rate_mel: 44100
   num_workers: 8
   prefetch_factor: 2
-  decode_audio_in_worker: false
-  skip_audio_errors: false
-  feature_batch_size: 16
-  async_feature_extraction: true
+  decode_audio_in_worker: true
+  skip_audio_errors: true
+  feature_batch_size: 4
+  # Disabled for the host-RAM leak isolation run.
+  async_feature_extraction: false
+  preload_features: false
+  preload_batch_size: 16
 
 preprocess_params:
-  sr: 22050
+  sr: 44100
   spect_params:
-    n_fft: 1024
-    win_length: 1024
-    hop_length: 256
-    n_mels: 80
+    n_fft: 2048
+    win_length: 2048
+    hop_length: 512
+    n_mels: 128
     fmin: 0
-    fmax: "None"
+    fmax: null
 
 s2mel:
   dit_type: ZipFormer
-  reg_loss_type: l1
+  reg_loss_type: l2
   use_gpt_latent: false
   inference_steps: 25
   inference_cfg_rate: 0.7
-  length_ratio: 1.72
+  length_ratio: 6.890625
   style_encoder:
     dim: 192
   length_regulator:
     channels: 512
     is_discrete: false
-    in_channels: 1024
+    in_channels: 1280
     content_codebook_size: 8192
     sampling_ratios: [1, 1, 1, 1]
     n_codebooks: 1
@@ -76,9 +82,10 @@ s2mel:
     f0_condition: false
     n_f0_bins: 512
   DiT:
-    in_channels: 80
+    in_channels: 128
     content_dim: 512
     zero_prompt_speech_token: false
+    style_condition: false
   ZipFormer:
     hidden_dim: 512
     feedforward_dim: 4096
@@ -91,31 +98,34 @@ s2mel:
     pos_head_dim: 4
     pos_dim: 48
     time_embed_dim: 192
-    style_condition: true
+    style_condition: false
     class_dropout_prob: 0.1
     condition_dropout_prob: 0.1
     use_conv: true
 
 train:
-  output_dir: exp/s2mel_zipformer
-  batch_size: 4
-  epochs: 10
+  output_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/exp/exp06_44k_nostyle_zipformer_sac_local8x4090
+  # Original effective batch: 16 GPUs * 32 = 512.
+  # Local effective batch: 8 GPUs * 16 * 4 accumulation = 512.
+  batch_size: 16
+  epochs: 60
   max_steps: 0
-  grad_accumulation: 1
+  grad_accumulation: 4
   learning_rate: 1.0e-4
   min_learning_rate: 1.0e-5
-  lr_scheduler: cosine
   weight_decay: 0.01
   warmup_steps: 1000
+  lr_scheduler: cosine
   grad_clip: 1.0
   mixed_precision: fp16
   log_interval: 20
-  valid_interval: 500
-  save_interval: 10000
-  archive_save_interval: 0
-  keep_last: 5
+  valid_interval: 1000
+  save_interval: 1000
+  archive_save_interval: 10000
+  keep_last: 3
   resume_from: ""
+  find_unused_parameters: true
   no_wandb: false
   wandb_entity: haoyuanhuang22-jcxy
   wandb_project: semantic2mel
-  wandb_run_name: s2mel_zipformer-vctk-8gpu
+  wandb_run_name: exp06_44k_nostyle_zipformer_sac_local8x4090

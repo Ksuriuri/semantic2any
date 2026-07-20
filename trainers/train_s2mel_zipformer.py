@@ -31,7 +31,16 @@ from semantic2any.data.s2mel_dataset import (
 )
 from semantic2any.models import Semantic2MelModel
 from semantic2any.utils.checkpoint import load_compatible_checkpoint, save_compatible_checkpoint
-from semantic2any.utils.indextts_adapters import IndexTTSFeatureAdapter, move_feature_batch_to_device
+from semantic2any.utils.indextts_adapters import (
+    S2MelFeatureAdapter,
+    build_feature_adapter,
+    move_feature_batch_to_device,
+)
+from semantic2any.utils.semantic_codecs import (
+    resolve_semantic_codec_config,
+    semantic_codec_info,
+    semantic_codec_type,
+)
 
 
 def _get(obj, name: str, default=None):
@@ -58,10 +67,16 @@ def _set_style_condition(cfg, enabled: bool) -> None:
     raise ValueError(f"Unsupported s2mel.dit_type={dit_type!r} for style override")
 
 
-def model_parameter_metadata(model, cfg) -> dict[str, int | str]:
+def model_parameter_metadata(model, cfg) -> dict[str, int | float | str]:
     cfm = model.models["cfm"]
+    codec = semantic_codec_info(cfg)
     return {
         "dit_type": _dit_type(cfg),
+        "semantic_codec": codec.name,
+        "semantic_source_model": codec.source_model,
+        "semantic_dim": codec.semantic_dim,
+        "semantic_fps": codec.semantic_fps,
+        "semantic_fingerprint": codec.fingerprint(),
         "estimator_parameters": sum(parameter.numel() for parameter in cfm.estimator.parameters()),
         "cfm_parameters": sum(parameter.numel() for parameter in cfm.parameters()),
         "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
@@ -88,6 +103,13 @@ def validate_resume_backbone(cfg, resume_path: Path | None) -> None:
             f"Cannot resume {checkpoint_dit_type} checkpoint with {_dit_type(cfg)} config. "
             "Backbone checkpoints are not compatible."
         )
+    checkpoint_codec = semantic_codec_type(checkpoint_config)
+    current_codec = semantic_codec_type(cfg)
+    if checkpoint_codec != current_codec:
+        raise ValueError(
+            f"Cannot resume {checkpoint_codec} semantic checkpoint with {current_codec} "
+            "config. Semantic codec checkpoints are not compatible."
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,6 +123,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--indextts-root", default=None)
     parser.add_argument("--model-dir", default=None)
+    parser.add_argument(
+        "--semantic-codec",
+        choices=("maskgct", "sac"),
+        default=None,
+        help="Override the semantic feature backend.",
+    )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
@@ -157,6 +185,7 @@ def apply_overrides(cfg, args: argparse.Namespace):
         cfg.train.no_wandb = True
     if args.style_condition is not None:
         _set_style_condition(cfg, args.style_condition)
+    resolve_semantic_codec_config(cfg, args.semantic_codec)
     return cfg
 
 
@@ -245,6 +274,7 @@ def make_dataloader(
     if dataset is None:
         dataset = make_source_dataset(cfg, source, speechdata=speechdata)
     spect = cfg.preprocess_params.spect_params
+    codec = semantic_codec_info(cfg)
     collator = S2MelCollator(
         hop_length=int(spect.hop_length),
         sample_rate=int(cfg.preprocess_params.sr),
@@ -257,6 +287,8 @@ def make_dataloader(
         decode_audio_in_worker=bool(_get(cfg.data, "decode_audio_in_worker", False)),
         skip_audio_errors=bool(_get(cfg.data, "skip_audio_errors", False)),
         max_audio_seconds=_optional_float(_get(cfg.data, "max_audio_seconds", None)),
+        expected_semantic_codec=codec.name,
+        expected_semantic_fingerprint=codec.fingerprint(),
     )
     kwargs: dict[str, Any] = {}
     if int(cfg.data.num_workers) > 0:
@@ -289,7 +321,7 @@ def preload_dataset_features(
     *,
     split: str,
     cfg,
-    adapter: IndexTTSFeatureAdapter,
+    adapter: S2MelFeatureAdapter,
     accelerator: Accelerator,
 ) -> S2MelInMemoryDataset:
     """Extract each utterance once and retain compact features in CPU RAM.
@@ -436,15 +468,19 @@ def build_training_batch(
     *,
     cfg,
     accelerator: Accelerator,
-    feature_adapter_ref: list[IndexTTSFeatureAdapter | None],
+    feature_adapter_ref: list[S2MelFeatureAdapter | None],
 ) -> dict[str, torch.Tensor]:
     if batch.get("is_precomputed", False):
         return move_feature_batch_to_device(batch, accelerator.device)
 
     if feature_adapter_ref[0] is None:
         if accelerator.is_main_process:
-            print("[Feature] Initializing frozen IndexTTS feature adapter")
-        feature_adapter_ref[0] = IndexTTSFeatureAdapter(cfg).to(accelerator.device)
+            codec = semantic_codec_info(cfg)
+            print(
+                f"[Feature] Initializing {codec.name} semantic adapter "
+                f"({codec.semantic_fps:g} Hz, {codec.semantic_dim} dims)"
+            )
+        feature_adapter_ref[0] = build_feature_adapter(cfg).to(accelerator.device)
         feature_adapter_ref[0].eval()
     if batch.get("is_paired", False):
         return feature_adapter_ref[0].extract_paired_from_audio_paths(
@@ -754,8 +790,10 @@ def main() -> None:
     )
     if bool(_get(cfg.data, "preload_features", False)):
         if accelerator.is_main_process:
-            print("[Preload] Initializing frozen IndexTTS feature adapter")
-        preload_adapter = IndexTTSFeatureAdapter(cfg).to(accelerator.device)
+            print(
+                f"[Preload] Initializing frozen {semantic_codec_type(cfg)} feature adapter"
+            )
+        preload_adapter = build_feature_adapter(cfg).to(accelerator.device)
         preload_adapter.eval()
         train_dataset = preload_dataset_features(
             train_dataset,
@@ -833,6 +871,9 @@ def main() -> None:
         print(
             "[Model] "
             f"dit_type={metadata['dit_type']} "
+            f"semantic_codec={metadata['semantic_codec']} "
+            f"semantic_dim={metadata['semantic_dim']} "
+            f"semantic_fps={metadata['semantic_fps']:g} "
             f"estimator_parameters={metadata['estimator_parameters']:,} "
             f"model_parameters={metadata['model_parameters']:,}"
         )
@@ -897,7 +938,7 @@ def main() -> None:
             max_seq_length=int(cfg.s2mel.DiT.block_size),
         )
 
-    feature_adapter_ref: list[IndexTTSFeatureAdapter | None] = [None]
+    feature_adapter_ref: list[S2MelFeatureAdapter | None] = [None]
     use_async_features = async_feature_extraction_enabled(cfg, accelerator)
     if accelerator.is_main_process and use_async_features:
         print("[Feature] Asynchronous extraction enabled (one batch ahead)")

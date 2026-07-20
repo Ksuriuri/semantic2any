@@ -20,7 +20,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from semantic2any.models import Semantic2MelModel
 from semantic2any.utils.checkpoint import load_compatible_checkpoint
-from semantic2any.utils.indextts_adapters import IndexTTSFeatureAdapter
+from semantic2any.utils.indextts_adapters import build_feature_adapter
+from semantic2any.utils.semantic_codecs import resolve_semantic_codec_config
 from scripts.infer_s2mel_zipformer import resolve_dtype
 
 
@@ -36,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--pair-manifest", required=True)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--semantic-codec", choices=("maskgct", "sac"), default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", choices=("auto", "float16", "float32"), default="auto")
     parser.add_argument("--inference-steps", type=int, default=None)
@@ -116,6 +118,7 @@ def render_comparison(
 def main() -> None:
     args = parse_args()
     cfg = OmegaConf.load(args.config)
+    resolve_semantic_codec_config(cfg, args.semantic_codec)
     manifest_path = Path(args.pair_manifest).expanduser().resolve()
     rows = load_rows(manifest_path)
     output_dir = (
@@ -131,7 +134,7 @@ def main() -> None:
     device = torch.device(args.device)
     dtype = resolve_dtype(device, args.dtype)
 
-    feature_adapter = IndexTTSFeatureAdapter(cfg).to(device=device)
+    feature_adapter = build_feature_adapter(cfg).to(device=device)
     feature_adapter.eval()
     model = Semantic2MelModel(cfg.s2mel)
     epoch, step = load_compatible_checkpoint(model, args.checkpoint, strict=True)

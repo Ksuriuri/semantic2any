@@ -13,6 +13,7 @@ wandb/
 
 exp/
 assets/
+metrics/
 outputs/
 eval_runs/
 checkpoints/

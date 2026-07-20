@@ -695,6 +695,8 @@ class S2MelCollator:
         decode_audio_in_worker: bool = False,
         skip_audio_errors: bool = False,
         max_audio_seconds: float | None = None,
+        expected_semantic_codec: str | None = None,
+        expected_semantic_fingerprint: str | None = None,
     ) -> None:
         self.hop_length = hop_length
         self.sample_rate = sample_rate
@@ -707,6 +709,36 @@ class S2MelCollator:
         self.decode_audio_in_worker = decode_audio_in_worker
         self.skip_audio_errors = skip_audio_errors
         self.max_audio_seconds = max_audio_seconds
+        self.expected_semantic_codec = expected_semantic_codec
+        self.expected_semantic_fingerprint = expected_semantic_fingerprint
+
+    def _validate_precomputed_metadata(self, records: list[dict[str, Any]]) -> None:
+        if self.expected_semantic_codec is None:
+            return
+        flattened = []
+        for record in records:
+            if isinstance(record.get("prompt"), dict):
+                flattened.extend((record["prompt"], record["target"]))
+            else:
+                flattened.append(record)
+        for record in flattened:
+            actual_codec = record.get("semantic_codec")
+            actual_fingerprint = record.get("semantic_fingerprint")
+            if actual_codec is not None and actual_codec != self.expected_semantic_codec:
+                raise ValueError(
+                    "Precomputed semantic codec mismatch: "
+                    f"manifest={actual_codec}, config={self.expected_semantic_codec}"
+                )
+            if (
+                actual_fingerprint is not None
+                and self.expected_semantic_fingerprint is not None
+                and actual_fingerprint != self.expected_semantic_fingerprint
+            ):
+                raise ValueError(
+                    "Precomputed semantic fingerprint mismatch: "
+                    f"manifest={actual_fingerprint}, "
+                    f"config={self.expected_semantic_fingerprint}"
+                )
 
     def _decode_audio_paths(
         self, audio_paths: list[str]
@@ -834,6 +866,7 @@ class S2MelCollator:
         }
 
     def __call__(self, records: list[dict[str, Any]]) -> dict[str, Any]:
+        self._validate_precomputed_metadata(records)
         paired = [
             isinstance(record.get("prompt"), dict) and isinstance(record.get("target"), dict)
             for record in records

@@ -39,7 +39,11 @@ from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
 from semantic2any.data.s2mel_dataset import S2MelJsonlDataset, S2MelSpeechDataDataset
-from semantic2any.utils.indextts_adapters import IndexTTSFeatureAdapter
+from semantic2any.utils.indextts_adapters import build_feature_adapter
+from semantic2any.utils.semantic_codecs import (
+    prepare_feature_metadata,
+    resolve_semantic_codec_config,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard", type=int, default=0)
+    parser.add_argument("--semantic-codec", choices=("maskgct", "sac"), default=None)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -100,6 +105,7 @@ def main() -> None:
         raise ValueError("--shard must be in [0, --num-shards)")
 
     cfg = OmegaConf.load(args.config)
+    resolve_semantic_codec_config(cfg, args.semantic_codec)
     if args.source and _looks_like_speechdata_source(args.source):
         dataset: Any = S2MelSpeechDataDataset(
             args.source, cache_dir=str(cfg.data.speechdata_cache_dir or "") or None
@@ -117,13 +123,16 @@ def main() -> None:
         collate_fn=_identity_collate,
     )
 
-    device = torch.device(args.device)
-    adapter = IndexTTSFeatureAdapter(cfg).to(device)
-    adapter.eval()
-
     output_dir = Path(args.output_dir).expanduser()
     feats_dir = output_dir / "feats"
     output_dir.mkdir(parents=True, exist_ok=True)
+    codec_metadata = prepare_feature_metadata(
+        output_dir, cfg, overwrite=args.overwrite
+    )
+
+    device = torch.device(args.device)
+    adapter = build_feature_adapter(cfg).to(device)
+    adapter.eval()
     manifest_name = args.manifest_name
     if args.num_shards > 1:
         stem, suffix = Path(manifest_name).stem, Path(manifest_name).suffix or ".jsonl"
@@ -147,6 +156,10 @@ def main() -> None:
                     "mel_path": str(paths["mel_path"].relative_to(output_dir)),
                     "semantic_path": str(paths["semantic_path"].relative_to(output_dir)),
                     "style_path": str(paths["style_path"].relative_to(output_dir)),
+                    "semantic_codec": codec_metadata["name"],
+                    "semantic_dim": codec_metadata["semantic_dim"],
+                    "semantic_fps": codec_metadata["semantic_fps"],
+                    "semantic_fingerprint": codec_metadata["fingerprint"],
                 }
                 for key in ("text", "speaker_id", "duration", "language"):
                     if key in record:

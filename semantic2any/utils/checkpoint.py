@@ -56,5 +56,16 @@ def load_compatible_checkpoint(
     for name, module in model.models.items():
         if name not in params or name in ignore_modules:
             continue
-        module.load_state_dict(_unwrap_state_dict(params[name]), strict=strict)
+        module_state = _unwrap_state_dict(params[name])
+        if name == "length_regulator" and "content_in_proj.weight" in module_state:
+            checkpoint_dim = int(module_state["content_in_proj.weight"].shape[1])
+            current_weight = module.state_dict().get("content_in_proj.weight")
+            current_dim = int(current_weight.shape[1]) if current_weight is not None else None
+            if current_dim != checkpoint_dim:
+                raise ValueError(
+                    "Semantic codec checkpoint is incompatible: "
+                    f"checkpoint input dim={checkpoint_dim}, config input dim={current_dim}. "
+                    "MaskGCT uses 1024 dims and SAC raw semantic embeddings use 1280 dims."
+                )
+        module.load_state_dict(module_state, strict=strict)
     return int(state.get("epoch", 0)), int(state.get("iters", state.get("step", 0)))

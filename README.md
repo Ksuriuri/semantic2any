@@ -15,6 +15,9 @@ uv pip install -e .
 The training code imports frozen feature extractors from a local IndexTTS
 checkout. By default it expects `/mnt/data_sdd/hhy/index-tts`; override this with
 `--indextts-root` or `paths.indextts_root` in `configs/s2mel_zipformer.yaml`.
+SAC support is included in this repository and downloads only the pinned
+`zai-org/glm-4-voice-tokenizer` weights through the Hugging Face cache. It does
+not require a separate SAC checkout.
 
 ## Manifest
 
@@ -63,9 +66,55 @@ Optional precomputed fields are supported for faster iteration:
 Tensor conventions:
 
 - `mel`: `[n_mels, T]` (80 or 128 depending on the config)
-- `semantic`: `[T_sem, 1024]` continuous semantic embeddings or `[Q, T_sem]`
-  discrete codebooks when using a discrete length regulator
+- `semantic`: `[T_sem, 1024]` MaskGCT embeddings, `[T_sem, 1280]` SAC raw
+  semantic embeddings, or `[Q, T_sem]` discrete codebooks
 - `style`: `[192]`
+
+## Semantic codec ablation
+
+The default backend remains MaskGCT. Select SAC with one CLI option on training,
+precomputation, inference, or paired rendering:
+
+```bash
+uv run accelerate launch trainers/train_s2mel_zipformer.py \
+  --config configs/s2mel_zipformer.yaml \
+  --semantic-codec sac \
+  --train-jsonl /path/to/train.jsonl \
+  --output-dir exp/s2mel-sac
+```
+
+The two continuous feature contracts are:
+
+- `maskgct`: approximately 50 Hz, 1024 dimensions
+- `sac`: 12.5 Hz, 1280 dimensions, 16384-entry semantic codebook
+
+`SAC-16k-62_5Hz` reports the combined codec rate: 12.5 Hz semantic plus 50 Hz
+acoustic. This project intentionally uses only the raw semantic stream. It runs
+the GLM-4-Voice quantizing encoder and codebook lookup used by SAC, and does not
+download or instantiate SAC's acoustic encoder, decoder, or 2 GB codec
+checkpoint.
+
+The default tokenizer revision is pinned in `semantic_codec.revision`. Set
+`semantic_codec.tokenizer_path` for a local snapshot, or configure
+`semantic_codec.cache_dir` and `local_files_only` for the Hugging Face cache.
+The resolved config records the codec, input dimension, frame rate, source
+model, and fingerprint.
+
+Precompute each ablation into its own directory:
+
+```bash
+uv run python scripts/precompute_s2mel_features.py \
+  --config configs/s2mel_zipformer.yaml \
+  --semantic-codec sac \
+  --source /path/to/train.jsonl \
+  --output-dir datasets/features-sac \
+  --device cuda:0
+```
+
+`feature_metadata.json` and each manifest row carry the codec fingerprint.
+Reusing a directory with another codec or tokenizer revision fails unless
+`--overwrite` is given. MaskGCT and SAC checkpoints are not interchangeable
+because their length-regulator projections have different input dimensions.
 
 ## SpeechData Shards
 

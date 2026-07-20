@@ -8,6 +8,7 @@ dependencies = [
     "accelerate",
     "einops",
     "gcsfs",
+    "huggingface-hub",
     "json5",
     "librosa",
     "matplotlib",
