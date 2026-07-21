@@ -11,7 +11,13 @@ import torchaudio
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 
-from semantic2any.data.s2mel_dataset import choose_prompt_len, collate_paired_features
+from semantic2any.data.s2mel_dataset import (
+    DEFAULT_MAX_AUDIO_SECONDS,
+    DEFAULT_MAX_PAIR_SECONDS,
+    DEFAULT_MAX_PROMPT_SECONDS,
+    choose_prompt_len,
+    collate_paired_features,
+)
 
 
 def _get(obj, name: str, default=None):
@@ -88,9 +94,13 @@ class S2MelFeatureAdapter(nn.Module):
         self.mel_spectrogram = mel_spectrogram
 
         data_cfg = _get(cfg, "data")
-        self.max_audio_seconds = float(_get(data_cfg, "max_audio_seconds", 20.0))
+        self.max_audio_seconds = float(
+            _get(data_cfg, "max_audio_seconds", DEFAULT_MAX_AUDIO_SECONDS)
+        )
         self.min_prompt_seconds = float(_get(data_cfg, "min_prompt_seconds", 1.0))
-        max_prompt_seconds = _get(data_cfg, "max_prompt_seconds", 5.0)
+        max_prompt_seconds = _get(
+            data_cfg, "max_prompt_seconds", DEFAULT_MAX_PROMPT_SECONDS
+        )
         self.max_prompt_seconds = (
             None if max_prompt_seconds in (None, "None") else float(max_prompt_seconds)
         )
@@ -99,7 +109,9 @@ class S2MelFeatureAdapter(nn.Module):
             None if min_target_seconds in (None, "None") else float(min_target_seconds)
         )
         self.min_generated_frames = int(_get(data_cfg, "min_generated_frames", 8))
-        self.max_pair_seconds = float(_get(data_cfg, "max_pair_seconds", 30.0))
+        self.max_pair_seconds = float(
+            _get(data_cfg, "max_pair_seconds", DEFAULT_MAX_PAIR_SECONDS)
+        )
         self.min_pair_prompt_seconds = float(
             _get(data_cfg, "min_pair_prompt_seconds", 3.0)
         )

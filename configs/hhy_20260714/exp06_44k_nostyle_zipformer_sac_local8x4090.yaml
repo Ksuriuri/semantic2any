@@ -32,11 +32,15 @@ data:
   train_speechdata_dir: ""
   valid_speechdata_dir: ""
   speechdata_cache_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/.cache/speechdata
-  max_audio_seconds: 30.0
+  # Match IndexTTS2's 16384-frame s2mel budget:
+  # 16384 * 512 / 44100 == 16384 * 256 / 22050 ~= 190.22 seconds.
+  # This is the combined prompt + target duration, not target-only duration.
+  max_audio_seconds: 190.22
+  max_pair_seconds: 190.22
   pair_same_speaker: false
   random_split_audio: true
   min_prompt_seconds: 3.0
-  max_prompt_seconds: null
+  max_prompt_seconds: 15.0
   min_target_seconds: 3.0
   min_generated_frames: 8
   semantic_fps: 12.5
@@ -44,11 +48,12 @@ data:
   sample_rate_mel: 44100
   num_workers: 8
   prefetch_factor: 2
+  pin_memory: false
   decode_audio_in_worker: true
   skip_audio_errors: true
   feature_batch_size: 4
-  # Disabled for the host-RAM leak isolation run.
-  async_feature_extraction: false
+  # Overlap frozen SAC extraction with model training.
+  async_feature_extraction: true
   preload_features: false
   preload_batch_size: 16
 

@@ -23,6 +23,9 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset
 
 from semantic2any.data.s2mel_dataset import (
+    DEFAULT_MAX_AUDIO_SECONDS,
+    DEFAULT_MAX_PAIR_SECONDS,
+    DEFAULT_MAX_PROMPT_SECONDS,
     S2MelCollator,
     S2MelInMemoryDataset,
     S2MelJsonlDataset,
@@ -279,14 +282,20 @@ def make_dataloader(
         hop_length=int(spect.hop_length),
         sample_rate=int(cfg.preprocess_params.sr),
         min_prompt_seconds=float(cfg.data.min_prompt_seconds),
-        max_prompt_seconds=_optional_float(_get(cfg.data, "max_prompt_seconds", 5.0)),
+        max_prompt_seconds=_optional_float(
+            _get(cfg.data, "max_prompt_seconds", DEFAULT_MAX_PROMPT_SECONDS)
+        ),
         min_generated_frames=int(cfg.data.min_generated_frames),
         min_target_seconds=_optional_float(_get(cfg.data, "min_target_seconds", None)),
-        max_pair_seconds=float(_get(cfg.data, "max_pair_seconds", 30.0)),
+        max_pair_seconds=float(
+            _get(cfg.data, "max_pair_seconds", DEFAULT_MAX_PAIR_SECONDS)
+        ),
         min_pair_prompt_seconds=float(_get(cfg.data, "min_pair_prompt_seconds", 3.0)),
         decode_audio_in_worker=bool(_get(cfg.data, "decode_audio_in_worker", False)),
         skip_audio_errors=bool(_get(cfg.data, "skip_audio_errors", False)),
-        max_audio_seconds=_optional_float(_get(cfg.data, "max_audio_seconds", None)),
+        max_audio_seconds=_optional_float(
+            _get(cfg.data, "max_audio_seconds", DEFAULT_MAX_AUDIO_SECONDS)
+        ),
         expected_semantic_codec=codec.name,
         expected_semantic_fingerprint=codec.fingerprint(),
     )
@@ -302,7 +311,7 @@ def make_dataloader(
         shuffle=shuffle,
         num_workers=int(cfg.data.num_workers),
         collate_fn=collator,
-        pin_memory=True,
+        pin_memory=bool(_get(cfg.data, "pin_memory", True)),
         drop_last=shuffle,
         **kwargs,
     )

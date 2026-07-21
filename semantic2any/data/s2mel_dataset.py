@@ -18,6 +18,11 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
 
+DEFAULT_MAX_AUDIO_SECONDS = 190.22
+DEFAULT_MAX_PAIR_SECONDS = 190.22
+DEFAULT_MAX_PROMPT_SECONDS = 15.0
+
+
 def _load_tensor(path: str | Path) -> torch.Tensor:
     obj = torch.load(path, map_location="cpu")
     if isinstance(obj, dict):
@@ -690,11 +695,11 @@ class S2MelCollator:
         max_prompt_seconds: float | None,
         min_generated_frames: int,
         min_target_seconds: float | None = None,
-        max_pair_seconds: float = 30.0,
+        max_pair_seconds: float = DEFAULT_MAX_PAIR_SECONDS,
         min_pair_prompt_seconds: float = 3.0,
         decode_audio_in_worker: bool = False,
         skip_audio_errors: bool = False,
-        max_audio_seconds: float | None = None,
+        max_audio_seconds: float | None = DEFAULT_MAX_AUDIO_SECONDS,
         expected_semantic_codec: str | None = None,
         expected_semantic_fingerprint: str | None = None,
     ) -> None:
