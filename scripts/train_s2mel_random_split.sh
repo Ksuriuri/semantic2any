@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DATASET_ROOT=${DATASET_ROOT:-/mnt/data_3t_1/datasets/preprocess/s2mel-train-data}
-SPLIT_ROOT=${SPLIT_ROOT:-${DATASET_ROOT}/splits/seed1234_valid1000}
+DATASET_ROOT=${DATASET_ROOT:-/mnt/data_3t_1/datasets/preprocess/s2mel-train-data-filtered}
+CODE_ROOT=${CODE_ROOT:-${DATASET_ROOT}/maskgct-codes}
+SPLIT_ROOT=${SPLIT_ROOT:-${CODE_ROOT}/splits/seed1234_valid1000}
 TRAIN_JSONL=${TRAIN_JSONL:-${SPLIT_ROOT}/train.jsonl}
 VALID_JSONL=${VALID_JSONL:-${SPLIT_ROOT}/valid.jsonl}
-CONFIG=${CONFIG:-configs/s2mel_zipformer_s2mel_train_data_random_split_bigvgan_v2_44khz_128band_512x.yaml}
-OUTPUT_DIR=${OUTPUT_DIR:-exp/s2mel_train_data_random_split_bigvgan_v2_44khz_128band_512x}
+CONFIG=${CONFIG:-configs/s2mel_zipformer_s2mel_train_data_filtered_speaker_pair_bigvgan_v2_44khz_128band_512x.yaml}
+OUTPUT_DIR=${OUTPUT_DIR:-exp/s2mel_train_data_filtered_speaker_pair_bigvgan_v2_44khz_128band_512x}
 LOG_FILE=${LOG_FILE:-${OUTPUT_DIR}/train.log}
 NUM_PROCESSES=${NUM_PROCESSES:-4}
 NUM_MACHINES=${NUM_MACHINES:-1}

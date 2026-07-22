@@ -27,6 +27,9 @@ from semantic2any.data.s2mel_dataset import (
 from semantic2any.third_party.indextts import CAMPPlus, mel_spectrogram
 
 
+_USE_CONFIGURED_AUDIO_LIMIT = object()
+
+
 def _get(obj, name: str, default=None):
     return getattr(obj, name, obj.get(name, default) if isinstance(obj, dict) else default)
 
@@ -146,7 +149,19 @@ class S2MelFeatureAdapter(nn.Module):
         self.min_target_seconds = (
             None if min_target_seconds in (None, "None") else float(min_target_seconds)
         )
+        max_target_seconds = _get(data_cfg, "max_target_seconds", None)
+        self.max_target_seconds = (
+            None if max_target_seconds in (None, "None") else float(max_target_seconds)
+        )
         self.min_generated_frames = int(_get(data_cfg, "min_generated_frames", 8))
+        if self.min_target_seconds is None:
+            self.min_target_seconds = (
+                self.min_generated_frames
+                * self.mel_args["hop_size"]
+                / self.mel_args["sampling_rate"]
+            )
+        if self.max_target_seconds is None:
+            self.max_target_seconds = self.max_audio_seconds
         self.max_pair_seconds = float(
             _get(data_cfg, "max_pair_seconds", DEFAULT_MAX_PAIR_SECONDS)
         )
@@ -243,11 +258,18 @@ class S2MelFeatureAdapter(nn.Module):
         audio_paths: list[str],
         waveforms: list[torch.Tensor] | None,
         sample_rates: list[int] | None,
+        *,
+        max_audio_seconds: float | None | object = _USE_CONFIGURED_AUDIO_LIMIT,
     ) -> tuple[list[torch.Tensor], list[int]]:
         if (waveforms is None) != (sample_rates is None):
             raise ValueError("waveforms and sample_rates must be provided together")
+        duration_limit = (
+            self.max_audio_seconds
+            if max_audio_seconds is _USE_CONFIGURED_AUDIO_LIMIT
+            else max_audio_seconds
+        )
         if waveforms is None or sample_rates is None:
-            loaded = [_load_audio(path, self.max_audio_seconds) for path in audio_paths]
+            loaded = [_load_audio(path, duration_limit) for path in audio_paths]
             return [item[0] for item in loaded], [item[1] for item in loaded]
         if len(waveforms) != len(audio_paths) or len(sample_rates) != len(audio_paths):
             raise ValueError("Decoded audio batch must match audio_paths")
@@ -258,8 +280,8 @@ class S2MelFeatureAdapter(nn.Module):
                 raise ValueError(f"Decoded waveform must be [channels, samples], got {audio.shape}")
             if audio.size(0) > 1:
                 audio = audio.mean(dim=0, keepdim=True)
-            if self.max_audio_seconds is not None:
-                audio = audio[:, : int(self.max_audio_seconds * sample_rate)]
+            if duration_limit is not None:
+                audio = audio[:, : int(float(duration_limit) * sample_rate)]
             prepared.append(audio)
         return prepared, [int(sample_rate) for sample_rate in sample_rates]
 
@@ -613,6 +635,7 @@ class S2MelFeatureAdapter(nn.Module):
         prompt_sample_rates: list[int] | None = None,
         target_waveforms: list[torch.Tensor] | None = None,
         target_sample_rates: list[int] | None = None,
+        singleton_splits: list[bool] | None = None,
         prompt_semantic_codes: torch.Tensor | None = None,
         prompt_semantic_code_lens: torch.Tensor | None = None,
         target_semantic_codes: torch.Tensor | None = None,
@@ -624,16 +647,10 @@ class S2MelFeatureAdapter(nn.Module):
         if any(item is None for item in decoded) and not all(item is None for item in decoded):
             raise ValueError("All paired decoded waveform fields must be provided together")
         batch_size = len(prompt_audio_paths)
-        combined_waveforms = (
-            None
-            if prompt_waveforms is None or target_waveforms is None
-            else prompt_waveforms + target_waveforms
-        )
-        combined_sample_rates = (
-            None
-            if prompt_sample_rates is None or target_sample_rates is None
-            else prompt_sample_rates + target_sample_rates
-        )
+        if singleton_splits is None:
+            singleton_splits = [False] * batch_size
+        if len(singleton_splits) != batch_size:
+            raise ValueError("singleton_splits must match the paired batch size")
         code_fields = (
             prompt_semantic_codes,
             prompt_semantic_code_lens,
@@ -644,39 +661,231 @@ class S2MelFeatureAdapter(nn.Module):
             item is None for item in code_fields
         ):
             raise ValueError("All paired semantic code fields must be provided together")
-        combined_codes = None
-        combined_code_lens = None
-        if all(item is not None for item in code_fields):
+        code_mode = all(item is not None for item in code_fields)
+        prompt_sources, prompt_rates = self._prepare_audio_batch(
+            prompt_audio_paths,
+            prompt_waveforms,
+            prompt_sample_rates,
+            max_audio_seconds=self.max_audio_seconds,
+        )
+        target_sources, target_rates = self._prepare_audio_batch(
+            target_audio_paths,
+            target_waveforms,
+            target_sample_rates,
+            max_audio_seconds=None,
+        )
+
+        min_target_seconds = self.min_target_seconds
+        max_target_seconds = self.max_target_seconds
+        if min_target_seconds is None or max_target_seconds is None:
+            raise ValueError(
+                "Paired extraction requires min_target_seconds and max_target_seconds"
+            )
+        if self.max_prompt_seconds is None:
+            raise ValueError("Paired extraction requires max_prompt_seconds")
+
+        prompt_segments: list[torch.Tensor] = []
+        target_segments: list[torch.Tensor] = []
+        segment_rates: list[int] = []
+        singleton_code_splits: list[int | None] = []
+        for index, singleton_split in enumerate(singleton_splits):
+            if singleton_split:
+                source = target_sources[index]
+                sample_rate = target_rates[index]
+                source_samples = source.size(-1)
+                min_prompt_samples = math.ceil(self.min_pair_prompt_seconds * sample_rate)
+                min_target_samples = math.ceil(min_target_seconds * sample_rate)
+                max_prompt_samples = int(self.max_prompt_seconds * sample_rate)
+                lower_sample = min_prompt_samples
+                upper_sample = min(
+                    max_prompt_samples,
+                    source_samples - min_target_samples,
+                )
+                if upper_sample < lower_sample:
+                    raise ValueError(
+                        f"Singleton audio {target_audio_paths[index]} is too short for "
+                        f"a {self.min_pair_prompt_seconds:g}s prompt and "
+                        f"{min_target_seconds:g}s target"
+                    )
+                if code_mode:
+                    assert target_semantic_code_lens is not None
+                    code_length = int(target_semantic_code_lens[index])
+                    lower_code = max(
+                        1,
+                        math.ceil(lower_sample * code_length / source_samples),
+                    )
+                    upper_code = min(
+                        code_length - 1,
+                        math.floor(upper_sample * code_length / source_samples),
+                    )
+                    if upper_code < lower_code:
+                        raise ValueError(
+                            f"Singleton audio {target_audio_paths[index]} has too few "
+                            "semantic frames for the requested duration bounds"
+                        )
+                    split_code = (
+                        lower_code
+                        if upper_code == lower_code
+                        else random.randint(lower_code, upper_code)
+                    )
+                    split_sample = round(split_code * source_samples / code_length)
+                    split_sample = max(lower_sample, min(upper_sample, split_sample))
+                    singleton_code_splits.append(split_code)
+                else:
+                    split_sample = (
+                        lower_sample
+                        if upper_sample == lower_sample
+                        else random.randint(lower_sample, upper_sample)
+                    )
+                    singleton_code_splits.append(None)
+                prompt_segment = source[:, :split_sample]
+                target_segment = source[:, split_sample:]
+            else:
+                prompt_source = prompt_sources[index]
+                prompt_rate = prompt_rates[index]
+                target_segment = target_sources[index]
+                target_rate = target_rates[index]
+                prompt_samples = min(
+                    prompt_source.size(-1),
+                    int(self.max_prompt_seconds * prompt_rate),
+                )
+                if prompt_samples < math.ceil(
+                    self.min_pair_prompt_seconds * prompt_rate
+                ):
+                    raise ValueError(
+                        f"Prompt {prompt_audio_paths[index]} is shorter than "
+                        f"{self.min_pair_prompt_seconds:g} seconds"
+                    )
+                target_seconds = target_segment.size(-1) / target_rate
+                if target_seconds < min_target_seconds:
+                    raise ValueError(
+                        f"Target {target_audio_paths[index]} is shorter than "
+                        f"{min_target_seconds:g} seconds"
+                    )
+                if target_seconds > max_target_seconds + (1.0 / target_rate):
+                    raise ValueError(
+                        f"Target {target_audio_paths[index]} is {target_seconds:.3f}s, "
+                        f"exceeding the {max_target_seconds:g}s limit; targets are not cropped"
+                    )
+                prompt_segment = prompt_source[:, :prompt_samples]
+                sample_rate = prompt_rate
+                singleton_code_splits.append(None)
+
+            prompt_segments.append(prompt_segment)
+            target_segments.append(target_segment)
+            segment_rates.extend(
+                [
+                    sample_rate,
+                    target_rates[index],
+                ]
+            )
+
+        interleaved_segments = [
+            segment
+            for pair in zip(prompt_segments, target_segments, strict=True)
+            for segment in pair
+        ]
+        use_style_condition = bool(getattr(self, "use_style_condition", False))
+        need_16k = not code_mode or use_style_condition
+        resampled = self._resample_waveform_batch(
+            interleaved_segments,
+            segment_rates,
+            (
+                (self.sample_rate_mel, self.sample_rate_16k)
+                if need_16k
+                else (self.sample_rate_mel,)
+            ),
+        )
+        mel_waveforms = resampled[self.sample_rate_mel]
+        waveforms_16k = resampled[self.sample_rate_16k] if need_16k else []
+
+        full_prompt_semantics: list[torch.Tensor] | None = None
+        full_target_semantics: list[torch.Tensor] | None = None
+        online_semantics: list[torch.Tensor] = []
+        if code_mode:
             assert prompt_semantic_codes is not None
             assert prompt_semantic_code_lens is not None
             assert target_semantic_codes is not None
             assert target_semantic_code_lens is not None
-            code_items = [
-                prompt_semantic_codes[index, : int(prompt_semantic_code_lens[index])]
-                for index in range(batch_size)
-            ] + [
-                target_semantic_codes[index, : int(target_semantic_code_lens[index])]
-                for index in range(batch_size)
+            full_prompt_semantics = self._semantic_from_codes(
+                prompt_semantic_codes,
+                prompt_semantic_code_lens,
+            )
+            full_target_semantics = self._semantic_from_codes(
+                target_semantic_codes,
+                target_semantic_code_lens,
+            )
+        else:
+            semantic_waveforms = [
+                waveform.squeeze(0).detach().cpu().numpy()
+                for waveform in waveforms_16k
             ]
-            combined_codes = pad_sequence(
-                code_items, batch_first=True, padding_value=0
+            for start in range(0, len(semantic_waveforms), self.feature_batch_size):
+                online_semantics.extend(
+                    self._semantic_from_waveforms(
+                        semantic_waveforms[start : start + self.feature_batch_size]
+                    )
+                )
+
+        prompt_features: list[dict[str, torch.Tensor]] = []
+        target_features: list[dict[str, torch.Tensor]] = []
+        device = self._module_device()
+        for index, singleton_split in enumerate(singleton_splits):
+            prompt_mel = self.mel_spectrogram(
+                mel_waveforms[2 * index].float(), **self.mel_args
+            ).squeeze(0)
+            target_mel = self.mel_spectrogram(
+                mel_waveforms[2 * index + 1].float(), **self.mel_args
+            ).squeeze(0)
+            if code_mode:
+                assert full_prompt_semantics is not None
+                assert full_target_semantics is not None
+                if singleton_split:
+                    split_code = singleton_code_splits[index]
+                    assert split_code is not None
+                    full_semantic = full_target_semantics[index]
+                    prompt_semantic = full_semantic[:split_code]
+                    target_semantic = full_semantic[split_code:]
+                else:
+                    full_prompt = full_prompt_semantics[index]
+                    prompt_keep = max(
+                        1,
+                        min(
+                            full_prompt.size(0),
+                            round(
+                                full_prompt.size(0)
+                                * prompt_segments[index].size(-1)
+                                / prompt_sources[index].size(-1)
+                            ),
+                        ),
+                    )
+                    prompt_semantic = full_prompt[:prompt_keep]
+                    target_semantic = full_target_semantics[index]
+            else:
+                prompt_semantic = online_semantics[2 * index]
+                target_semantic = online_semantics[2 * index + 1]
+            style = (
+                self._style_from_audio(waveforms_16k[2 * index])
+                if need_16k
+                else torch.zeros(
+                    int(getattr(self, "style_dim", 192)),
+                    device=device,
+                )
             )
-            combined_code_lens = torch.cat(
-                [prompt_semantic_code_lens, target_semantic_code_lens]
+            prompt_features.append(
+                {"mel": prompt_mel, "semantic": prompt_semantic, "style": style}
             )
-        features = self.extract_utterance_features(
-            prompt_audio_paths + target_audio_paths,
-            waveforms=combined_waveforms,
-            sample_rates=combined_sample_rates,
-            semantic_codes=combined_codes,
-            semantic_code_lens=combined_code_lens,
-        )
+            target_features.append(
+                {"mel": target_mel, "semantic": target_semantic, "style": style}
+            )
+
+        duration_budget = self.max_prompt_seconds + max_target_seconds
         return collate_paired_features(
-            features[:batch_size],
-            features[batch_size:],
+            prompt_features,
+            target_features,
             hop_length=self.mel_args["hop_size"],
             sample_rate=self.sample_rate_mel,
-            max_pair_seconds=self.max_pair_seconds,
+            max_pair_seconds=duration_budget,
             min_prompt_seconds=self.min_pair_prompt_seconds,
             min_generated_frames=self.min_generated_frames,
             is_precomputed=False,

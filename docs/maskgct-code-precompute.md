@@ -8,8 +8,8 @@ W2V-BERT 或完整 RepCodec encoder。
 这里的 lookup table 来自 MaskGCT RepCodec 的 FVQ codebook 和
 `out_project`，不是 s2mel length regulator 中可训练的 `embedding`。
 
-音频文件仍由 DataLoader worker 在 CPU 解码，但不会在 worker 中重采样。
-同采样率音频会在主进程组成 batch，传到对应 GPU 后统一重采样至 16 kHz。
+音频文件由 DataLoader worker 在 CPU 解码并重采样至 16 kHz，随后以 NumPy
+waveform 交给 MaskGCT。这样避免 GPU 重采样后为适配特征提取器再次同步回 CPU。
 
 ## 输出结构
 
@@ -54,6 +54,9 @@ uv run python scripts/precompute_maskgct_codes.py \
 对 filtered 数据集的 1,413,343 条音频各提取一次；`--num-shards` 仅表示并行
 存储分片，不是训练集划分。
 
+当前任务输出到
+`/mnt/data_3t_1/datasets/preprocess/s2mel-train-data-filtered/maskgct-codes`。
+
 ```bash
 tmux new-session -d -s maskgct-codes-filtered-8gpu \
   "cd /mnt/data_sdd/hhy/noiz-tts/semantic2any && \
@@ -61,9 +64,10 @@ tmux new-session -d -s maskgct-codes-filtered-8gpu \
    for shard in \$(seq 0 7); do \
      CUDA_VISIBLE_DEVICES=\$shard uv run python scripts/precompute_maskgct_codes.py \
        --config configs/s2mel_zipformer_s2mel_train_data_random_split_bigvgan_v2_44khz_128band_512x.yaml \
+       --model-dir checkpoints/feature-extractors \
        --source /mnt/data_3t_1/datasets/preprocess/s2mel-train-data-filtered/metadata \
        --output-dir /mnt/data_3t_1/datasets/preprocess/s2mel-train-data-filtered/maskgct-codes \
-       --device cuda:0 --batch-size 16 --num-workers 2 \
+       --device cuda:0 --batch-size 8 --num-workers 2 \
        --num-shards 8 --shard \$shard \
        > /mnt/data_3t_1/datasets/preprocess/s2mel-train-data-filtered/maskgct-codes/logs/shard-\$shard.log 2>&1 & \
    done; wait"
@@ -75,19 +79,47 @@ tmux new-session -d -s maskgct-codes-filtered-8gpu \
 tmux attach -t maskgct-codes-filtered-8gpu
 ```
 
-## 使用 code manifest 训练
+## 生成固定训练/验证划分
+
+8 个 shard 全部完成后，再从 code manifest 固定抽取 1,000 条验证记录。不要在提取
+尚未完成时生成 split，否则后续完成的记录不会进入训练集。
 
 ```bash
-uv run accelerate launch trainers/train_s2mel_zipformer.py \
-  --config configs/s2mel_zipformer_s2mel_train_data_random_split_bigvgan_v2_44khz_128band_512x.yaml \
-  --train-jsonl /mnt/data_3t_1/datasets/preprocess/s2mel-train-data-filtered/maskgct-codes/manifests
+uv run python scripts/split_s2mel_validation.py \
+  --metadata-dir /mnt/data_3t_1/datasets/preprocess/s2mel-train-data-filtered/maskgct-codes/manifests \
+  --output-dir /mnt/data_3t_1/datasets/preprocess/s2mel-train-data-filtered/maskgct-codes/splits/seed1234_valid1000 \
+  --valid-size 1000 \
+  --seed 1234
 ```
 
-上述命令将全部提取记录作为一个数据源使用；若需要 train/valid，应在特征提取
-完成后基于生成的 manifest 单独划分，而不是重复提取音频。
+split 脚本会保留 semantic offset、length、fingerprint 和 checksum，并将
+`audio_path`、`semantic_code_path`、`semantic_lookup_path` 解析为绝对路径。
+生成的 train/valid manifest 互不重叠。
 
-`random_split_audio: true` 时，训练仍随机选择实际音频切点，然后按
-`split_sample / clipped_audio_samples` 的比例切分整条 semantic code。prompt
-和 target 在 length regulator 中仍分别插值，但不会为每个随机切分重新运行
-MaskGCT。`data.preload_features` 必须保持 `false`。
+## 默认训练规则
+
+默认入口改为：
+
+```bash
+NUM_PROCESSES=8 bash scripts/train_s2mel_random_split.sh
+```
+
+虽然脚本名为历史遗留的 `random_split`，默认配置已经切换到
+`configs/s2mel_zipformer_s2mel_train_data_filtered_speaker_pair_bigvgan_v2_44khz_128band_512x.yaml`，
+并读取上述 code-aware split。
+
+训练样本按 `speaker_id` 组织：
+
+1. 同一说话人有两条及以上可用音频时，target 取 3–30 秒的完整音频，不做裁切；
+   超过 30 秒的音频不作为 target，但仍可作为 prompt。
+2. prompt 随机选择该说话人的另一条音频，至少 3 秒；超过 20 秒时只保留开头
+   20 秒，semantic code 同比例保留对应前缀。
+3. 说话人只有一条可用音频时，从该音频随机切分 prompt/target，二者均至少
+   3 秒且 prompt 不超过 20 秒。使用预计算 code 时先选择整数 semantic frame
+   分界，再映射回音频 sample，因此 code 不会在 frame 中间切开。
+4. 验证集不会从训练集借用同说话人 prompt，避免 train/valid 交叉。
+
+当前已生成 code 的 `semantic_max_audio_seconds` 是 30 秒，所以默认配置必须保持
+`data.max_audio_seconds: 30.0`。`data.preload_features` 必须保持 `false`；训练只
+加载约 32 MiB lookup table，不会重新运行 MaskGCT encoder。
 

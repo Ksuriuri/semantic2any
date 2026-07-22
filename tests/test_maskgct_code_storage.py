@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from scripts.precompute_maskgct_codes import GPUWaveformResampler, _load_jsonl
+from scripts.precompute_maskgct_codes import AudioCollator, _load_jsonl
 from semantic2any.data.s2mel_dataset import S2MelCollator, S2MelJsonlDataset
 
 
@@ -140,13 +140,29 @@ def test_resume_repairs_only_a_partial_final_journal_line(tmp_path):
     assert journal.read_bytes() == committed
 
 
-def test_batched_resampler_preserves_per_item_lengths():
-    resampler = GPUWaveformResampler(torch.device("cpu"), target_rate=2)
+def test_audio_collator_resamples_before_returning_numpy(monkeypatch):
+    monkeypatch.setattr(
+        "scripts.precompute_maskgct_codes.torchaudio.load",
+        lambda _: (torch.arange(8).view(1, -1).float(), 4),
+    )
+    calls = []
 
-    outputs = resampler(
-        [torch.arange(8).view(1, -1).float(), torch.arange(4).view(1, -1).float()],
-        [4, 4],
+    def resample(audio, source_rate, target_rate):
+        calls.append((source_rate, target_rate))
+        return torch.ones(1, 32)
+
+    monkeypatch.setattr(
+        "scripts.precompute_maskgct_codes.torchaudio.functional.resample",
+        resample,
     )
 
-    assert [item.shape[0] for item in outputs] == [4, 2]
-    assert len(resampler._cache) == 1
+    records, waveforms, failures = AudioCollator(10.0, False)(
+        [{"audio_path": "sample.wav"}]
+    )
+
+    assert [record["audio_path"] for record in records] == ["sample.wav"]
+    assert failures == []
+    assert calls == [(4, 16000)]
+    assert len(waveforms) == 1
+    assert waveforms[0].shape == (32,)
+    assert waveforms[0].dtype == np.float32

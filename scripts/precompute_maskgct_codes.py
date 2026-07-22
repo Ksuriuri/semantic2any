@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import sys
 import warnings
@@ -21,7 +20,6 @@ import numpy as np
 import torch
 import torchaudio
 from omegaconf import OmegaConf
-from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm.auto import tqdm
 
@@ -77,15 +75,9 @@ class AudioCollator:
 
     def __call__(
         self, records: list[dict[str, Any]]
-    ) -> tuple[
-        list[dict[str, Any]],
-        list[torch.Tensor],
-        list[int],
-        list[dict[str, Any]],
-    ]:
+    ) -> tuple[list[dict[str, Any]], list[np.ndarray], list[dict[str, Any]]]:
         valid_records: list[dict[str, Any]] = []
-        waveforms: list[torch.Tensor] = []
-        sample_rates: list[int] = []
+        waveforms: list[np.ndarray] = []
         failures: list[dict[str, Any]] = []
         for record in records:
             path = str(record["audio_path"])
@@ -97,6 +89,14 @@ class AudioCollator:
                 audio = audio[:, :max_samples].float()
                 if audio.numel() == 0:
                     raise ValueError("decoded audio is empty")
+                if sample_rate != 16000:
+                    audio = torchaudio.functional.resample(audio, sample_rate, 16000)
+                waveform = (
+                    audio.squeeze(0)
+                    .contiguous()
+                    .numpy()
+                    .astype(np.float32, copy=False)
+                )
             except (OSError, RuntimeError, ValueError) as exc:
                 if not self.skip_errors:
                     raise
@@ -112,79 +112,8 @@ class AudioCollator:
                 warnings.warn(f"Skipping undecodable audio {path}: {exc}", RuntimeWarning)
                 continue
             valid_records.append(record)
-            waveforms.append(audio.contiguous())
-            sample_rates.append(int(sample_rate))
-        return valid_records, waveforms, sample_rates, failures
-
-
-class GPUWaveformResampler:
-    """Batch worker-decoded variable-length audio and resample on the target GPU."""
-
-    def __init__(self, device: torch.device, target_rate: int = 16000) -> None:
-        self.device = torch.device(device)
-        self.target_rate = int(target_rate)
-        self._cache: dict[tuple[int, torch.dtype], torchaudio.transforms.Resample] = {}
-
-    def _resampler(
-        self,
-        source_rate: int,
-        dtype: torch.dtype,
-    ) -> torchaudio.transforms.Resample:
-        key = (source_rate, dtype)
-        resampler = self._cache.get(key)
-        if resampler is None:
-            resampler = torchaudio.transforms.Resample(
-                source_rate,
-                self.target_rate,
-                dtype=dtype,
-            ).to(self.device)
-            resampler.eval()
-            self._cache[key] = resampler
-        return resampler
-
-    @torch.no_grad()
-    def __call__(
-        self,
-        waveforms: list[torch.Tensor],
-        sample_rates: list[int],
-    ) -> list[np.ndarray]:
-        if not waveforms or len(waveforms) != len(sample_rates):
-            raise ValueError("waveforms and sample_rates must have the same non-zero length")
-        grouped: dict[int, list[int]] = {}
-        for index, sample_rate in enumerate(sample_rates):
-            grouped.setdefault(int(sample_rate), []).append(index)
-
-        outputs: list[np.ndarray | None] = [None] * len(waveforms)
-        for source_rate, indices in grouped.items():
-            source_items = [waveforms[index].squeeze(0).float() for index in indices]
-            source_lengths = [item.numel() for item in source_items]
-            padded = pad_sequence(
-                source_items,
-                batch_first=True,
-                padding_value=0.0,
-            ).to(self.device, non_blocking=True)
-            resampled = (
-                padded
-                if source_rate == self.target_rate
-                else self._resampler(source_rate, padded.dtype)(padded)
-            )
-            for local_index, (global_index, source_length) in enumerate(
-                zip(indices, source_lengths, strict=True)
-            ):
-                target_length = math.ceil(
-                    source_length * self.target_rate / source_rate
-                )
-                outputs[global_index] = (
-                    resampled[local_index, :target_length]
-                    .detach()
-                    .cpu()
-                    .contiguous()
-                    .numpy()
-                    .astype(np.float32, copy=False)
-                )
-        if any(item is None for item in outputs):
-            raise RuntimeError("GPU resampling did not produce every waveform")
-        return [item for item in outputs if item is not None]
+            waveforms.append(waveform)
+        return valid_records, waveforms, failures
 
 
 def _source_identity(record: dict[str, Any]) -> str:
@@ -367,7 +296,6 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=AudioCollator(max_audio_seconds, args.skip_audio_errors),
-        pin_memory=device.type == "cuda",
         persistent_workers=args.num_workers > 0,
     )
 
@@ -377,7 +305,6 @@ def main() -> None:
     if not isinstance(backend, MaskGCTSemanticCodec):
         raise TypeError("Expected MaskGCTSemanticCodec")
     backend = backend.to(device).eval()
-    waveform_resampler = GPUWaveformResampler(device, target_rate=info.sample_rate)
 
     lookup = backend.codebook_lookup()
     _install_lookup_once(lookup_path, lookup)
@@ -441,7 +368,7 @@ def main() -> None:
     ):
         binary.seek(0, os.SEEK_END)
         token_offset = binary.tell() // np.dtype("<u2").itemsize
-        for valid_records, waveforms, sample_rates, failures in tqdm(
+        for valid_records, waveforms, failures in tqdm(
             loader,
             total=(len(pending_indices) + args.batch_size - 1) // args.batch_size,
             desc=suffix,
@@ -451,8 +378,7 @@ def main() -> None:
                 failed += 1
             if not waveforms:
                 continue
-            waveforms_16k = waveform_resampler(waveforms, sample_rates)
-            codes_batch = backend.extract_codes(waveforms_16k)
+            codes_batch = backend.extract_codes(waveforms)
             for record, codes in zip(valid_records, codes_batch, strict=True):
                 codes = codes.detach().cpu().long().contiguous()
                 if codes.ndim != 1 or codes.numel() == 0:

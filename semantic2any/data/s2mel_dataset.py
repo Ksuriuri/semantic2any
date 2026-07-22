@@ -472,92 +472,135 @@ def _record_can_be_prompt(
 
 
 class S2MelSpeakerPairedDataset(Dataset):
-    """Pair every target with a distinct prompt utterance from the same speaker."""
+    """Build same-speaker pairs, falling back to an aligned singleton split."""
 
     def __init__(
         self,
         target_dataset: Dataset,
         *,
         min_prompt_seconds: float,
+        max_prompt_seconds: float,
+        min_target_seconds: float,
+        max_target_seconds: float,
         hop_length: int,
         sample_rate: int,
-        fallback_prompt_dataset: Dataset | None = None,
     ) -> None:
         self.target_dataset = target_dataset
-        self.fallback_prompt_dataset = fallback_prompt_dataset
         target_records = _dataset_records(target_dataset)
+        if min_prompt_seconds <= 0 or min_target_seconds <= 0:
+            raise ValueError("Minimum prompt and target durations must be positive")
+        if max_prompt_seconds < min_prompt_seconds:
+            raise ValueError("max_prompt_seconds must be >= min_prompt_seconds")
+        if max_target_seconds < min_target_seconds:
+            raise ValueError("max_target_seconds must be >= min_target_seconds")
 
-        def build_prompt_groups(dataset: Dataset) -> dict[str, list[tuple[Dataset, int, str]]]:
-            groups: dict[str, list[tuple[Dataset, int, str]]] = defaultdict(list)
-            for index, record in enumerate(_dataset_records(dataset)):
-                speaker_id = record.get("speaker_id")
-                if not isinstance(speaker_id, str) or not speaker_id:
-                    continue
-                if not _record_can_be_prompt(
-                    record,
-                    min_prompt_seconds=min_prompt_seconds,
-                    hop_length=hop_length,
-                    sample_rate=sample_rate,
-                ):
-                    continue
-                groups[speaker_id].append((dataset, index, _record_identity(record, index)))
-            return groups
-
-        local_groups = build_prompt_groups(target_dataset)
-        fallback_groups = (
-            build_prompt_groups(fallback_prompt_dataset)
-            if fallback_prompt_dataset is not None and fallback_prompt_dataset is not target_dataset
-            else {}
-        )
-
-        self.target_indices: list[int] = []
-        self.prompt_candidates: list[list[tuple[Dataset, int]]] = []
-        self.fallback_target_count = 0
+        prompt_groups: dict[str, list[int]] = defaultdict(list)
+        prompt_identities: dict[str, set[str]] = defaultdict(set)
         self.missing_speaker_count = 0
-        for target_index, target_record in enumerate(target_records):
-            speaker_id = target_record.get("speaker_id")
+        self.missing_duration_count = 0
+        for index, record in enumerate(target_records):
+            speaker_id = record.get("speaker_id")
             if not isinstance(speaker_id, str) or not speaker_id:
                 self.missing_speaker_count += 1
                 continue
+            duration = record.get("duration")
+            if not isinstance(duration, (int, float)) or not math.isfinite(float(duration)):
+                self.missing_duration_count += 1
+                continue
+            if float(duration) >= min_prompt_seconds:
+                identity = _record_identity(record, index)
+                prompt_groups[speaker_id].append(index)
+                prompt_identities[speaker_id].add(identity)
+
+        self.target_indices: list[int] = []
+        self.target_speaker_ids: list[str] = []
+        self.singleton_splits: list[bool] = []
+        self.paired_target_count = 0
+        self.singleton_target_count = 0
+        self.too_short_target_count = 0
+        self.overlong_target_count = 0
+        self.unusable_target_count = 0
+        for target_index, target_record in enumerate(target_records):
+            speaker_id = target_record.get("speaker_id")
+            if not isinstance(speaker_id, str) or not speaker_id:
+                continue
+            duration = target_record.get("duration")
+            if not isinstance(duration, (int, float)) or not math.isfinite(float(duration)):
+                continue
+            duration = float(duration)
+            if duration < min_target_seconds:
+                self.too_short_target_count += 1
+                continue
+            if duration > max_target_seconds:
+                self.overlong_target_count += 1
+                continue
             target_identity = _record_identity(target_record, target_index)
-            candidates = [
-                (dataset, index)
-                for dataset, index, identity in local_groups.get(speaker_id, [])
-                if identity != target_identity
-            ]
-            used_fallback = False
-            if not candidates:
-                candidates = [
-                    (dataset, index)
-                    for dataset, index, identity in fallback_groups.get(speaker_id, [])
-                    if identity != target_identity
-                ]
-                used_fallback = bool(candidates)
-            if not candidates:
+            identities = prompt_identities.get(speaker_id, set())
+            singleton_split = not identities or identities == {target_identity}
+            if singleton_split and duration < min_prompt_seconds + min_target_seconds:
+                self.unusable_target_count += 1
                 continue
             self.target_indices.append(target_index)
-            self.prompt_candidates.append(candidates)
-            self.fallback_target_count += int(used_fallback)
+            self.target_speaker_ids.append(speaker_id)
+            self.singleton_splits.append(singleton_split)
+            self.singleton_target_count += int(singleton_split)
+            self.paired_target_count += int(not singleton_split)
 
         if not self.target_indices:
             raise ValueError(
-                "No same-speaker prompt/target pairs are available. Each target needs "
-                "speaker_id and a distinct prompt utterance of at least "
-                f"{min_prompt_seconds:g} seconds."
+                "No usable speaker-conditioned samples are available. Targets need "
+                f"speaker_id and duration in [{min_target_seconds:g}, "
+                f"{max_target_seconds:g}] seconds; singleton utterances must also fit "
+                f"a {min_prompt_seconds:g}-second prompt."
             )
+        self.min_prompt_seconds = float(min_prompt_seconds)
+        self.max_prompt_seconds = float(max_prompt_seconds)
+        self.min_target_seconds = float(min_target_seconds)
+        self.max_target_seconds = float(max_target_seconds)
+        self.hop_length = int(hop_length)
+        self.sample_rate = int(sample_rate)
+        self.prompt_groups = dict(prompt_groups)
+        self.target_records = target_records
 
     def __len__(self) -> int:
         return len(self.target_indices)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         target_index = self.target_indices[index]
-        prompt_dataset, prompt_index = random.choice(self.prompt_candidates[index])
-        prompt = prompt_dataset[prompt_index]
+        singleton_split = self.singleton_splits[index]
         target = self.target_dataset[target_index]
+        if singleton_split:
+            prompt = target
+        else:
+            target_identity = _record_identity(
+                self.target_records[target_index],
+                target_index,
+            )
+            group = self.prompt_groups[self.target_speaker_ids[index]]
+            for _ in range(8):
+                prompt_index = random.choice(group)
+                prompt_identity = _record_identity(
+                    self.target_records[prompt_index],
+                    prompt_index,
+                )
+                if prompt_identity != target_identity:
+                    break
+            else:
+                prompt_index = next(
+                    candidate_index
+                    for candidate_index in group
+                    if _record_identity(
+                        self.target_records[candidate_index],
+                        candidate_index,
+                    )
+                    != target_identity
+                )
+            prompt = self.target_dataset[prompt_index]
         return {
             "prompt": prompt,
             "target": target,
             "speaker_id": target["speaker_id"],
+            "singleton_split": singleton_split,
         }
 
 
@@ -730,6 +773,7 @@ class S2MelCollator:
         max_prompt_seconds: float | None,
         min_generated_frames: int,
         min_target_seconds: float | None = None,
+        max_target_seconds: float | None = None,
         max_pair_seconds: float = DEFAULT_MAX_PAIR_SECONDS,
         min_pair_prompt_seconds: float = 3.0,
         decode_audio_in_worker: bool = False,
@@ -744,6 +788,7 @@ class S2MelCollator:
         self.max_prompt_seconds = max_prompt_seconds
         self.min_generated_frames = min_generated_frames
         self.min_target_seconds = min_target_seconds
+        self.max_target_seconds = max_target_seconds
         self.max_pair_seconds = max_pair_seconds
         self.min_pair_prompt_seconds = min_pair_prompt_seconds
         self.decode_audio_in_worker = decode_audio_in_worker
@@ -781,27 +826,37 @@ class S2MelCollator:
                 )
 
     def _decode_audio_paths(
-        self, audio_paths: list[str]
+        self,
+        audio_paths: list[str],
+        *,
+        max_audio_seconds: float | None,
     ) -> tuple[list[torch.Tensor], list[int], list[int]]:
         waveforms = []
         sample_rates = []
         valid_indices = []
+        decoded: dict[str, tuple[torch.Tensor, int] | None] = {}
         for index, path in enumerate(audio_paths):
-            try:
-                audio, sample_rate = torchaudio.load(path)
-            except (OSError, RuntimeError, ValueError) as exc:
-                if not self.skip_audio_errors:
-                    raise
-                warnings.warn(
-                    f"Skipping undecodable audio file {path}: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            cached = decoded.get(path)
+            if path not in decoded:
+                try:
+                    cached = torchaudio.load(path)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    if not self.skip_audio_errors:
+                        raise
+                    warnings.warn(
+                        f"Skipping undecodable audio file {path}: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    cached = None
+                decoded[path] = cached
+            if cached is None:
                 continue
+            audio, sample_rate = cached
             if audio.size(0) > 1:
                 audio = audio.mean(dim=0, keepdim=True)
-            if self.max_audio_seconds is not None:
-                max_samples = int(self.max_audio_seconds * sample_rate)
+            if max_audio_seconds is not None:
+                max_samples = int(max_audio_seconds * sample_rate)
                 audio = audio[:, :max_samples]
             waveforms.append(audio)
             sample_rates.append(sample_rate)
@@ -1034,16 +1089,21 @@ class S2MelCollator:
             batch = {
                 "prompt_audio_paths": prompt_audio_paths,
                 "target_audio_paths": target_audio_paths,
+                "singleton_splits": [
+                    bool(record.get("singleton_split", False)) for record in records
+                ],
                 "records": records,
                 "is_precomputed": False,
                 "is_paired": True,
             }
             if self.decode_audio_in_worker:
                 prompt_waveforms, prompt_sample_rates, prompt_indices = self._decode_audio_paths(
-                    prompt_audio_paths
+                    prompt_audio_paths,
+                    max_audio_seconds=self.max_audio_seconds,
                 )
                 target_waveforms, target_sample_rates, target_indices = self._decode_audio_paths(
-                    target_audio_paths
+                    target_audio_paths,
+                    max_audio_seconds=None,
                 )
                 prompt_decoded = {
                     index: (waveform, sample_rate)
@@ -1071,6 +1131,10 @@ class S2MelCollator:
                     {
                         "prompt_audio_paths": prompt_audio_paths,
                         "target_audio_paths": target_audio_paths,
+                        "singleton_splits": [
+                            bool(records[index].get("singleton_split", False))
+                            for index in range(len(records))
+                        ],
                         "records": records,
                         "prompt_audio_waveforms": [
                             prompt_decoded[index][0] for index in valid_indices
@@ -1112,7 +1176,10 @@ class S2MelCollator:
             "is_precomputed": False,
         }
         if self.decode_audio_in_worker:
-            waveforms, sample_rates, valid_indices = self._decode_audio_paths(audio_paths)
+            waveforms, sample_rates, valid_indices = self._decode_audio_paths(
+                audio_paths,
+                max_audio_seconds=self.max_audio_seconds,
+            )
             if not valid_indices:
                 raise RuntimeError("No decodable audio files remain in batch")
             batch["audio_paths"] = [audio_paths[index] for index in valid_indices]

@@ -8,7 +8,14 @@ import random
 from pathlib import Path
 
 
-PATH_KEYS = ("audio_path", "mel_path", "semantic_path", "style_path")
+PATH_KEYS = (
+    "audio_path",
+    "mel_path",
+    "semantic_path",
+    "style_path",
+    "semantic_code_path",
+    "semantic_lookup_path",
+)
 
 
 def parse_args() -> argparse.Namespace:

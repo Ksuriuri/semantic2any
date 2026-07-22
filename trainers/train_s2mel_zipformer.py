@@ -284,6 +284,7 @@ def make_dataloader(
         ),
         min_generated_frames=int(cfg.data.min_generated_frames),
         min_target_seconds=_optional_float(_get(cfg.data, "min_target_seconds", None)),
+        max_target_seconds=_optional_float(_get(cfg.data, "max_target_seconds", None)),
         max_pair_seconds=float(
             _get(cfg.data, "max_pair_seconds", DEFAULT_MAX_PAIR_SECONDS)
         ),
@@ -377,16 +378,35 @@ def preload_dataset_features(
 def make_speaker_paired_dataset(
     cfg,
     dataset: Dataset,
-    *,
-    fallback_prompt_dataset: Dataset | None = None,
 ) -> S2MelSpeakerPairedDataset:
     spect = cfg.preprocess_params.spect_params
+    min_target_seconds = _optional_float(_get(cfg.data, "min_target_seconds", None))
+    max_prompt_seconds = _optional_float(
+        _get(cfg.data, "max_prompt_seconds", DEFAULT_MAX_PROMPT_SECONDS)
+    )
+    max_target_seconds = _optional_float(_get(cfg.data, "max_target_seconds", None))
+    if min_target_seconds is None:
+        min_target_seconds = (
+            int(_get(cfg.data, "min_generated_frames", 8))
+            * int(spect.hop_length)
+            / int(cfg.preprocess_params.sr)
+        )
+    if max_prompt_seconds is None:
+        max_prompt_seconds = float(
+            _get(cfg.data, "max_audio_seconds", DEFAULT_MAX_AUDIO_SECONDS)
+        )
+    if max_target_seconds is None:
+        max_target_seconds = float(
+            _get(cfg.data, "max_audio_seconds", DEFAULT_MAX_AUDIO_SECONDS)
+        )
     return S2MelSpeakerPairedDataset(
         dataset,
         min_prompt_seconds=float(_get(cfg.data, "min_pair_prompt_seconds", 3.0)),
+        max_prompt_seconds=max_prompt_seconds,
+        min_target_seconds=min_target_seconds,
+        max_target_seconds=max_target_seconds,
         hop_length=int(spect.hop_length),
         sample_rate=int(cfg.preprocess_params.sr),
-        fallback_prompt_dataset=fallback_prompt_dataset,
     )
 
 
@@ -530,6 +550,7 @@ def build_training_batch(
             prompt_sample_rates=batch.get("prompt_audio_sample_rates"),
             target_waveforms=batch.get("target_audio_waveforms"),
             target_sample_rates=batch.get("target_audio_sample_rates"),
+            singleton_splits=batch.get("singleton_splits"),
             prompt_semantic_codes=batch.get("prompt_semantic_codes"),
             prompt_semantic_code_lens=batch.get("prompt_semantic_code_lens"),
             target_semantic_codes=batch.get("target_semantic_codes"),
@@ -869,21 +890,25 @@ def main() -> None:
         valid_prompt_dataset = valid_dataset
         train_dataset = make_speaker_paired_dataset(cfg, train_prompt_dataset)
         if valid_prompt_dataset is not None:
-            valid_dataset = make_speaker_paired_dataset(
-                cfg,
-                valid_prompt_dataset,
-                fallback_prompt_dataset=train_prompt_dataset,
-            )
+            valid_dataset = make_speaker_paired_dataset(cfg, valid_prompt_dataset)
         if accelerator.is_main_process:
             print(
-                f"[Pairing] train: {len(train_dataset)} same-speaker targets; "
-                f"missing speaker_id: {train_dataset.missing_speaker_count}"
+                f"[Pairing] train: {len(train_dataset)} samples "
+                f"({train_dataset.paired_target_count} paired, "
+                f"{train_dataset.singleton_target_count} singleton); "
+                f"skipped target too-short={train_dataset.too_short_target_count}, "
+                f"overlong={train_dataset.overlong_target_count}, "
+                f"unusable={train_dataset.unusable_target_count}, "
+                f"missing-speaker={train_dataset.missing_speaker_count}, "
+                f"missing-duration={train_dataset.missing_duration_count}"
             )
             if valid_dataset is not None:
                 print(
-                    f"[Pairing] valid: {len(valid_dataset)} same-speaker targets; "
-                    f"train-prompt fallbacks: {valid_dataset.fallback_target_count}; "
-                    f"missing speaker_id: {valid_dataset.missing_speaker_count}"
+                    f"[Pairing] valid: {len(valid_dataset)} samples "
+                    f"({valid_dataset.paired_target_count} paired, "
+                    f"{valid_dataset.singleton_target_count} singleton); "
+                    f"missing-speaker={valid_dataset.missing_speaker_count}, "
+                    f"missing-duration={valid_dataset.missing_duration_count}"
                 )
 
     train_loader = make_dataloader(

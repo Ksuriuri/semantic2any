@@ -263,3 +263,35 @@ NUM_PROCESSES=8 \
 对应配置为
 `configs/s2mel_zipformer_s2mel_train_data_random_split_bigvgan_v2_44khz_128band_512x.yaml`；
 当前每 1,000 step 验证一次。
+
+## Filtered + MaskGCT code 默认训练集
+
+当前默认训练入口使用另一套完整 filtered 数据：
+
+```text
+/mnt/data_3t_1/datasets/preprocess/s2mel-train-data-filtered
+```
+
+该目录包含 1,413,343 条音频。MaskGCT code 写入其 `maskgct-codes/` 子目录，详细
+提取方式见 [maskgct-code-precompute.md](maskgct-code-precompute.md)。所有 shard
+完成后执行：
+
+```bash
+uv run python scripts/split_s2mel_validation.py \
+  --metadata-dir /mnt/data_3t_1/datasets/preprocess/s2mel-train-data-filtered/maskgct-codes/manifests \
+  --output-dir /mnt/data_3t_1/datasets/preprocess/s2mel-train-data-filtered/maskgct-codes/splits/seed1234_valid1000 \
+  --valid-size 1000 \
+  --seed 1234
+```
+
+该脚本同时解析 semantic binary 和 lookup 路径；不能在 code 提取未完成时提前
+生成 split。默认训练命令为：
+
+```bash
+NUM_PROCESSES=8 bash scripts/train_s2mel_random_split.sh
+```
+
+默认配置使用同说话人配对：prompt 为 3–20 秒，target 为 3–30 秒且不裁切；
+单条说话人音频按 semantic frame 边界随机切成均不少于 3 秒的 prompt/target。
+历史 439,305 条 `s2mel-train-data` random-split 实验仍可通过显式设置
+`CONFIG`、`TRAIN_JSONL` 和 `VALID_JSONL` 复现。
