@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import random
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -18,20 +17,18 @@ from semantic2any.data.s2mel_dataset import (
     choose_prompt_len,
     collate_paired_features,
 )
+from semantic2any.third_party.indextts import CAMPPlus, mel_spectrogram
 
 
 def _get(obj, name: str, default=None):
     return getattr(obj, name, obj.get(name, default) if isinstance(obj, dict) else default)
 
 
-def add_indextts_to_path(indextts_root: str | Path) -> Path:
-    root = Path(indextts_root).expanduser().resolve()
-    if not (root / "indextts").exists():
-        raise FileNotFoundError(f"IndexTTS package not found under {root}")
-    root_str = str(root)
-    if root_str not in sys.path:
-        sys.path.insert(0, root_str)
-    return root
+def _uses_style_condition(cfg: Any) -> bool:
+    s2mel_cfg = _get(cfg, "s2mel")
+    dit_type = str(_get(s2mel_cfg, "dit_type", "ZipFormer")).lower()
+    estimator_cfg = _get(s2mel_cfg, "DiT" if dit_type == "dit" else "ZipFormer")
+    return bool(_get(estimator_cfg, "style_condition", True))
 
 
 def _resolve_model_path(model_dir: Path, value: str | Path) -> Path:
@@ -58,24 +55,36 @@ class S2MelFeatureAdapter(nn.Module):
         super().__init__()
 
         paths_cfg = _get(cfg, "paths")
-        self.indextts_root = add_indextts_to_path(_get(paths_cfg, "indextts_root"))
+        style_cfg = _get(_get(cfg, "s2mel"), "style_encoder")
+        self.style_dim = int(_get(style_cfg, "dim", 192))
+        self.use_style_condition = _uses_style_condition(cfg)
         self.model_dir = Path(_get(paths_cfg, "model_dir")).expanduser().resolve()
-        if not self.model_dir.exists():
-            raise FileNotFoundError(f"model_dir does not exist: {self.model_dir}")
 
-        from indextts.s2mel.modules.audio import mel_spectrogram
-        from indextts.s2mel.modules.campplus.DTDNN import CAMPPlus
-        from semantic2any.utils.semantic_codecs import build_semantic_codec
+        from semantic2any.utils.semantic_codecs import (
+            build_semantic_codec,
+            semantic_codec_type,
+        )
+
+        needs_model_dir = (
+            semantic_codec_type(cfg) == "maskgct" or self.use_style_condition
+        )
+        if needs_model_dir and not self.model_dir.exists():
+            raise FileNotFoundError(f"model_dir does not exist: {self.model_dir}")
 
         self.semantic_backend = build_semantic_codec(cfg, model_dir=self.model_dir)
         self.register_buffer("_device_anchor", torch.empty(0), persistent=False)
 
-        campplus_ckpt = _resolve_model_path(
-            self.model_dir, _get(paths_cfg, "campplus_ckpt", "campplus/campplus_cn_common.bin")
-        )
-        self.campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
-        self.campplus_model.load_state_dict(torch.load(campplus_ckpt, map_location="cpu"))
-        self.campplus_model.eval()
+        self.campplus_model: CAMPPlus | None = None
+        if self.use_style_condition:
+            campplus_ckpt = _resolve_model_path(
+                self.model_dir,
+                _get(paths_cfg, "campplus_ckpt", "campplus/campplus_cn_common.bin"),
+            )
+            self.campplus_model = CAMPPlus(feat_dim=80, embedding_size=self.style_dim)
+            self.campplus_model.load_state_dict(
+                torch.load(campplus_ckpt, map_location="cpu"), strict=True
+            )
+            self.campplus_model.eval()
 
         preprocess = _get(cfg, "preprocess_params", _get(_get(cfg, "s2mel"), "preprocess_params", None))
         spect = _get(preprocess, "spect_params")
@@ -136,6 +145,8 @@ class S2MelFeatureAdapter(nn.Module):
             )
 
         for module in (self.semantic_backend, self.campplus_model):
+            if module is None:
+                continue
             module.requires_grad_(False)
 
     def _module_device(self) -> torch.device:
@@ -161,6 +172,8 @@ class S2MelFeatureAdapter(nn.Module):
     @torch.no_grad()
     def _style_from_audio(self, audio_16k: torch.Tensor) -> torch.Tensor:
         device = self._module_device()
+        if self.campplus_model is None:
+            return torch.zeros(self.style_dim, device=device)
         feat = torchaudio.compliance.kaldi.fbank(
             audio_16k.to(device),
             num_mel_bins=80,

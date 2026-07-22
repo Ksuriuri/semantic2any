@@ -124,7 +124,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--valid-speechdata-dir", default=None)
     parser.add_argument("--speechdata-cache-dir", default=None)
     parser.add_argument("--output-dir", default=None)
-    parser.add_argument("--indextts-root", default=None)
     parser.add_argument("--model-dir", default=None)
     parser.add_argument(
         "--semantic-codec",
@@ -170,8 +169,6 @@ def apply_overrides(cfg, args: argparse.Namespace):
         cfg.data.speechdata_cache_dir = args.speechdata_cache_dir
     if args.output_dir is not None:
         cfg.train.output_dir = args.output_dir
-    if args.indextts_root is not None:
-        cfg.paths.indextts_root = args.indextts_root
     if args.model_dir is not None:
         cfg.paths.model_dir = args.model_dir
     if args.batch_size is not None:

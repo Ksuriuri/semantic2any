@@ -1,8 +1,7 @@
 seed: 1234
 
 paths:
-  indextts_root: /mnt/data_sdd/hhy/index-tts
-  model_dir: /mnt/data_sdd/hhy/index-tts/checkpoints/IndexTTS-2-vLLM
+  model_dir: checkpoints/feature-extractors
   semantic_codec_ckpt: ""
   campplus_ckpt: campplus/campplus_cn_common.bin
   w2v_bert_dir: w2v-bert-2.0

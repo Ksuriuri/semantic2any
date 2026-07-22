@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=/mnt/data_sdd/hhy/noiz-tts/semantic2any
-VAE=/mnt/data_sdd/hhy/noiz-tts/vae-eval
+ROOT=${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+VAE=${VAE:-/path/to/optional/vae-eval}
 RUN=task12_vctk10pct_min6_prompt3p01
 OUT_ROOT="$ROOT/outputs/$RUN"
 METRIC_ROOT="$ROOT/metrics/$RUN"
@@ -14,10 +14,9 @@ PROMPT_SECONDS=3.01
 TEMP=0.7
 CFG_RATE=0.0
 INFER_STEPS=25
-INDEXTTS_ROOT=/mnt/data_sdd/hhy/index-tts
-MODEL_DIR=/mnt/data_sdd/hhy/index-tts/checkpoints/IndexTTS-2-vLLM
-VOCODER_22=/mnt/data_sdd/hhy/noiz-tts/vae-eval/.hf_cache/models--nvidia--bigvgan_v2_22khz_80band_256x/snapshots/633ff708ed5b74903e86ff1298cf4a98e921c513
-VOCODER_44=/mnt/data_sdd/hhy/noiz-tts/vae-eval/.hf_cache/models--nvidia--bigvgan_v2_44khz_128band_512x/snapshots/95a9d1dcb12906c03edd938d77b9333d6ded7dfb
+MODEL_DIR=${MODEL_DIR:-$ROOT/checkpoints/feature-extractors}
+VOCODER_22=${VOCODER_22:-$ROOT/checkpoints/vocoders/bigvgan_v2_22khz_80band_256x}
+VOCODER_44=${VOCODER_44:-$ROOT/checkpoints/vocoders/bigvgan_v2_44khz_128band_512x}
 
 MODE=${1:-full}
 mkdir -p "$OUT_ROOT" "$METRIC_ROOT" "$LOG_ROOT"
@@ -48,7 +47,6 @@ run_one() {
     --checkpoint "$ckpt" \
     --input "$input" \
     --output-dir "$out_dir" \
-    --indextts-root "$INDEXTTS_ROOT" \
     --model-dir "$MODEL_DIR" \
     --vocoder-model "$vocoder" \
     --device cuda \

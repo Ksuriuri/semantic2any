@@ -1,8 +1,7 @@
 seed: 1234
 
 paths:
-  indextts_root: /mnt/data_sdd/hhy/index-tts
-  model_dir: /mnt/data_sdd/hhy/index-tts/checkpoints/IndexTTS-2-vLLM
+  model_dir: checkpoints/feature-extractors
   semantic_codec_ckpt: ""
   campplus_ckpt: campplus/campplus_cn_common.bin
   w2v_bert_dir: w2v-bert-2.0
@@ -13,8 +12,8 @@ semantic_codec:
   source_model: Soul-AILab/SAC-16k-62_5Hz
   tokenizer_model: zai-org/glm-4-voice-tokenizer
   revision: a5f2404e63c84e92f5238908e1706316324ebafa
-  tokenizer_path: ""
-  cache_dir: /home/tanhe/.cache/huggingface/hub
+  tokenizer_path: checkpoints/sac-tokenizer
+  cache_dir: ""
   local_files_only: true
   max_chunk_seconds: 30.0
   # Keep the frozen WhisperVQ peak low while the trainable model holds a
@@ -23,7 +22,7 @@ semantic_codec:
 
 vocoder:
   model_id: nvidia/bigvgan_v2_44khz_128band_512x
-  cache_dir: /mnt/data_sdd/hhy/noiz-tts/vae-eval/.hf_cache
+  cache_dir: checkpoints/huggingface
   local_files_only: true
 
 data:
@@ -31,7 +30,7 @@ data:
   valid_jsonl: /mnt/data_3t_1/datasets/preprocess/s2mel-train-data/splits/seed1234_valid1000/valid.jsonl
   train_speechdata_dir: ""
   valid_speechdata_dir: ""
-  speechdata_cache_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/.cache/speechdata
+  speechdata_cache_dir: .cache/speechdata
   # Match IndexTTS2's 16384-frame s2mel budget:
   # 16384 * 512 / 44100 == 16384 * 256 / 22050 ~= 190.22 seconds.
   # This is the combined prompt + target duration, not target-only duration.
@@ -109,7 +108,7 @@ s2mel:
     use_conv: true
 
 train:
-  output_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/exp/exp06_44k_nostyle_zipformer_sac_local8x4090
+  output_dir: exp/exp06_44k_nostyle_zipformer_sac_local8x4090
   # Original effective batch: 16 GPUs * 32 = 512.
   # Local effective batch: 8 GPUs * 16 * 4 accumulation = 512.
   batch_size: 16

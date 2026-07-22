@@ -17,7 +17,6 @@ from semantic2any.models import Semantic2MelModel
 from semantic2any.utils.checkpoint import load_compatible_checkpoint
 from semantic2any.utils.indextts_adapters import (
     S2MelFeatureAdapter,
-    add_indextts_to_path,
     build_feature_adapter,
 )
 from semantic2any.utils.semantic_codecs import (
@@ -43,7 +42,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", default="exp/s2mel_zipformer-vctk-8gpu/s2mel_final.pth")
     parser.add_argument("--input", default="assets/test", help="Audio file or directory to process.")
     parser.add_argument("--output-dir", default="outputs/s2mel_zipformer-vctk-8gpu")
-    parser.add_argument("--indextts-root", default=None)
     parser.add_argument("--model-dir", default=None)
     parser.add_argument("--semantic-codec", choices=("maskgct", "sac"), default=None)
     parser.add_argument("--vocoder-model", default=None)
@@ -100,12 +98,11 @@ def iter_audio_paths(path: Path) -> list[Path]:
 
 def load_vocoder(cfg, device: torch.device, dtype: torch.dtype):
     paths_cfg = _get(cfg, "paths")
-    indextts_root = add_indextts_to_path(_get(paths_cfg, "indextts_root"))
     model_dir = Path(_get(paths_cfg, "model_dir")).expanduser().resolve()
     if not model_dir.exists():
         raise FileNotFoundError(f"IndexTTS model_dir does not exist: {model_dir}")
 
-    from indextts.s2mel.modules.bigvgan import bigvgan
+    from semantic2any.third_party.indextts.bigvgan import BigVGAN
 
     vocoder_cfg = _get(cfg, "vocoder", None)
     model_id = str(_get(vocoder_cfg, "model_id", "") or "")
@@ -117,7 +114,7 @@ def load_vocoder(cfg, device: torch.device, dtype: torch.dtype):
         load_kwargs["local_files_only"] = bool(
             _get(vocoder_cfg, "local_files_only", False)
         )
-    vocoder = bigvgan.BigVGAN.from_pretrained(source, **load_kwargs)
+    vocoder = BigVGAN.from_pretrained(source, **load_kwargs)
 
     preprocess = _get(cfg, "preprocess_params")
     spect = _get(preprocess, "spect_params")
@@ -143,7 +140,6 @@ def load_vocoder(cfg, device: torch.device, dtype: torch.dtype):
     vocoder = vocoder.to(device=device, dtype=dtype)
     vocoder.remove_weight_norm()
     vocoder.eval()
-    print(f">> IndexTTS root: {indextts_root}")
     print(f">> BigVGAN restored from: {source}")
     return vocoder
 
@@ -234,8 +230,6 @@ def infer_one(
 def main() -> None:
     args = parse_args()
     cfg = OmegaConf.load(args.config)
-    if args.indextts_root is not None:
-        cfg.paths.indextts_root = args.indextts_root
     if args.model_dir is not None:
         cfg.paths.model_dir = args.model_dir
     if args.vocoder_model is not None:

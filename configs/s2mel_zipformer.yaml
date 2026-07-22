@@ -1,8 +1,7 @@
 seed: 1234
 
 paths:
-  indextts_root: /mnt/data_sdd/hhy/index-tts
-  model_dir: /mnt/data_sdd/hhy/index-tts/checkpoints/IndexTTS-2-vLLM
+  model_dir: checkpoints/feature-extractors
   semantic_codec_ckpt: ""
   campplus_ckpt: campplus/campplus_cn_common.bin
   w2v_bert_dir: w2v-bert-2.0
@@ -25,7 +24,7 @@ data:
   valid_jsonl: ""
   train_speechdata_dir: ""
   valid_speechdata_dir: ""
-  speechdata_cache_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/.cache/speechdata
+  speechdata_cache_dir: .cache/speechdata
   max_audio_seconds: 30.0
   pair_same_speaker: true
   random_split_audio: false

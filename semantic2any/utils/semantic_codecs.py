@@ -162,20 +162,23 @@ def prepare_feature_metadata(
 class MaskGCTSemanticCodec(nn.Module):
     def __init__(self, cfg: Any, model_dir: Path) -> None:
         super().__init__()
-        import inspect
 
         import safetensors.torch
         from omegaconf import OmegaConf
         from transformers import SeamlessM4TFeatureExtractor
 
-        from indextts.utils.maskgct_utils import build_semantic_codec, build_semantic_model
+        from semantic2any.third_party.indextts.maskgct import (
+            build_semantic_codec,
+            build_semantic_model,
+        )
 
         paths_cfg = _get(cfg, "paths")
         index_cfg_path = model_dir / "config.yaml"
-        index_cfg = OmegaConf.load(index_cfg_path) if index_cfg_path.exists() else cfg
-        semantic_codec_cfg = _get(index_cfg, "semantic_codec", None)
-        if semantic_codec_cfg is None:
-            raise ValueError("semantic_codec config not found in IndexTTS config.yaml")
+        semantic_codec_cfg = None
+        if index_cfg_path.exists():
+            semantic_codec_cfg = _get(
+                OmegaConf.load(index_cfg_path), "semantic_codec", None
+            )
 
         def resolve_path(value: str | Path) -> Path:
             path = Path(value).expanduser()
@@ -186,18 +189,15 @@ class MaskGCTSemanticCodec(nn.Module):
         self.feature_extractor = SeamlessM4TFeatureExtractor.from_pretrained(
             str(w2v_bert_dir), local_files_only=True
         )
-        semantic_sig = inspect.signature(build_semantic_model)
-        if "model_path" in semantic_sig.parameters:
-            model, mean, std = build_semantic_model(
-                str(w2v_stat), model_path=str(w2v_bert_dir)
-            )
-        else:
-            model, mean, std = build_semantic_model(
-                str(w2v_stat), bert_path=str(w2v_bert_dir)
-            )
+        model, mean, std = build_semantic_model(
+            str(w2v_stat), model_path=str(w2v_bert_dir)
+        )
         self.semantic_model = model.eval()
         self.register_buffer("semantic_mean", mean.float())
         self.register_buffer("semantic_std", std.float())
+        # RepCodec's constructor defaults are the published MaskGCT dimensions.
+        # A legacy IndexTTS config can still override them, but the minimal
+        # asset bundle intentionally does not require the unrelated config.
         self.codec = build_semantic_codec(semantic_codec_cfg).eval()
 
         configured = str(_get(paths_cfg, "semantic_codec_ckpt", "") or "")
@@ -222,7 +222,9 @@ class MaskGCTSemanticCodec(nn.Module):
                     "Set paths.semantic_codec_ckpt in the config."
                 )
         if checkpoint.suffix == ".safetensors":
-            safetensors.torch.load_model(self.codec, str(checkpoint))
+            safetensors.torch.load_model(
+                self.codec, str(checkpoint), strict=True, device="cpu"
+            )
         else:
             state = torch.load(checkpoint, map_location="cpu")
             self.codec.load_state_dict(state.get("state_dict", state), strict=False)

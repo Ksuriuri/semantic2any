@@ -1,8 +1,7 @@
 seed: 1234
 
 paths:
-  indextts_root: /mnt/data_sdd/hhy/index-tts
-  model_dir: /mnt/data_sdd/hhy/index-tts/checkpoints/IndexTTS-2-vLLM
+  model_dir: checkpoints/feature-extractors
   semantic_codec_ckpt: ""
   campplus_ckpt: campplus/campplus_cn_common.bin
   w2v_bert_dir: w2v-bert-2.0
@@ -10,7 +9,7 @@ paths:
 
 vocoder:
   model_id: nvidia/bigvgan_v2_44khz_128band_256x
-  cache_dir: /mnt/data_sdd/hhy/noiz-tts/vae-eval/.hf_cache
+  cache_dir: checkpoints/huggingface
   local_files_only: true
 
 data:

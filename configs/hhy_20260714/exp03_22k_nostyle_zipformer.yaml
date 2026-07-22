@@ -1,14 +1,13 @@
 seed: 1234
 paths:
-  indextts_root: /hunshan/hhy/workspace/index-tts
-  model_dir: /hunshan/hhy/models/IndexTTS-2-vLLM
+  model_dir: checkpoints/feature-extractors
   semantic_codec_ckpt: ''
   campplus_ckpt: campplus/campplus_cn_common.bin
   w2v_bert_dir: w2v-bert-2.0
   w2v_stat: wav2vec2bert_stats.pt
 vocoder:
-  model_id: /hunshan/hhy/models/bigvgan_v2_22khz_80band_256x
-  cache_dir: /hunshan/hhy/models
+  model_id: nvidia/bigvgan_v2_22khz_80band_256x
+  cache_dir: checkpoints/huggingface
   local_files_only: true
 data:
   train_jsonl: /mnt/hhy/data/s2mel-train-data/splits/seed1234_valid1000_hhy/train.jsonl

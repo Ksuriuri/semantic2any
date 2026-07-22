@@ -21,14 +21,12 @@ tests:
 git clone <repository-url> semantic2any
 cd semantic2any
 uv sync --frozen
-uv run python -m unittest discover -s tests -v
+uv run pytest -q
 ```
 
-The feature adapter also needs a local IndexTTS checkout and its model files.
-Either update the `paths` section of the selected YAML config or pass
-`--indextts-root` and `--model-dir` to the trainer. For the 44.1 kHz BigVGAN
-config, also update `vocoder.cache_dir`; set `vocoder.local_files_only: false`
-once if the new machine must download the vocoder.
+The feature implementation is included in this repository. Download the
+minimal model assets described in `docs/model-assets.md`, then update
+`paths.model_dir` or pass `--model-dir`. BigVGAN is needed only for inference.
 
 Use absolute paths for manifests when moving between machines. A training row
 must at least contain:
@@ -52,8 +50,7 @@ uv run accelerate launch --num_processes 1 trainers/train_s2mel_zipformer.py \
   --config configs/s2mel_zipformer.yaml \
   --train-jsonl /data/manifests/tiny.jsonl \
   --output-dir exp/smoke-style-reference \
-  --indextts-root /opt/index-tts \
-  --model-dir /models/IndexTTS-2-vLLM \
+  --model-dir checkpoints/feature-extractors \
   --batch-size 1 \
   --max-steps 1 \
   --no-wandb \
@@ -67,8 +64,7 @@ uv run accelerate launch --num_processes 1 trainers/train_s2mel_zipformer.py \
   --config configs/s2mel_zipformer.yaml \
   --train-jsonl /data/manifests/tiny.jsonl \
   --output-dir exp/smoke-style-none \
-  --indextts-root /opt/index-tts \
-  --model-dir /models/IndexTTS-2-vLLM \
+  --model-dir checkpoints/feature-extractors \
   --batch-size 1 \
   --max-steps 1 \
   --no-wandb \
@@ -117,8 +113,7 @@ CONFIG=configs/s2mel_zipformer_s2mel_train_data_random_split_bigvgan_v2_44khz_12
 OUTPUT_DIR=exp/s2mel-style-reference \
 NUM_PROCESSES=4 \
 bash scripts/train_s2mel_random_split.sh \
-  --indextts-root /opt/index-tts \
-  --model-dir /models/IndexTTS-2-vLLM \
+  --model-dir checkpoints/feature-extractors \
   --style-condition
 ```
 
@@ -134,8 +129,7 @@ CONFIG=configs/s2mel_zipformer_s2mel_train_data_random_split_bigvgan_v2_44khz_12
 OUTPUT_DIR=exp/s2mel-style-none \
 NUM_PROCESSES=4 \
 bash scripts/train_s2mel_random_split.sh \
-  --indextts-root /opt/index-tts \
-  --model-dir /models/IndexTTS-2-vLLM \
+  --model-dir checkpoints/feature-extractors \
   --no-style-condition
 ```
 

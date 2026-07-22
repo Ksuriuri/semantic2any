@@ -9,15 +9,19 @@ ZipVoice-inspired ZipFormer stack.
 Use `uv` from the repository root:
 
 ```bash
-uv pip install -e .
+uv sync --frozen
 ```
 
-The training code imports frozen feature extractors from a local IndexTTS
-checkout. By default it expects `/mnt/data_sdd/hhy/index-tts`; override this with
-`--indextts-root` or `paths.indextts_root` in `configs/s2mel_zipformer.yaml`.
-SAC support is included in this repository and downloads only the pinned
-`zai-org/glm-4-voice-tokenizer` weights through the Hugging Face cache. It does
-not require a separate SAC checkout.
+The frozen feature-extractor and BigVGAN implementations used by this project
+are included under `semantic2any/third_party/`; no IndexTTS, MaskGCT, SAC, or
+BigVGAN source checkout is required. Model weights remain external and are
+selected by workflow so a new machine does not need to download the full
+IndexTTS bundle. See [`docs/model-assets.md`](docs/model-assets.md) for pinned,
+minimal downloads and an offline deployment layout.
+
+SAC support downloads only the pinned `zai-org/glm-4-voice-tokenizer` files
+needed by the semantic encoder. It does not download SAC's acoustic modules or
+complete codec checkpoint.
 
 ## Manifest
 

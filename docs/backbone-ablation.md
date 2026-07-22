@@ -96,13 +96,12 @@ On a new machine:
 git clone <repository-url> semantic2any
 cd semantic2any
 uv sync --frozen
-uv run python -m unittest discover -s tests -v
+uv run pytest -q
 ```
 
-Set the local IndexTTS checkout and model paths in the selected config's
-`paths` section, or pass `--indextts-root` and `--model-dir` when launching
-training. For the 44.1 kHz config, also make `vocoder.cache_dir` valid on the
-new machine.
+The required feature code is included in this repository. Prepare the minimal
+weights from `docs/model-assets.md`, then set `paths.model_dir` or pass
+`--model-dir`. The vocoder cache is not needed during training.
 
 ## One-step smoke tests
 
@@ -113,8 +112,7 @@ uv run accelerate launch --num_processes 1 trainers/train_s2mel_zipformer.py \
   --config configs/s2mel_zipformer.yaml \
   --train-jsonl /data/manifests/tiny.jsonl \
   --output-dir exp/smoke-zipformer \
-  --indextts-root /opt/index-tts \
-  --model-dir /models/IndexTTS-2-vLLM \
+  --model-dir checkpoints/feature-extractors \
   --batch-size 1 \
   --max-steps 1 \
   --no-wandb \
@@ -124,8 +122,7 @@ uv run accelerate launch --num_processes 1 trainers/train_s2mel_zipformer.py \
   --config configs/s2mel_dit.yaml \
   --train-jsonl /data/manifests/tiny.jsonl \
   --output-dir exp/smoke-dit \
-  --indextts-root /opt/index-tts \
-  --model-dir /models/IndexTTS-2-vLLM \
+  --model-dir checkpoints/feature-extractors \
   --batch-size 1 \
   --max-steps 1 \
   --no-wandb \
@@ -157,8 +154,7 @@ CONFIG=configs/s2mel_zipformer_s2mel_train_data_random_split_bigvgan_v2_44khz_12
 OUTPUT_DIR=exp/s2mel-zipformer-reference \
 NUM_PROCESSES=4 \
 bash scripts/train_s2mel_random_split.sh \
-  --indextts-root /opt/index-tts \
-  --model-dir /models/IndexTTS-2-vLLM \
+  --model-dir checkpoints/feature-extractors \
   --style-condition
 ```
 
@@ -174,8 +170,7 @@ CONFIG=configs/s2mel_dit_s2mel_train_data_random_split_bigvgan_v2_44khz_128band_
 OUTPUT_DIR=exp/s2mel-dit-reference \
 NUM_PROCESSES=4 \
 bash scripts/train_s2mel_random_split.sh \
-  --indextts-root /opt/index-tts \
-  --model-dir /models/IndexTTS-2-vLLM \
+  --model-dir checkpoints/feature-extractors \
   --style-condition
 ```
 
