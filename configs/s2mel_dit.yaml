@@ -7,6 +7,11 @@ paths:
   w2v_bert_dir: w2v-bert-2.0
   w2v_stat: wav2vec2bert_stats.pt
 
+vocoder:
+  model_id: nvidia/bigvgan_v2_44khz_128band_512x
+  cache_dir: checkpoints/huggingface
+  local_files_only: true
+
 data:
   train_jsonl: ""
   valid_jsonl: ""
@@ -24,7 +29,7 @@ data:
   min_generated_frames: 8
   semantic_fps: 50.0
   sample_rate_16k: 16000
-  sample_rate_mel: 22050
+  sample_rate_mel: 44100
   num_workers: 8
   prefetch_factor: 2
   decode_audio_in_worker: false
@@ -33,12 +38,12 @@ data:
   async_feature_extraction: true
 
 preprocess_params:
-  sr: 22050
+  sr: 44100
   spect_params:
-    n_fft: 1024
-    win_length: 1024
-    hop_length: 256
-    n_mels: 80
+    n_fft: 2048
+    win_length: 2048
+    hop_length: 512
+    n_mels: 128
     fmin: 0
     fmax: "None"
 
@@ -67,8 +72,8 @@ s2mel:
     depth: 13
     class_dropout_prob: 0.1
     block_size: 8192
-    in_channels: 80
-    style_condition: true
+    in_channels: 128
+    style_condition: false
     final_layer_type: wavenet
     content_dim: 512
     content_codebook_size: 1024
@@ -85,7 +90,7 @@ s2mel:
     kernel_size: 5
     dilation_rate: 1
     p_dropout: 0.2
-    style_condition: true
+    style_condition: false
 
 train:
   output_dir: exp/s2mel_dit

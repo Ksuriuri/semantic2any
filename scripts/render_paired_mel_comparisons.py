@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--style-mode",
         choices=("reference", "none"),
-        default="reference",
+        default="none",
         help="Use the prompt reference style embedding or mask it after projection.",
     )
     parser.add_argument("--seed", type=int, default=1234)

@@ -13,6 +13,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from semantic2any.defaults import (
+    DEFAULT_BIGVGAN_MODEL_ID,
+    DEFAULT_MEL_CHANNELS,
+    DEFAULT_MEL_HOP_LENGTH,
+    DEFAULT_MEL_N_FFT,
+    DEFAULT_MEL_SAMPLE_RATE,
+    DEFAULT_MEL_WIN_LENGTH,
+)
 from semantic2any.models import Semantic2MelModel
 from semantic2any.utils.checkpoint import load_compatible_checkpoint
 from semantic2any.utils.indextts_adapters import (
@@ -70,7 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--style-mode",
         choices=("reference", "none"),
-        default="reference",
+        default="none",
         help="Use the reference style embedding or mask it after projection.",
     )
     parser.add_argument("--seed", type=int, default=1234)
@@ -105,7 +113,11 @@ def load_vocoder(cfg, device: torch.device, dtype: torch.dtype):
     from semantic2any.third_party.indextts.bigvgan import BigVGAN
 
     vocoder_cfg = _get(cfg, "vocoder", None)
-    model_id = str(_get(vocoder_cfg, "model_id", "") or "")
+    model_id = (
+        DEFAULT_BIGVGAN_MODEL_ID
+        if vocoder_cfg is None
+        else str(_get(vocoder_cfg, "model_id", "") or "")
+    )
     source = model_id or str(model_dir / "bigvgan")
     cache_dir = str(_get(vocoder_cfg, "cache_dir", "") or "")
     load_kwargs = {}
@@ -119,11 +131,11 @@ def load_vocoder(cfg, device: torch.device, dtype: torch.dtype):
     preprocess = _get(cfg, "preprocess_params")
     spect = _get(preprocess, "spect_params")
     expected = {
-        "sampling_rate": int(_get(preprocess, "sr", 22050)),
-        "num_mels": int(_get(spect, "n_mels", 80)),
-        "n_fft": int(_get(spect, "n_fft", 1024)),
-        "hop_size": int(_get(spect, "hop_length", 256)),
-        "win_size": int(_get(spect, "win_length", 1024)),
+        "sampling_rate": int(_get(preprocess, "sr", DEFAULT_MEL_SAMPLE_RATE)),
+        "num_mels": int(_get(spect, "n_mels", DEFAULT_MEL_CHANNELS)),
+        "n_fft": int(_get(spect, "n_fft", DEFAULT_MEL_N_FFT)),
+        "hop_size": int(_get(spect, "hop_length", DEFAULT_MEL_HOP_LENGTH)),
+        "win_size": int(_get(spect, "win_length", DEFAULT_MEL_WIN_LENGTH)),
     }
     mismatches = {
         key: (value, int(_get(vocoder.h, key)))
@@ -149,8 +161,8 @@ def prompt_frames_from_seconds(cfg, mel_len: int, prompt_seconds: float, min_gen
         raise ValueError(f"--prompt-seconds must be at least 3.0, got {prompt_seconds}")
     preprocess = _get(cfg, "preprocess_params")
     spect = _get(preprocess, "spect_params")
-    sample_rate = int(_get(preprocess, "sr", 22050))
-    hop_length = int(_get(spect, "hop_length", 256))
+    sample_rate = int(_get(preprocess, "sr", DEFAULT_MEL_SAMPLE_RATE))
+    hop_length = int(_get(spect, "hop_length", DEFAULT_MEL_HOP_LENGTH))
     requested = max(1, int(prompt_seconds * sample_rate / hop_length))
     max_prompt = max(1, mel_len - min_generate_frames)
     if requested > max_prompt:
@@ -218,7 +230,9 @@ def infer_one(
     generated = generated[:, :, prompt_len:mel_len]
 
     wav = vocoder(generated.to(device=device, dtype=dtype))[0]
-    sample_rate = int(_get(_get(cfg, "preprocess_params"), "sr", 22050))
+    sample_rate = int(
+        _get(_get(cfg, "preprocess_params"), "sr", DEFAULT_MEL_SAMPLE_RATE)
+    )
     save_wav(output_path, wav, sample_rate)
     print(
         f">> wrote {output_path} "

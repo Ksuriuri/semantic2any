@@ -73,7 +73,7 @@ s2mel:
     class_dropout_prob: 0.1
     block_size: 8192
     in_channels: 128
-    style_condition: true
+    style_condition: false
     final_layer_type: wavenet
     content_dim: 512
     content_codebook_size: 1024
@@ -90,7 +90,7 @@ s2mel:
     kernel_size: 5
     dilation_rate: 1
     p_dropout: 0.2
-    style_condition: true
+    style_condition: false
 
 train:
   output_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/exp/s2mel_dit_train_data_random_split_bigvgan_v2_44khz_128band_512x

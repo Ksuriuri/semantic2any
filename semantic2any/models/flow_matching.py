@@ -6,6 +6,8 @@ import torch
 from torch import nn
 from tqdm.auto import tqdm
 
+from semantic2any.defaults import DEFAULT_MEL_CHANNELS
+
 
 def _get(obj, name: str, default=None):
     return getattr(obj, name, obj.get(name, default) if isinstance(obj, dict) else default)
@@ -19,7 +21,7 @@ class BASECFM(nn.Module, ABC):
         self.sigma_min = 1e-6
         self.estimator: nn.Module | None = None
         dit_cfg = _get(args, "DiT")
-        self.in_channels = int(_get(dit_cfg, "in_channels", 80))
+        self.in_channels = int(_get(dit_cfg, "in_channels", DEFAULT_MEL_CHANNELS))
         reg_loss_type = _get(args, "reg_loss_type", "l1")
         self.criterion = nn.MSELoss() if reg_loss_type == "l2" else nn.L1Loss()
         self.zero_prompt_speech_token = bool(_get(dit_cfg, "zero_prompt_speech_token", False))

@@ -7,6 +7,11 @@ paths:
   w2v_bert_dir: w2v-bert-2.0
   w2v_stat: wav2vec2bert_stats.pt
 
+vocoder:
+  model_id: nvidia/bigvgan_v2_44khz_128band_512x
+  cache_dir: checkpoints/huggingface
+  local_files_only: true
+
 semantic_codec:
   # Switch to "sac" for 12.5 Hz, 1280-dim SAC raw semantic embeddings.
   type: maskgct
@@ -37,7 +42,7 @@ data:
   # w2v-bert 2.0 features / MaskGCT semantic codec run at 50 Hz (IndexTTS2 uses code_lens * 1.72 -> mel frames).
   semantic_fps: 50.0
   sample_rate_16k: 16000
-  sample_rate_mel: 22050
+  sample_rate_mel: 44100
   num_workers: 8
   prefetch_factor: 2
   decode_audio_in_worker: false
@@ -46,12 +51,12 @@ data:
   async_feature_extraction: true
 
 preprocess_params:
-  sr: 22050
+  sr: 44100
   spect_params:
-    n_fft: 1024
-    win_length: 1024
-    hop_length: 256
-    n_mels: 80
+    n_fft: 2048
+    win_length: 2048
+    hop_length: 512
+    n_mels: 128
     fmin: 0
     fmax: "None"
 
@@ -75,7 +80,7 @@ s2mel:
     f0_condition: false
     n_f0_bins: 512
   DiT:
-    in_channels: 80
+    in_channels: 128
     content_dim: 512
     zero_prompt_speech_token: false
   ZipFormer:
@@ -90,7 +95,7 @@ s2mel:
     pos_head_dim: 4
     pos_dim: 48
     time_embed_dim: 192
-    style_condition: true
+    style_condition: false
     class_dropout_prob: 0.1
     condition_dropout_prob: 0.1
     use_conv: true

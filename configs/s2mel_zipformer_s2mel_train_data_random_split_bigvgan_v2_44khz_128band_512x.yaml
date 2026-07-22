@@ -85,7 +85,7 @@ s2mel:
     pos_head_dim: 4
     pos_dim: 48
     time_embed_dim: 192
-    style_condition: true
+    style_condition: false
     class_dropout_prob: 0.1
     condition_dropout_prob: 0.1
     use_conv: true

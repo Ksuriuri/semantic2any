@@ -10,6 +10,13 @@ import torchaudio
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 
+from semantic2any.defaults import (
+    DEFAULT_MEL_CHANNELS,
+    DEFAULT_MEL_HOP_LENGTH,
+    DEFAULT_MEL_N_FFT,
+    DEFAULT_MEL_SAMPLE_RATE,
+    DEFAULT_MEL_WIN_LENGTH,
+)
 from semantic2any.data.s2mel_dataset import (
     DEFAULT_MAX_AUDIO_SECONDS,
     DEFAULT_MAX_PAIR_SECONDS,
@@ -28,7 +35,7 @@ def _uses_style_condition(cfg: Any) -> bool:
     s2mel_cfg = _get(cfg, "s2mel")
     dit_type = str(_get(s2mel_cfg, "dit_type", "ZipFormer")).lower()
     estimator_cfg = _get(s2mel_cfg, "DiT" if dit_type == "dit" else "ZipFormer")
-    return bool(_get(estimator_cfg, "style_condition", True))
+    return bool(_get(estimator_cfg, "style_condition", False))
 
 
 def _resolve_model_path(model_dir: Path, value: str | Path) -> Path:
@@ -91,11 +98,15 @@ class S2MelFeatureAdapter(nn.Module):
         fmax = _get(spect, "fmax", "None")
         fmax = None if fmax in (None, "None") else float(fmax)
         self.mel_args = {
-            "n_fft": int(_get(spect, "n_fft", 1024)),
-            "num_mels": int(_get(spect, "n_mels", 80)),
-            "sampling_rate": int(_get(preprocess, "sr", 22050)),
-            "hop_size": int(_get(spect, "hop_length", 256)),
-            "win_size": int(_get(spect, "win_length", 1024)),
+            "n_fft": int(_get(spect, "n_fft", DEFAULT_MEL_N_FFT)),
+            "num_mels": int(_get(spect, "n_mels", DEFAULT_MEL_CHANNELS)),
+            "sampling_rate": int(
+                _get(preprocess, "sr", DEFAULT_MEL_SAMPLE_RATE)
+            ),
+            "hop_size": int(_get(spect, "hop_length", DEFAULT_MEL_HOP_LENGTH)),
+            "win_size": int(
+                _get(spect, "win_length", DEFAULT_MEL_WIN_LENGTH)
+            ),
             "fmin": float(_get(spect, "fmin", 0)),
             "fmax": fmax,
             "center": False,

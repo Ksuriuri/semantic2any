@@ -9,6 +9,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn.utils import weight_norm
 
+from semantic2any.defaults import DEFAULT_MEL_CHANNELS
 from semantic2any.models.common import sequence_mask
 from semantic2any.models.indextts_dit.gpt_fast.model import ModelArgs, Transformer
 from semantic2any.models.indextts_dit.wavenet import WN
@@ -68,14 +69,14 @@ class DiTEstimator(nn.Module):
         if dit_cfg is None or wavenet_cfg is None or style_cfg is None:
             raise ValueError("DiT estimator requires DiT, wavenet, and style_encoder config blocks")
 
-        self.in_channels = int(_get(dit_cfg, "in_channels", 80))
+        self.in_channels = int(_get(dit_cfg, "in_channels", DEFAULT_MEL_CHANNELS))
         self.content_dim = int(_get(dit_cfg, "content_dim", 512))
         self.style_dim = int(_get(style_cfg, "dim", 192))
         self.hidden_dim = int(_get(dit_cfg, "hidden_dim", 512))
         self.block_size = int(_get(dit_cfg, "block_size", 16384))
         self.time_as_token = bool(_get(dit_cfg, "time_as_token", False))
         self.style_as_token = bool(_get(dit_cfg, "style_as_token", False))
-        self.style_condition = bool(_get(dit_cfg, "style_condition", True))
+        self.style_condition = bool(_get(dit_cfg, "style_condition", False))
         self.final_layer_type = str(_get(dit_cfg, "final_layer_type", "wavenet"))
         self.class_dropout_prob = float(_get(dit_cfg, "class_dropout_prob", 0.0))
         self.is_causal = bool(_get(dit_cfg, "is_causal", False))
@@ -109,7 +110,7 @@ class DiTEstimator(nn.Module):
         self.register_buffer("input_pos", torch.arange(self.block_size))
 
         if self.final_layer_type == "wavenet":
-            wavenet_style_condition = bool(_get(wavenet_cfg, "style_condition", True))
+            wavenet_style_condition = bool(_get(wavenet_cfg, "style_condition", False))
             if wavenet_style_condition != self.style_condition:
                 raise ValueError("DiT.style_condition and wavenet.style_condition must match")
             wavenet_hidden = int(_get(wavenet_cfg, "hidden_dim", self.hidden_dim))

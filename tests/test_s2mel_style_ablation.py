@@ -12,6 +12,7 @@ from scripts.infer_s2mel_zipformer import parse_args as parse_inference_args
 from scripts.render_paired_mel_comparisons import parse_args as parse_paired_inference_args
 from semantic2any.models.flow_matching import CFM
 from semantic2any.models.zipformer_estimator import ZipFormerEstimator
+from semantic2any.utils.indextts_adapters import _uses_style_condition
 from trainers.train_s2mel_zipformer import apply_overrides, parse_args as parse_training_args
 
 
@@ -78,6 +79,12 @@ def _minimal_cfm() -> tuple[CFM, _RecordingEstimator]:
 
 
 class TrainingStyleConditionCliTest(unittest.TestCase):
+    def test_missing_style_condition_defaults_to_disabled(self) -> None:
+        cfg = OmegaConf.create(
+            {"s2mel": {"dit_type": "ZipFormer", "ZipFormer": {}}}
+        )
+        self.assertFalse(_uses_style_condition(cfg))
+
     def test_training_cli_overrides_style_condition(self) -> None:
         for option, expected in (("--style-condition", True), ("--no-style-condition", False)):
             with self.subTest(option=option), patch.object(sys, "argv", ["train", option]):
@@ -165,25 +172,26 @@ class StyleMaskingTest(unittest.TestCase):
 class InferenceStyleModeCliTest(unittest.TestCase):
     def test_style_mode_defaults_and_overrides(self) -> None:
         with patch.object(sys, "argv", ["infer"]):
-            self.assertEqual(parse_inference_args().style_mode, "reference")
-        with patch.object(sys, "argv", ["infer", "--style-mode", "none"]):
             self.assertEqual(parse_inference_args().style_mode, "none")
+        with patch.object(sys, "argv", ["infer", "--style-mode", "reference"]):
+            self.assertEqual(parse_inference_args().style_mode, "reference")
+        paired_args = [
+            "render",
+            "--config",
+            "config.yaml",
+            "--checkpoint",
+            "checkpoint.pth",
+            "--pair-manifest",
+            "pairs.jsonl",
+        ]
+        with patch.object(sys, "argv", paired_args):
+            self.assertEqual(parse_paired_inference_args().style_mode, "none")
         with patch.object(
             sys,
             "argv",
-            [
-                "render",
-                "--config",
-                "config.yaml",
-                "--checkpoint",
-                "checkpoint.pth",
-                "--pair-manifest",
-                "pairs.jsonl",
-                "--style-mode",
-                "none",
-            ],
+            paired_args + ["--style-mode", "reference"],
         ):
-            self.assertEqual(parse_paired_inference_args().style_mode, "none")
+            self.assertEqual(parse_paired_inference_args().style_mode, "reference")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from semantic2any.defaults import DEFAULT_MEL_CHANNELS
 from semantic2any.models.common import lengths_to_padding_mask
 from semantic2any.models.zipvoice_modules import TTSZipformer
 
@@ -29,10 +30,10 @@ class ZipFormerEstimator(nn.Module):
         zip_cfg = _get(args, "ZipFormer")
         style_cfg = _get(args, "style_encoder")
 
-        self.in_channels = int(_get(dit_cfg, "in_channels", 80))
+        self.in_channels = int(_get(dit_cfg, "in_channels", DEFAULT_MEL_CHANNELS))
         self.content_dim = int(_get(dit_cfg, "content_dim", 512))
         self.style_dim = int(_get(style_cfg, "dim", 192))
-        self.style_condition = bool(_get(zip_cfg, "style_condition", True))
+        self.style_condition = bool(_get(zip_cfg, "style_condition", False))
         self.class_dropout_prob = float(_get(zip_cfg, "class_dropout_prob", 0.0))
         self.condition_dropout_prob = float(_get(zip_cfg, "condition_dropout_prob", self.class_dropout_prob))
 
