@@ -12,6 +12,7 @@ from semantic2any.data.s2mel_dataset import S2MelCollator
 from semantic2any.third_party.sac_whisper.modeling import WhisperVQSemanticEncoder
 from semantic2any.utils.checkpoint import load_compatible_checkpoint
 from semantic2any.utils.semantic_codecs import (
+    MaskGCTSemanticCodec,
     SACSemanticCodec,
     SEMANTIC_CODEC_SPECS,
     prepare_feature_metadata,
@@ -140,6 +141,60 @@ def test_precompute_metadata_rejects_codec_reuse(tmp_path):
         prepare_feature_metadata(tmp_path, cfg, overwrite=False)
     replaced = prepare_feature_metadata(tmp_path, cfg, overwrite=True)
     assert replaced["name"] == "sac"
+
+
+class _FakeMaskGCTQuantizer(nn.Module):
+    codebook_size = 4
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer(
+            "table",
+            torch.tensor(
+                [
+                    [0.0, 1.0, 2.0],
+                    [3.0, 4.0, 5.0],
+                    [6.0, 7.0, 8.0],
+                    [9.0, 10.0, 11.0],
+                ]
+            ),
+        )
+
+    def vq2emb(self, codes):
+        return self.table[codes[0]].transpose(1, 2)
+
+
+class _FakeMaskGCTCodec(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.quantizer = _FakeMaskGCTQuantizer()
+
+    def quantize(self, feature):
+        codes = feature[..., 0].round().long().clamp(0, 3)
+        semantic = self.quantizer.vq2emb(codes.unsqueeze(0)).transpose(1, 2)
+        return codes, semantic
+
+
+def test_maskgct_codes_recover_quantized_features():
+    backend = MaskGCTSemanticCodec.__new__(MaskGCTSemanticCodec)
+    nn.Module.__init__(backend)
+    backend.codec = _FakeMaskGCTCodec()
+    feature = torch.tensor([[[0.0], [2.0], [3.0]]])
+
+    codes, quantized = backend._quantize(feature)
+    recovered = backend.decode_codes(codes)
+
+    assert codes.tolist() == [0, 2, 3]
+    torch.testing.assert_close(recovered, quantized, rtol=0, atol=0)
+
+
+def test_maskgct_code_decode_rejects_out_of_range_values():
+    backend = MaskGCTSemanticCodec.__new__(MaskGCTSemanticCodec)
+    nn.Module.__init__(backend)
+    backend.codec = _FakeMaskGCTCodec()
+
+    with pytest.raises(ValueError, match=r"\[0, 4\)"):
+        backend.decode_codes(torch.tensor([4]))
 
 
 def test_collator_rejects_manifest_codec_mismatch():

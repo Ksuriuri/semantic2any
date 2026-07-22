@@ -9,10 +9,19 @@ from typing import Any
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 def _get(obj: Any, name: str, default=None):
     return getattr(obj, name, obj.get(name, default) if isinstance(obj, dict) else default)
+
+
+def sha256_file(path: str | Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as file_obj:
+        while chunk := file_obj.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -228,6 +237,7 @@ class MaskGCTSemanticCodec(nn.Module):
         else:
             state = torch.load(checkpoint, map_location="cpu")
             self.codec.load_state_dict(state.get("state_dict", state), strict=False)
+        self.checkpoint_path = checkpoint.resolve()
         self.requires_grad_(False)
         self.eval()
 
@@ -235,8 +245,10 @@ class MaskGCTSemanticCodec(nn.Module):
     def info(self) -> SemanticCodecInfo:
         return SEMANTIC_CODEC_SPECS["maskgct"]
 
-    def _quantize(self, feature: torch.Tensor) -> torch.Tensor:
-        _, semantic = self.codec.quantize(feature)
+    def _quantize(
+        self, feature: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        codes, semantic = self.codec.quantize(feature)
         if not torch.is_floating_point(semantic):
             semantic = self.codec.quantizer.vq2emb(semantic.unsqueeze(1))
             if semantic.ndim == 3 and semantic.size(1) != feature.size(1):
@@ -247,10 +259,60 @@ class MaskGCTSemanticCodec(nn.Module):
             and semantic.size(2) == feature.size(1)
         ):
             semantic = semantic.transpose(1, 2)
-        return semantic.squeeze(0).float()
+        if codes.ndim == 2 and codes.size(0) == 1:
+            codes = codes.squeeze(0)
+        if codes.ndim != 1:
+            raise ValueError(
+                "MaskGCT extraction expects one codebook and one utterance, "
+                f"got codes with shape {tuple(codes.shape)}"
+            )
+        return codes.long(), semantic.squeeze(0).float()
+
+    def decode_codes(self, codes: torch.Tensor) -> torch.Tensor:
+        """Decode MaskGCT indices to the continuous features used by s2mel."""
+        squeeze = False
+        if codes.ndim == 1:
+            codes = codes.unsqueeze(0)
+            squeeze = True
+        elif codes.ndim == 3 and codes.size(1) == 1:
+            codes = codes.squeeze(1)
+        if codes.ndim != 2:
+            raise ValueError(
+                f"MaskGCT codes must be [T], [B,T], or [B,1,T], got {tuple(codes.shape)}"
+            )
+        codebook_size = int(self.codec.quantizer.codebook_size)
+        if codes.numel() and (
+            int(codes.min().item()) < 0 or int(codes.max().item()) >= codebook_size
+        ):
+            raise ValueError(f"MaskGCT codes must be in [0, {codebook_size})")
+        decoded = self.codec.quantizer.vq2emb(codes.long().unsqueeze(0))
+        decoded = decoded.transpose(1, 2).contiguous().float()
+        return decoded.squeeze(0) if squeeze else decoded
 
     @torch.no_grad()
-    def extract(self, waveforms: list[np.ndarray]) -> list[torch.Tensor]:
+    def codebook_lookup(self) -> torch.Tensor:
+        """Materialize the frozen 8192x1024 post-projection lookup table."""
+        codebook_size = int(self.codec.quantizer.codebook_size)
+        device = next(self.codec.parameters()).device
+        codes = torch.arange(codebook_size, device=device, dtype=torch.long)
+        return self.decode_codes(codes).detach().cpu().float().contiguous()
+
+    def codebook_metadata(self) -> dict[str, Any]:
+        lookup = self.codebook_lookup()
+        return {
+            **self.info.to_dict(),
+            "representation": "maskgct_codes",
+            "codebook_size": int(lookup.size(0)),
+            "codebook_dim": int(lookup.size(1)),
+            "code_dtype": "uint16",
+            "lookup_dtype": "float32",
+            "checkpoint_path": str(self.checkpoint_path),
+            "checkpoint_sha256": sha256_file(self.checkpoint_path),
+        }
+
+    def _encode_semantic_features(
+        self, waveforms: list[np.ndarray]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         inputs = self.feature_extractor(
             waveforms, sampling_rate=16000, return_tensors="pt", padding=True
         )
@@ -263,11 +325,75 @@ class MaskGCTSemanticCodec(nn.Module):
             output_hidden_states=True,
         )
         feature = (output.hidden_states[17] - self.semantic_mean) / self.semantic_std
-        lengths = attention_mask.sum(dim=1).long()
+        return feature, attention_mask.sum(dim=1).long()
+
+    @torch.no_grad()
+    def extract(self, waveforms: list[np.ndarray]) -> list[torch.Tensor]:
+        feature, lengths = self._encode_semantic_features(waveforms)
         return [
-            self._quantize(feature[index : index + 1, : int(lengths[index])])
+            self._quantize(feature[index : index + 1, : int(lengths[index])])[1]
             for index in range(feature.size(0))
         ]
+
+    @torch.no_grad()
+    def extract_codes(self, waveforms: list[np.ndarray]) -> list[torch.Tensor]:
+        feature, lengths = self._encode_semantic_features(waveforms)
+        return [
+            self._quantize(feature[index : index + 1, : int(lengths[index])])[0]
+            for index in range(feature.size(0))
+        ]
+
+
+class MaskGCTCodebookDecoder(nn.Module):
+    """Lightweight frozen decoder for precomputed MaskGCT indices."""
+
+    def __init__(
+        self,
+        lookup_path: str | Path,
+        *,
+        expected_sha256: str | None = None,
+    ) -> None:
+        super().__init__()
+        lookup_path = Path(lookup_path).expanduser()
+        if not lookup_path.is_file():
+            raise FileNotFoundError(f"MaskGCT lookup table not found: {lookup_path}")
+        self.lookup_sha256 = sha256_file(lookup_path)
+        if expected_sha256:
+            if self.lookup_sha256 != expected_sha256:
+                raise ValueError(
+                    "MaskGCT lookup table checksum mismatch: "
+                    f"expected={expected_sha256}, actual={self.lookup_sha256}"
+                )
+        payload = torch.load(lookup_path, map_location="cpu")
+        lookup = payload.get("lookup") if isinstance(payload, dict) else payload
+        if not isinstance(lookup, torch.Tensor):
+            raise TypeError(f"Invalid MaskGCT lookup payload in {lookup_path}")
+        lookup = lookup.float().contiguous()
+        expected_dim = SEMANTIC_CODEC_SPECS["maskgct"].semantic_dim
+        if lookup.ndim != 2 or lookup.size(0) != 8192 or lookup.size(1) != expected_dim:
+            raise ValueError(
+                "MaskGCT lookup must be [8192, 1024], "
+                f"got {tuple(lookup.shape)}"
+            )
+        self.lookup_path = lookup_path.resolve()
+        self.register_buffer("lookup", lookup, persistent=False)
+
+    @torch.no_grad()
+    def forward(self, codes: torch.Tensor) -> torch.Tensor:
+        if codes.ndim == 3:
+            if codes.size(1) != 1:
+                raise ValueError(
+                    f"MaskGCT uses one codebook, got shape {tuple(codes.shape)}"
+                )
+            codes = codes[:, 0]
+        if codes.ndim not in (1, 2):
+            raise ValueError(f"MaskGCT codes must be [T] or [B,T], got {tuple(codes.shape)}")
+        codes = codes.long()
+        if codes.numel() and (
+            int(codes.min().item()) < 0 or int(codes.max().item()) >= self.lookup.size(0)
+        ):
+            raise ValueError(f"MaskGCT codes must be in [0, {self.lookup.size(0)})")
+        return F.embedding(codes, self.lookup)
 
 
 class SACSemanticCodec(nn.Module):

@@ -12,6 +12,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torchaudio
 from torch.nn.utils.rnn import pad_sequence
@@ -21,6 +22,7 @@ from torch.utils.data import Dataset
 DEFAULT_MAX_AUDIO_SECONDS = 190.22
 DEFAULT_MAX_PAIR_SECONDS = 190.22
 DEFAULT_MAX_PROMPT_SECONDS = 15.0
+_SEMANTIC_CODE_MEMMAPS: dict[str, np.memmap] = {}
 
 
 def _load_tensor(path: str | Path) -> torch.Tensor:
@@ -33,6 +35,32 @@ def _load_tensor(path: str | Path) -> torch.Tensor:
     if not isinstance(obj, torch.Tensor):
         raise TypeError(f"Expected tensor payload in {path}, got {type(obj)!r}")
     return obj
+
+
+def _load_semantic_codes(record: dict[str, Any]) -> torch.Tensor:
+    path = str(record["semantic_code_path"])
+    offset = int(record["semantic_code_offset"])
+    length = int(record["semantic_code_length"])
+    if offset < 0 or length <= 0:
+        raise ValueError(
+            f"Invalid semantic code range offset={offset}, length={length}: {path}"
+        )
+    mmap = _SEMANTIC_CODE_MEMMAPS.get(path)
+    if mmap is None:
+        mmap = np.memmap(path, mode="r", dtype="<u2")
+        _SEMANTIC_CODE_MEMMAPS[path] = mmap
+    end = offset + length
+    if end > mmap.size:
+        raise ValueError(
+            f"Semantic code range [{offset}, {end}) exceeds {path} ({mmap.size} tokens)"
+        )
+    return torch.from_numpy(np.array(mmap[offset:end], dtype=np.int64, copy=True))
+
+
+def _pad_semantic_codes(records: list[dict[str, Any]]) -> tuple[torch.Tensor, torch.Tensor]:
+    codes = [_load_semantic_codes(record) for record in records]
+    lengths = torch.tensor([item.numel() for item in codes], dtype=torch.long)
+    return pad_sequence(codes, batch_first=True, padding_value=0), lengths
 
 
 def _resolve_path(base_dir: Path, value: str | None) -> str | None:
@@ -209,7 +237,14 @@ class S2MelJsonlDataset(Dataset):
                     if not line:
                         continue
                     record = json.loads(line)
-                    for key in ("audio_path", "mel_path", "semantic_path", "style_path"):
+                    for key in (
+                        "audio_path",
+                        "mel_path",
+                        "semantic_path",
+                        "style_path",
+                        "semantic_code_path",
+                        "semantic_lookup_path",
+                    ):
                         record[key] = _resolve_path(base_dir, record.get(key))
                     record["_line_no"] = line_no
                     record["_manifest_path"] = str(current_manifest)
@@ -784,6 +819,91 @@ class S2MelCollator:
             )
         )
 
+    @staticmethod
+    def _has_semantic_codes(record: dict[str, Any]) -> bool:
+        return bool(
+            record.get("semantic_code_path")
+            and record.get("semantic_code_length")
+            and record.get("semantic_lookup_path")
+            and record.get("semantic_lookup_sha256")
+        )
+
+    def _semantic_code_batch_metadata(
+        self,
+        records: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        lookup_paths = {str(record["semantic_lookup_path"]) for record in records}
+        lookup_hashes = {str(record["semantic_lookup_sha256"]) for record in records}
+        fingerprints = {str(record.get("semantic_fingerprint", "")) for record in records}
+        codecs = {str(record.get("semantic_codec", "")) for record in records}
+        if len(lookup_paths) != 1 or len(lookup_hashes) != 1:
+            raise ValueError("A batch must use one semantic lookup table and checksum")
+        if len(fingerprints) != 1 or len(codecs) != 1 or codecs != {"maskgct"}:
+            raise ValueError("A semantic code batch must use one MaskGCT fingerprint")
+        encoded_max_durations = {
+            float(record["semantic_max_audio_seconds"])
+            for record in records
+            if record.get("semantic_max_audio_seconds") is not None
+        }
+        if len(encoded_max_durations) > 1:
+            raise ValueError("A batch must use one semantic max-audio duration")
+        if (
+            encoded_max_durations
+            and self.max_audio_seconds is not None
+            and not math.isclose(
+                next(iter(encoded_max_durations)),
+                self.max_audio_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+        ):
+            raise ValueError(
+                "Precomputed semantic code duration limit does not match training: "
+                f"manifest={next(iter(encoded_max_durations))}, "
+                f"config={self.max_audio_seconds}"
+            )
+        return {
+            "semantic_lookup_path": next(iter(lookup_paths)),
+            "semantic_lookup_sha256": next(iter(lookup_hashes)),
+            "semantic_fingerprint": next(iter(fingerprints)),
+        }
+
+    def _attach_single_semantic_codes(
+        self,
+        batch: dict[str, Any],
+        records: list[dict[str, Any]],
+    ) -> None:
+        semantic_codes, semantic_code_lens = _pad_semantic_codes(records)
+        batch.update(
+            {
+                "semantic_codes": semantic_codes,
+                "semantic_code_lens": semantic_code_lens,
+                "has_semantic_codes": True,
+                **self._semantic_code_batch_metadata(records),
+            }
+        )
+
+    def _attach_paired_semantic_codes(
+        self,
+        batch: dict[str, Any],
+        records: list[dict[str, Any]],
+    ) -> None:
+        prompt_records = [record["prompt"] for record in records]
+        target_records = [record["target"] for record in records]
+        flattened = prompt_records + target_records
+        prompt_codes, prompt_code_lens = _pad_semantic_codes(prompt_records)
+        target_codes, target_code_lens = _pad_semantic_codes(target_records)
+        batch.update(
+            {
+                "prompt_semantic_codes": prompt_codes,
+                "prompt_semantic_code_lens": prompt_code_lens,
+                "target_semantic_codes": target_codes,
+                "target_semantic_code_lens": target_code_lens,
+                "has_semantic_codes": True,
+                **self._semantic_code_batch_metadata(flattened),
+            }
+        )
+
     def _collate_paired_precomputed(self, records: list[dict[str, Any]]) -> dict[str, Any]:
         return collate_paired_features(
             [_load_record_features(record["prompt"]) for record in records],
@@ -889,10 +1009,24 @@ class S2MelCollator:
                 self._has_precomputed(prompt) or self._has_precomputed(target)
                 for prompt, target in zip(prompt_records, target_records, strict=True)
             ]
+            has_semantic_codes = [
+                self._has_semantic_codes(prompt) and self._has_semantic_codes(target)
+                for prompt, target in zip(prompt_records, target_records, strict=True)
+            ]
+            partially_semantic_codes = [
+                self._has_semantic_codes(prompt) or self._has_semantic_codes(target)
+                for prompt, target in zip(prompt_records, target_records, strict=True)
+            ]
             if all(has_precomputed):
+                if any(partially_semantic_codes):
+                    raise ValueError(
+                        "Do not combine full precomputed features with semantic codes"
+                    )
                 return self._collate_paired_precomputed(records)
             if any(partially_precomputed):
                 raise ValueError("Both sides of every pair must use the same feature mode")
+            if any(partially_semantic_codes) and not all(has_semantic_codes):
+                raise ValueError("Both sides of every pair must provide semantic codes")
             prompt_audio_paths = [record.get("audio_path") for record in prompt_records]
             target_audio_paths = [record.get("audio_path") for record in target_records]
             if any(path is None for path in prompt_audio_paths + target_audio_paths):
@@ -952,13 +1086,22 @@ class S2MelCollator:
                         ],
                     }
                 )
+            if all(has_semantic_codes):
+                self._attach_paired_semantic_codes(batch, records)
             return batch
 
         has_precomputed = [self._has_precomputed(record) for record in records]
+        has_semantic_codes = [self._has_semantic_codes(record) for record in records]
         if all(has_precomputed):
+            if any(has_semantic_codes):
+                raise ValueError(
+                    "Do not combine full precomputed features with semantic codes"
+                )
             return self._collate_precomputed(records)
         if any(has_precomputed):
             raise ValueError("Do not mix precomputed and audio-only records in one batch")
+        if any(has_semantic_codes) and not all(has_semantic_codes):
+            raise ValueError("Do not mix records with and without semantic codes")
         audio_paths = [r.get("audio_path") for r in records]
         if any(path is None for path in audio_paths):
             missing = [r.get("_line_no") for r, path in zip(records, audio_paths, strict=True) if path is None]
@@ -976,4 +1119,6 @@ class S2MelCollator:
             batch["records"] = [records[index] for index in valid_indices]
             batch["audio_waveforms"] = waveforms
             batch["audio_sample_rates"] = sample_rates
+        if all(has_semantic_codes):
+            self._attach_single_semantic_codes(batch, batch["records"])
         return batch

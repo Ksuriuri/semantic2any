@@ -58,7 +58,13 @@ def _load_audio(path: str | Path, max_audio_seconds: float | None = None) -> tup
 class S2MelFeatureAdapter(nn.Module):
     """Frozen mel/style stack with a selectable semantic codec backend."""
 
-    def __init__(self, cfg: Any) -> None:
+    def __init__(
+        self,
+        cfg: Any,
+        *,
+        semantic_lookup_path: str | Path | None = None,
+        semantic_lookup_sha256: str | None = None,
+    ) -> None:
         super().__init__()
 
         paths_cfg = _get(cfg, "paths")
@@ -68,17 +74,29 @@ class S2MelFeatureAdapter(nn.Module):
         self.model_dir = Path(_get(paths_cfg, "model_dir")).expanduser().resolve()
 
         from semantic2any.utils.semantic_codecs import (
+            MaskGCTCodebookDecoder,
             build_semantic_codec,
             semantic_codec_type,
         )
 
         needs_model_dir = (
-            semantic_codec_type(cfg) == "maskgct" or self.use_style_condition
+            (semantic_lookup_path is None and semantic_codec_type(cfg) == "maskgct")
+            or self.use_style_condition
         )
         if needs_model_dir and not self.model_dir.exists():
             raise FileNotFoundError(f"model_dir does not exist: {self.model_dir}")
+        self.semantic_decoder: MaskGCTCodebookDecoder | None = None
+        self.semantic_backend: nn.Module | None = None
+        if semantic_lookup_path is not None:
+            if semantic_codec_type(cfg) != "maskgct":
+                raise ValueError("Precomputed MaskGCT codes require semantic_codec.type=maskgct")
+            self.semantic_decoder = MaskGCTCodebookDecoder(
+                semantic_lookup_path,
+                expected_sha256=semantic_lookup_sha256,
+            )
+        else:
+            self.semantic_backend = build_semantic_codec(cfg, model_dir=self.model_dir)
 
-        self.semantic_backend = build_semantic_codec(cfg, model_dir=self.model_dir)
         self.register_buffer("_device_anchor", torch.empty(0), persistent=False)
 
         self.campplus_model: CAMPPlus | None = None
@@ -155,7 +173,7 @@ class S2MelFeatureAdapter(nn.Module):
                 f"({model_mel_channels} != {self.mel_args['num_mels']})"
             )
 
-        for module in (self.semantic_backend, self.campplus_model):
+        for module in (self.semantic_backend, self.semantic_decoder, self.campplus_model):
             if module is None:
                 continue
             module.requires_grad_(False)
@@ -173,7 +191,33 @@ class S2MelFeatureAdapter(nn.Module):
 
     @torch.no_grad()
     def _semantic_from_waveforms(self, waveforms: list) -> list[torch.Tensor]:
+        if self.semantic_backend is None:
+            raise RuntimeError(
+                "This feature adapter was initialized for precomputed semantic codes"
+            )
         return self.semantic_backend.extract(waveforms)
+
+    @torch.no_grad()
+    def _semantic_from_codes(
+        self,
+        codes: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        if self.semantic_decoder is None:
+            raise RuntimeError("No MaskGCT semantic lookup table is loaded")
+        if codes.ndim == 3 and codes.size(1) == 1:
+            codes = codes[:, 0]
+        if codes.ndim != 2 or lengths.ndim != 1 or lengths.size(0) != codes.size(0):
+            raise ValueError("Semantic codes must be [B,T] with matching [B] lengths")
+        device = self._module_device()
+        decoded = self.semantic_decoder(codes.to(device))
+        outputs = []
+        for index, length in enumerate(lengths):
+            value = int(length.item())
+            if value <= 0 or value > decoded.size(1):
+                raise ValueError(f"Invalid semantic code length {value}")
+            outputs.append(decoded[index, :value].float())
+        return outputs
 
     @torch.no_grad()
     def _semantic_from_audio(self, audio_16k: torch.Tensor) -> torch.Tensor:
@@ -295,6 +339,8 @@ class S2MelFeatureAdapter(nn.Module):
         *,
         waveforms: list[torch.Tensor] | None = None,
         sample_rates: list[int] | None = None,
+        semantic_codes: torch.Tensor | None = None,
+        semantic_code_lens: torch.Tensor | None = None,
     ) -> list[dict[str, torch.Tensor]]:
         """Extract per-utterance features. w2v-bert runs batched (chunked by
         ``feature_batch_size``); mel, campplus and codec quantization stay
@@ -302,6 +348,11 @@ class S2MelFeatureAdapter(nn.Module):
         mels = []
         styles = []
         waveforms_16k = []
+        if (semantic_codes is None) != (semantic_code_lens is None):
+            raise ValueError("semantic_codes and semantic_code_lens must be provided together")
+        code_mode = semantic_codes is not None
+        use_style_condition = bool(getattr(self, "use_style_condition", False))
+        need_16k = not code_mode or use_style_condition
 
         source_waveforms, source_rates = self._prepare_audio_batch(
             audio_paths, waveforms, sample_rates
@@ -309,20 +360,38 @@ class S2MelFeatureAdapter(nn.Module):
         resampled = self._resample_waveform_batch(
             source_waveforms,
             source_rates,
-            (self.sample_rate_mel, self.sample_rate_16k),
+            (
+                (self.sample_rate_mel, self.sample_rate_16k)
+                if need_16k
+                else (self.sample_rate_mel,)
+            ),
         )
-        for audio_mel, audio_16k in zip(
-            resampled[self.sample_rate_mel],
-            resampled[self.sample_rate_16k],
-            strict=True,
-        ):
+        for index, audio_mel in enumerate(resampled[self.sample_rate_mel]):
             mels.append(self.mel_spectrogram(audio_mel.float(), **self.mel_args).squeeze(0))
-            styles.append(self._style_from_audio(audio_16k))
-            waveforms_16k.append(audio_16k.squeeze(0).detach().cpu().numpy())
-
+            if need_16k:
+                audio_16k = resampled[self.sample_rate_16k][index]
+                styles.append(self._style_from_audio(audio_16k))
+                if not code_mode:
+                    waveforms_16k.append(
+                        audio_16k.squeeze(0).detach().cpu().numpy()
+                    )
+            else:
+                styles.append(
+                    torch.zeros(
+                        int(getattr(self, "style_dim", 192)),
+                        device=self._module_device(),
+                    )
+                )
         semantics: list[torch.Tensor] = []
-        for start in range(0, len(waveforms_16k), self.feature_batch_size):
-            semantics.extend(self._semantic_from_waveforms(waveforms_16k[start : start + self.feature_batch_size]))
+        if semantic_codes is not None and semantic_code_lens is not None:
+            semantics = self._semantic_from_codes(semantic_codes, semantic_code_lens)
+        else:
+            for start in range(0, len(waveforms_16k), self.feature_batch_size):
+                semantics.extend(
+                    self._semantic_from_waveforms(
+                        waveforms_16k[start : start + self.feature_batch_size]
+                    )
+                )
 
         return [
             {"mel": mel, "semantic": semantic, "style": style}
@@ -336,6 +405,8 @@ class S2MelFeatureAdapter(nn.Module):
         *,
         waveforms: list[torch.Tensor] | None = None,
         sample_rates: list[int] | None = None,
+        semantic_codes: torch.Tensor | None = None,
+        semantic_code_lens: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Randomly split each waveform into prompt and target before feature extraction."""
         device = self._module_device()
@@ -344,6 +415,12 @@ class S2MelFeatureAdapter(nn.Module):
         styles = []
         segment_waveforms = []
         segment_sample_rates = []
+        split_fractions: list[float] = []
+        if (semantic_codes is None) != (semantic_code_lens is None):
+            raise ValueError("semantic_codes and semantic_code_lens must be provided together")
+        code_mode = semantic_codes is not None
+        use_style_condition = bool(getattr(self, "use_style_condition", False))
+        need_16k = not code_mode or use_style_condition
 
         target_floor_seconds = self.min_target_seconds
         if target_floor_seconds is None:
@@ -373,6 +450,7 @@ class S2MelFeatureAdapter(nn.Module):
                     f"{self.min_prompt_seconds:g}s prompt and {target_floor_seconds:g}s target"
                 )
             split_sample = lower if upper == lower else random.randint(lower, upper)
+            split_fractions.append(split_sample / audio.size(-1))
             segment_waveforms.extend(
                 [audio[:, :split_sample], audio[:, split_sample:]]
             )
@@ -381,10 +459,16 @@ class S2MelFeatureAdapter(nn.Module):
         resampled = self._resample_waveform_batch(
             segment_waveforms,
             segment_sample_rates,
-            (self.sample_rate_mel, self.sample_rate_16k),
+            (
+                (self.sample_rate_mel, self.sample_rate_16k)
+                if need_16k
+                else (self.sample_rate_mel,)
+            ),
         )
         segment_waveforms_mel = resampled[self.sample_rate_mel]
-        segment_waveforms_16k = resampled[self.sample_rate_16k]
+        segment_waveforms_16k = (
+            resampled[self.sample_rate_16k] if need_16k else []
+        )
         for index in range(len(audio_paths)):
             prompt_audio_mel = segment_waveforms_mel[2 * index]
             target_audio_mel = segment_waveforms_mel[2 * index + 1]
@@ -395,19 +479,30 @@ class S2MelFeatureAdapter(nn.Module):
                 self.mel_spectrogram(target_audio_mel.float(), **self.mel_args).squeeze(0)
             )
 
-            styles.append(self._style_from_audio(segment_waveforms_16k[2 * index]))
-
-        semantic_waveforms_16k = [
-            waveform.squeeze(0).detach().cpu().numpy()
-            for waveform in segment_waveforms_16k
-        ]
-        segment_semantics: list[torch.Tensor] = []
-        for start in range(0, len(semantic_waveforms_16k), self.feature_batch_size):
-            segment_semantics.extend(
-                self._semantic_from_waveforms(
-                    semantic_waveforms_16k[start : start + self.feature_batch_size]
+            if need_16k:
+                styles.append(self._style_from_audio(segment_waveforms_16k[2 * index]))
+            else:
+                styles.append(
+                    torch.zeros(int(getattr(self, "style_dim", 192)), device=device)
                 )
-            )
+
+        full_semantics = (
+            self._semantic_from_codes(semantic_codes, semantic_code_lens)
+            if semantic_codes is not None and semantic_code_lens is not None
+            else None
+        )
+        segment_semantics: list[torch.Tensor] = []
+        if full_semantics is None:
+            semantic_waveforms_16k = [
+                waveform.squeeze(0).detach().cpu().numpy()
+                for waveform in segment_waveforms_16k
+            ]
+            for start in range(0, len(semantic_waveforms_16k), self.feature_batch_size):
+                segment_semantics.extend(
+                    self._semantic_from_waveforms(
+                        semantic_waveforms_16k[start : start + self.feature_batch_size]
+                    )
+                )
 
         mels = []
         semantics = []
@@ -416,8 +511,21 @@ class S2MelFeatureAdapter(nn.Module):
         for index, (prompt_mel, target_mel) in enumerate(
             zip(prompt_mels, target_mels, strict=True)
         ):
-            prompt_semantic = segment_semantics[2 * index]
-            target_semantic = segment_semantics[2 * index + 1]
+            if full_semantics is None:
+                prompt_semantic = segment_semantics[2 * index]
+                target_semantic = segment_semantics[2 * index + 1]
+            else:
+                full_semantic = full_semantics[index]
+                if full_semantic.size(0) < 2:
+                    raise ValueError("Random split requires at least two semantic code frames")
+                prompt_semantic_len = round(
+                    full_semantic.size(0) * split_fractions[index]
+                )
+                prompt_semantic_len = max(
+                    1, min(full_semantic.size(0) - 1, prompt_semantic_len)
+                )
+                prompt_semantic = full_semantic[:prompt_semantic_len]
+                target_semantic = full_semantic[prompt_semantic_len:]
             mels.append(torch.cat([prompt_mel, target_mel], dim=-1).transpose(0, 1))
             semantics.append(torch.cat([prompt_semantic, target_semantic], dim=0))
             prompt_lens.append(prompt_mel.size(-1))
@@ -448,12 +556,16 @@ class S2MelFeatureAdapter(nn.Module):
         *,
         waveforms: list[torch.Tensor] | None = None,
         sample_rates: list[int] | None = None,
+        semantic_codes: torch.Tensor | None = None,
+        semantic_code_lens: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         device = self._module_device()
         features = self.extract_utterance_features(
             audio_paths,
             waveforms=waveforms,
             sample_rates=sample_rates,
+            semantic_codes=semantic_codes,
+            semantic_code_lens=semantic_code_lens,
         )
 
         mels = []
@@ -501,6 +613,10 @@ class S2MelFeatureAdapter(nn.Module):
         prompt_sample_rates: list[int] | None = None,
         target_waveforms: list[torch.Tensor] | None = None,
         target_sample_rates: list[int] | None = None,
+        prompt_semantic_codes: torch.Tensor | None = None,
+        prompt_semantic_code_lens: torch.Tensor | None = None,
+        target_semantic_codes: torch.Tensor | None = None,
+        target_semantic_code_lens: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if not prompt_audio_paths or len(prompt_audio_paths) != len(target_audio_paths):
             raise ValueError("Prompt and target path lists must have the same non-zero length")
@@ -518,10 +634,42 @@ class S2MelFeatureAdapter(nn.Module):
             if prompt_sample_rates is None or target_sample_rates is None
             else prompt_sample_rates + target_sample_rates
         )
+        code_fields = (
+            prompt_semantic_codes,
+            prompt_semantic_code_lens,
+            target_semantic_codes,
+            target_semantic_code_lens,
+        )
+        if any(item is None for item in code_fields) and not all(
+            item is None for item in code_fields
+        ):
+            raise ValueError("All paired semantic code fields must be provided together")
+        combined_codes = None
+        combined_code_lens = None
+        if all(item is not None for item in code_fields):
+            assert prompt_semantic_codes is not None
+            assert prompt_semantic_code_lens is not None
+            assert target_semantic_codes is not None
+            assert target_semantic_code_lens is not None
+            code_items = [
+                prompt_semantic_codes[index, : int(prompt_semantic_code_lens[index])]
+                for index in range(batch_size)
+            ] + [
+                target_semantic_codes[index, : int(target_semantic_code_lens[index])]
+                for index in range(batch_size)
+            ]
+            combined_codes = pad_sequence(
+                code_items, batch_first=True, padding_value=0
+            )
+            combined_code_lens = torch.cat(
+                [prompt_semantic_code_lens, target_semantic_code_lens]
+            )
         features = self.extract_utterance_features(
             prompt_audio_paths + target_audio_paths,
             waveforms=combined_waveforms,
             sample_rates=combined_sample_rates,
+            semantic_codes=combined_codes,
+            semantic_code_lens=combined_code_lens,
         )
         return collate_paired_features(
             features[:batch_size],
@@ -539,8 +687,17 @@ class S2MelFeatureAdapter(nn.Module):
 IndexTTSFeatureAdapter = S2MelFeatureAdapter
 
 
-def build_feature_adapter(cfg: Any) -> S2MelFeatureAdapter:
-    return S2MelFeatureAdapter(cfg)
+def build_feature_adapter(
+    cfg: Any,
+    *,
+    semantic_lookup_path: str | Path | None = None,
+    semantic_lookup_sha256: str | None = None,
+) -> S2MelFeatureAdapter:
+    return S2MelFeatureAdapter(
+        cfg,
+        semantic_lookup_path=semantic_lookup_path,
+        semantic_lookup_sha256=semantic_lookup_sha256,
+    )
 
 
 def move_feature_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:

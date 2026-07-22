@@ -151,6 +151,9 @@ uv run accelerate launch trainers/train_s2mel_zipformer.py \
 MaskGCT、SAC 和 CAMPPlus 资产。预计算特征必须携带匹配的 codec
 fingerprint，不能在 MaskGCT 与 SAC 实验间混用。
 
+只预提取紧凑 MaskGCT code、训练时通过冻结词表恢复连续 feature 的流程见
+[maskgct-code-precompute.md](maskgct-code-precompute.md)。
+
 ## 4. 可选评估资产
 
 `scripts/task12_run_semantic2any_eval.sh` 是历史实验评估入口，不参与安装、

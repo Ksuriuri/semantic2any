@@ -346,6 +346,11 @@ def preload_dataset_features(
     for start in range(0, total, batch_size):
         end = min(start + batch_size, total)
         source_records = [dataset[index] for index in range(start, end)]
+        if any(record.get("semantic_code_path") for record in source_records):
+            raise ValueError(
+                "data.preload_features is not supported with precomputed semantic codes; "
+                "leave preload_features=false"
+            )
         audio_paths = [record.get("audio_path") for record in source_records]
         if any(not isinstance(path, str) or not path for path in audio_paths):
             raise ValueError(f"{split} preload encountered a record without audio_path")
@@ -479,15 +484,44 @@ def build_training_batch(
     if batch.get("is_precomputed", False):
         return move_feature_batch_to_device(batch, accelerator.device)
 
+    has_semantic_codes = bool(batch.get("has_semantic_codes", False))
     if feature_adapter_ref[0] is None:
         if accelerator.is_main_process:
             codec = semantic_codec_info(cfg)
-            print(
-                f"[Feature] Initializing {codec.name} semantic adapter "
-                f"({codec.semantic_fps:g} Hz, {codec.semantic_dim} dims)"
-            )
-        feature_adapter_ref[0] = build_feature_adapter(cfg).to(accelerator.device)
+            if has_semantic_codes:
+                print(
+                    f"[Feature] Initializing {codec.name} code lookup adapter "
+                    f"({codec.semantic_fps:g} Hz, {codec.semantic_dim} dims)"
+                )
+            else:
+                print(
+                    f"[Feature] Initializing {codec.name} semantic adapter "
+                    f"({codec.semantic_fps:g} Hz, {codec.semantic_dim} dims)"
+                )
+        feature_adapter_ref[0] = build_feature_adapter(
+            cfg,
+            semantic_lookup_path=(
+                batch["semantic_lookup_path"] if has_semantic_codes else None
+            ),
+            semantic_lookup_sha256=(
+                batch["semantic_lookup_sha256"] if has_semantic_codes else None
+            ),
+        ).to(accelerator.device)
         feature_adapter_ref[0].eval()
+    elif has_semantic_codes:
+        decoder = feature_adapter_ref[0].semantic_decoder
+        if decoder is None:
+            raise ValueError(
+                "Cannot mix precomputed semantic-code batches with online semantic batches"
+            )
+        if decoder.lookup_sha256 != batch["semantic_lookup_sha256"]:
+            raise ValueError(
+                "All training and validation batches must use the same lookup table"
+            )
+    elif feature_adapter_ref[0].semantic_backend is None:
+        raise ValueError(
+            "Cannot mix online semantic batches with precomputed semantic-code batches"
+        )
     if batch.get("is_paired", False):
         return feature_adapter_ref[0].extract_paired_from_audio_paths(
             batch["prompt_audio_paths"],
@@ -496,17 +530,25 @@ def build_training_batch(
             prompt_sample_rates=batch.get("prompt_audio_sample_rates"),
             target_waveforms=batch.get("target_audio_waveforms"),
             target_sample_rates=batch.get("target_audio_sample_rates"),
+            prompt_semantic_codes=batch.get("prompt_semantic_codes"),
+            prompt_semantic_code_lens=batch.get("prompt_semantic_code_lens"),
+            target_semantic_codes=batch.get("target_semantic_codes"),
+            target_semantic_code_lens=batch.get("target_semantic_code_lens"),
         )
     if bool(_get(cfg.data, "random_split_audio", False)):
         return feature_adapter_ref[0].extract_random_split_from_audio_paths(
             batch["audio_paths"],
             waveforms=batch.get("audio_waveforms"),
             sample_rates=batch.get("audio_sample_rates"),
+            semantic_codes=batch.get("semantic_codes"),
+            semantic_code_lens=batch.get("semantic_code_lens"),
         )
     return feature_adapter_ref[0].extract_from_audio_paths(
         batch["audio_paths"],
         waveforms=batch.get("audio_waveforms"),
         sample_rates=batch.get("audio_sample_rates"),
+        semantic_codes=batch.get("semantic_codes"),
+        semantic_code_lens=batch.get("semantic_code_lens"),
     )
 
 

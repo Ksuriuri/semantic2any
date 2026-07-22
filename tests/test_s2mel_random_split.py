@@ -94,6 +94,52 @@ class PromptStyleExtractionTest(unittest.TestCase):
         self.assertEqual(batch["mel_lens"].tolist(), [10])
         self.assertEqual(batch["prompt_semantic_lens"].tolist(), [4])
 
+    def test_precomputed_codes_follow_the_random_audio_split(self) -> None:
+        class Decoder(torch.nn.Module):
+            def forward(self, codes):
+                return codes.float().unsqueeze(-1).expand(-1, -1, 4)
+
+        adapter = IndexTTSFeatureAdapter.__new__(IndexTTSFeatureAdapter)
+        torch.nn.Module.__init__(adapter)
+        adapter.semantic_mean = torch.zeros(1)
+        adapter.semantic_backend = None
+        adapter.semantic_decoder = Decoder()
+        adapter.max_audio_seconds = 30.0
+        adapter.sample_rate_mel = 1
+        adapter.sample_rate_16k = 1
+        adapter.mel_args = {"hop_size": 1}
+        adapter.min_prompt_seconds = 3.0
+        adapter.max_prompt_seconds = None
+        adapter.min_target_seconds = 3.0
+        adapter.min_generated_frames = 1
+        adapter.feature_batch_size = 16
+        adapter._resampler_cache = {}
+        adapter.mel_spectrogram = lambda audio, **kwargs: torch.zeros(
+            1, 2, audio.size(-1)
+        )
+        adapter._style_from_audio = lambda audio: torch.zeros(192)
+
+        with (
+            patch(
+                "semantic2any.utils.indextts_adapters._load_audio",
+                return_value=(torch.zeros(1, 10), 1),
+            ),
+            patch(
+                "semantic2any.utils.indextts_adapters.random.randint",
+                return_value=4,
+            ),
+        ):
+            batch = IndexTTSFeatureAdapter.extract_random_split_from_audio_paths(
+                adapter,
+                ["sample.flac"],
+                semantic_codes=torch.arange(10).unsqueeze(0),
+                semantic_code_lens=torch.tensor([10]),
+            )
+
+        self.assertEqual(batch["prompt_semantic_lens"].tolist(), [4])
+        self.assertEqual(batch["semantic_lens"].tolist(), [10])
+        self.assertEqual(batch["semantic"][0, :, 0].tolist(), list(range(10)))
+
 
 class BatchedResamplerTest(unittest.TestCase):
     def test_batches_variable_lengths_and_reuses_cached_kernel(self) -> None:
