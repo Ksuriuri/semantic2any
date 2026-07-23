@@ -126,6 +126,13 @@ class SpeakerPairDatasetTest(unittest.TestCase):
         dataset = S2MelInMemoryDataset(
             [
                 {"id": "short", "speaker_id": "short", "duration": 5.9},
+                {
+                    "id": "short-code",
+                    "speaker_id": "short-code",
+                    "duration": 6.01,
+                    "semantic_code_length": 299,
+                    "semantic_fps": 50.0,
+                },
                 {"id": "usable", "speaker_id": "usable", "duration": 6.0},
             ]
         )
@@ -142,7 +149,7 @@ class SpeakerPairDatasetTest(unittest.TestCase):
         self.assertEqual(len(paired), 1)
         self.assertEqual(paired[0]["target"]["id"], "usable")
         self.assertTrue(paired[0]["singleton_split"])
-        self.assertEqual(paired.unusable_target_count, 1)
+        self.assertEqual(paired.unusable_target_count, 2)
 
     def test_overlong_audio_can_be_prompt_but_not_target(self) -> None:
         dataset = S2MelInMemoryDataset(

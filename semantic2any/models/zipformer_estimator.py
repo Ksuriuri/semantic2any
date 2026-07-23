@@ -42,7 +42,9 @@ class ZipFormerEstimator(nn.Module):
             input_dim += self.style_dim
 
         self.cond_projection = nn.Linear(self.content_dim, self.content_dim)
-        self.style_projection = nn.Linear(self.style_dim, self.style_dim)
+        self.style_projection = (
+            nn.Linear(self.style_dim, self.style_dim) if self.style_condition else None
+        )
         self.decoder = TTSZipformer(
             in_dim=input_dim,
             out_dim=self.in_channels,
@@ -86,6 +88,8 @@ class ZipFormerEstimator(nn.Module):
 
         parts = [x_in, prompt_in, cond]
         if self.style_condition:
+            if self.style_projection is None:
+                raise RuntimeError("style_projection is required when style_condition=true")
             style = self.style_projection(style)
             if drop_style:
                 style = torch.zeros_like(style)

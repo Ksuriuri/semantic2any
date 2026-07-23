@@ -121,6 +121,32 @@ class TrainingStyleConditionCliTest(unittest.TestCase):
 
 
 class StyleMaskingTest(unittest.TestCase):
+    def test_no_style_zipformer_does_not_register_style_projection(self) -> None:
+        cfg = OmegaConf.create(
+            {
+                "DiT": {"in_channels": 4, "content_dim": 8},
+                "style_encoder": {"dim": 6},
+                "ZipFormer": {
+                    "style_condition": False,
+                    "downsampling_factor": [1],
+                    "num_layers": [1],
+                    "cnn_module_kernel": [3],
+                    "hidden_dim": 8,
+                    "feedforward_dim": 16,
+                    "num_heads": 2,
+                    "time_embed_dim": 8,
+                    "use_conv": False,
+                },
+            }
+        )
+        estimator = ZipFormerEstimator(cfg)
+
+        self.assertIsNone(estimator.style_projection)
+        self.assertNotIn(
+            "style_projection.weight",
+            dict(estimator.named_parameters()),
+        )
+
     def test_drop_style_masks_projected_embedding_including_bias(self) -> None:
         estimator, decoder = _minimal_estimator()
         kwargs = {

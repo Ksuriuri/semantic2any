@@ -1,7 +1,7 @@
 seed: 1234
 
 paths:
-  model_dir: checkpoints/feature-extractors
+  model_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/checkpoints/feature-extractors
   semantic_codec_ckpt: ""
   campplus_ckpt: campplus/campplus_cn_common.bin
   w2v_bert_dir: w2v-bert-2.0
@@ -38,7 +38,7 @@ data:
   decode_audio_in_worker: true
   skip_audio_errors: true
   feature_batch_size: 16
-  async_feature_extraction: true
+  async_feature_extraction: false
   preload_features: false
   preload_batch_size: 16
   # Prompt-mel only: with this probability, band-limit prompt audio to a
@@ -99,10 +99,11 @@ s2mel:
 
 train:
   output_dir: /mnt/data_sdd/hhy/noiz-tts/semantic2any/exp/s2mel_train_data_filtered_speaker_pair_bigvgan_v2_44khz_128band_512x
-  batch_size: 32
+  batch_size: 8
   epochs: 10
   max_steps: 0
-  grad_accumulation: 1
+  grad_accumulation: 4
+  find_unused_parameters: false
   learning_rate: 1.0e-4
   min_learning_rate: 1.0e-5
   weight_decay: 0.01

@@ -9,7 +9,7 @@ VALID_JSONL=${VALID_JSONL:-${SPLIT_ROOT}/valid.jsonl}
 CONFIG=${CONFIG:-configs/s2mel_zipformer_s2mel_train_data_filtered_speaker_pair_bigvgan_v2_44khz_128band_512x.yaml}
 OUTPUT_DIR=${OUTPUT_DIR:-exp/s2mel_train_data_filtered_speaker_pair_bigvgan_v2_44khz_128band_512x}
 LOG_FILE=${LOG_FILE:-${OUTPUT_DIR}/train.log}
-NUM_PROCESSES=${NUM_PROCESSES:-4}
+NUM_PROCESSES=${NUM_PROCESSES:-8}
 NUM_MACHINES=${NUM_MACHINES:-1}
 MAIN_PROCESS_PORT=${MAIN_PROCESS_PORT:-29543}
 

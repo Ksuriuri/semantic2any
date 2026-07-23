@@ -480,6 +480,23 @@ def _record_can_be_prompt(
     return True
 
 
+def _record_has_singleton_semantic_budget(
+    record: dict[str, Any],
+    *,
+    min_prompt_seconds: float,
+    min_target_seconds: float,
+) -> bool:
+    """Precomputed code must be long enough for a frame-aligned singleton split."""
+    code_length = record.get("semantic_code_length")
+    if not isinstance(code_length, (int, float)):
+        return True
+    semantic_fps = record.get("semantic_fps", 50.0)
+    if not isinstance(semantic_fps, (int, float)) or semantic_fps <= 0:
+        return True
+    min_code_frames = math.ceil((min_prompt_seconds + min_target_seconds) * float(semantic_fps))
+    return int(code_length) >= min_code_frames
+
+
 class S2MelSpeakerPairedDataset(Dataset):
     """Build same-speaker pairs, falling back to an aligned singleton split."""
 
@@ -546,9 +563,17 @@ class S2MelSpeakerPairedDataset(Dataset):
             target_identity = _record_identity(target_record, target_index)
             identities = prompt_identities.get(speaker_id, set())
             singleton_split = not identities or identities == {target_identity}
-            if singleton_split and duration < min_prompt_seconds + min_target_seconds:
-                self.unusable_target_count += 1
-                continue
+            if singleton_split:
+                if duration < min_prompt_seconds + min_target_seconds:
+                    self.unusable_target_count += 1
+                    continue
+                if not _record_has_singleton_semantic_budget(
+                    target_record,
+                    min_prompt_seconds=min_prompt_seconds,
+                    min_target_seconds=min_target_seconds,
+                ):
+                    self.unusable_target_count += 1
+                    continue
             self.target_indices.append(target_index)
             self.target_speaker_ids.append(speaker_id)
             self.singleton_splits.append(singleton_split)
