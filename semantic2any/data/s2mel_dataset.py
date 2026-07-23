@@ -19,8 +19,8 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
 
-DEFAULT_MAX_AUDIO_SECONDS = 60.0
-DEFAULT_MAX_PAIR_SECONDS = 80.0
+DEFAULT_MAX_AUDIO_SECONDS = 30.0
+DEFAULT_MAX_PAIR_SECONDS = 50.0
 DEFAULT_MAX_PROMPT_SECONDS = 20.0
 _SEMANTIC_CODE_MEMMAPS: dict[str, np.memmap] = {}
 

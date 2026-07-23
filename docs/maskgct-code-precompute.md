@@ -111,8 +111,8 @@ NUM_PROCESSES=8 bash scripts/train_s2mel_random_split.sh
 
 训练样本按 `speaker_id` 组织：
 
-1. 同一说话人有两条及以上可用音频时，target 取 3–60 秒的完整音频，不做裁切；
-   超过 60 秒的音频不作为 target，但仍可作为 prompt。
+1. 同一说话人有两条及以上可用音频时，target 取 3–30 秒的完整音频，不做裁切；
+   超过 30 秒的音频不作为 target，但仍可作为 prompt。
 2. prompt 随机选择该说话人的另一条音频，至少 3 秒；超过 20 秒时只保留开头
    20 秒，semantic code 同比例保留对应前缀。
 3. 说话人只有一条可用音频时，从该音频随机切分 prompt/target，二者均至少
@@ -120,8 +120,7 @@ NUM_PROCESSES=8 bash scripts/train_s2mel_random_split.sh
    分界，再映射回音频 sample，因此 code 不会在 frame 中间切开。
 4. 验证集不会从训练集借用同说话人 prompt，避免 train/valid 交叉。
 
-默认配置要求 code manifest 的 `semantic_max_audio_seconds` 为 60 秒；旧的
-30 秒 code 必须重新预计算，否则训练会因配置和 manifest 不匹配而退出。
+默认配置要求 code manifest 的 `semantic_max_audio_seconds` 为 30 秒。
 `data.preload_features` 必须保持 `false`；训练只加载约 32 MiB lookup table，
 不会重新运行 MaskGCT encoder。
 

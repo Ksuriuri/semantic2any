@@ -291,7 +291,7 @@ uv run python scripts/split_s2mel_validation.py \
 NUM_PROCESSES=8 bash scripts/train_s2mel_random_split.sh
 ```
 
-默认配置使用同说话人配对：prompt 为 3–20 秒，target 为 3–60 秒且不裁切；
+默认配置使用同说话人配对：prompt 为 3–20 秒，target 为 3–30 秒且不裁切；
 单条说话人音频按 semantic frame 边界随机切成均不少于 3 秒的 prompt/target。
 历史 439,305 条 `s2mel-train-data` random-split 实验仍可通过显式设置
 `CONFIG`、`TRAIN_JSONL` 和 `VALID_JSONL` 复现。

@@ -51,6 +51,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard", type=int, default=0)
+    parser.add_argument(
+        "--index-modulo",
+        type=int,
+        default=None,
+        help="Optional second-level source_index modulo filter for recovery splits.",
+    )
+    parser.add_argument(
+        "--index-remainder",
+        type=int,
+        default=None,
+        help="Remainder used with --index-modulo.",
+    )
+    parser.add_argument(
+        "--output-suffix",
+        default=None,
+        help="Override output shard suffix to avoid concurrent writers.",
+    )
+    parser.add_argument(
+        "--skip-done-jsonl",
+        action="append",
+        default=[],
+        help="Existing manifest/error JSONL whose source_index values should be skipped.",
+    )
     parser.add_argument("--max-audio-seconds", type=float, default=None)
     parser.add_argument(
         "--skip-audio-errors",
@@ -59,7 +82,15 @@ def parse_args() -> argparse.Namespace:
         help="Record undecodable audio and continue (default: enabled)",
     )
     parser.add_argument("--overwrite", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (args.index_modulo is None) != (args.index_remainder is None):
+        parser.error("--index-modulo and --index-remainder must be provided together")
+    if args.index_modulo is not None:
+        if args.index_modulo <= 0:
+            parser.error("--index-modulo must be positive")
+        if not 0 <= args.index_remainder < args.index_modulo:
+            parser.error("--index-remainder must be in [0, --index-modulo)")
+    return args
 
 
 class RecordDataset(Dataset):
@@ -247,7 +278,7 @@ def main() -> None:
     errors_dir = output_dir / "errors"
     for directory in (codes_dir, manifests_dir, errors_dir):
         directory.mkdir(parents=True, exist_ok=True)
-    suffix = f"shard{args.shard:05d}of{args.num_shards:05d}"
+    suffix = args.output_suffix or f"shard{args.shard:05d}of{args.num_shards:05d}"
     binary_path = codes_dir / f"codes.{suffix}.bin"
     manifest_path = manifests_dir / f"manifest.{suffix}.jsonl"
     errors_path = errors_dir / f"errors.{suffix}.jsonl"
@@ -277,6 +308,17 @@ def main() -> None:
     for row in error_rows:
         source_index = int(row["source_index"])
         done[source_index] = str(row["source_identity"])
+    for done_jsonl in args.skip_done_jsonl:
+        for row in _load_jsonl(Path(done_jsonl).expanduser(), repair_partial_tail=True):
+            source_index = int(row["source_index"])
+            identity = str(row["source_identity"])
+            existing_identity = done.get(source_index)
+            if existing_identity is not None and existing_identity != identity:
+                raise ValueError(
+                    f"Conflicting source_identity for source_index {source_index} "
+                    f"between {manifest_path} and {done_jsonl}"
+                )
+            done[source_index] = identity
     for source_index, identity in done.items():
         if source_index >= len(records) or _source_identity(records[source_index]) != identity:
             raise ValueError(
@@ -289,11 +331,16 @@ def main() -> None:
         binary.flush()
         os.fsync(binary.fileno())
 
-    pending_indices = [
-        index
-        for index in range(args.shard, len(records), args.num_shards)
-        if index not in done
-    ]
+    pending_indices = []
+    for index in range(args.shard, len(records), args.num_shards):
+        if index in done:
+            continue
+        if (
+            args.index_modulo is not None
+            and index % args.index_modulo != args.index_remainder
+        ):
+            continue
+        pending_indices.append(index)
     device = torch.device(args.device)
     loader = DataLoader(
         Subset(RecordDataset(records), pending_indices),
