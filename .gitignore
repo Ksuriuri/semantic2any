@@ -7,6 +7,9 @@ __pycache__/
 .venv/
 venv/
 .cache/
+.cursor/
+pytest-of-*/
+torchinductor_*/
 
 *.log
 wandb/
