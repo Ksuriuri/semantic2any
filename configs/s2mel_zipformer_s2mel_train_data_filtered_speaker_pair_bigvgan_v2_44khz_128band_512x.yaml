@@ -20,15 +20,15 @@ data:
   valid_speechdata_dir: ""
   speechdata_cache_dir: .cache/speechdata
   # This must match semantic_max_audio_seconds in the generated code manifests.
-  max_audio_seconds: 30.0
+  max_audio_seconds: 60.0
   pair_same_speaker: true
   random_split_audio: false
   min_prompt_seconds: 3.0
   max_prompt_seconds: 20.0
   min_pair_prompt_seconds: 3.0
   min_target_seconds: 3.0
-  max_target_seconds: 30.0
-  max_pair_seconds: 50.0
+  max_target_seconds: 60.0
+  max_pair_seconds: 80.0
   min_generated_frames: 8
   semantic_fps: 50.0
   sample_rate_16k: 16000
@@ -41,6 +41,11 @@ data:
   async_feature_extraction: true
   preload_features: false
   preload_batch_size: 16
+  # Prompt-mel only: with this probability, band-limit prompt audio to a
+  # randomly chosen rate below (16 kHz / 22.05 kHz simulation). Semantic codes
+  # stay on the original prompt; validation disables this augmentation.
+  prompt_bandwidth_aug_prob: 0.3
+  prompt_bandwidth_aug_rates: [16000, 22050]
 
 preprocess_params:
   sr: 44100
@@ -80,7 +85,7 @@ s2mel:
     feedforward_dim: 4096
     num_heads: 4
     downsampling_factor: [1, 2, 4, 2, 1]
-    num_layers: [2, 2, 4, 4, 4]
+    num_layers: [3, 3, 6, 6, 6]
     cnn_module_kernel: [31, 15, 7, 15, 31]
     query_head_dim: 32
     value_head_dim: 12

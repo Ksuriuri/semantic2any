@@ -30,14 +30,15 @@ data:
   train_speechdata_dir: ""
   valid_speechdata_dir: ""
   speechdata_cache_dir: .cache/speechdata
-  max_audio_seconds: 30.0
+  max_audio_seconds: 60.0
   pair_same_speaker: true
   random_split_audio: false
-  max_pair_seconds: 30.0
+  max_pair_seconds: 80.0
   min_pair_prompt_seconds: 3.0
   min_prompt_seconds: 1.0
-  max_prompt_seconds: 5.0
+  max_prompt_seconds: 20.0
   min_target_seconds: null
+  max_target_seconds: 60.0
   min_generated_frames: 8
   # w2v-bert 2.0 features / MaskGCT semantic codec run at 50 Hz (IndexTTS2 uses code_lens * 1.72 -> mel frames).
   semantic_fps: 50.0
@@ -88,7 +89,7 @@ s2mel:
     feedforward_dim: 4096
     num_heads: 4
     downsampling_factor: [1, 2, 4, 2, 1]
-    num_layers: [2, 2, 4, 4, 4]
+    num_layers: [3, 3, 6, 6, 6]
     cnn_module_kernel: [31, 15, 7, 15, 31]
     query_head_dim: 32
     value_head_dim: 12

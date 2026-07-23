@@ -500,6 +500,7 @@ def build_training_batch(
     cfg,
     accelerator: Accelerator,
     feature_adapter_ref: list[S2MelFeatureAdapter | None],
+    apply_prompt_bandwidth_aug: bool = True,
 ) -> dict[str, torch.Tensor]:
     if batch.get("is_precomputed", False):
         return move_feature_batch_to_device(batch, accelerator.device)
@@ -555,6 +556,7 @@ def build_training_batch(
             prompt_semantic_code_lens=batch.get("prompt_semantic_code_lens"),
             target_semantic_codes=batch.get("target_semantic_codes"),
             target_semantic_code_lens=batch.get("target_semantic_code_lens"),
+            apply_prompt_bandwidth_aug=apply_prompt_bandwidth_aug,
         )
     if bool(_get(cfg.data, "random_split_audio", False)):
         return feature_adapter_ref[0].extract_random_split_from_audio_paths(
@@ -563,6 +565,7 @@ def build_training_batch(
             sample_rates=batch.get("audio_sample_rates"),
             semantic_codes=batch.get("semantic_codes"),
             semantic_code_lens=batch.get("semantic_code_lens"),
+            apply_prompt_bandwidth_aug=apply_prompt_bandwidth_aug,
         )
     return feature_adapter_ref[0].extract_from_audio_paths(
         batch["audio_paths"],
@@ -753,6 +756,7 @@ def validate(model, loader, cfg, accelerator: Accelerator, feature_adapter_ref) 
                     cfg=cfg,
                     accelerator=accelerator,
                     feature_adapter_ref=feature_adapter_ref,
+                    apply_prompt_bandwidth_aug=False,
                 )
                 loss = forward_loss(model, train_batch)
                 batch_size = train_batch["mel"].size(0)

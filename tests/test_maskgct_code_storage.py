@@ -166,3 +166,24 @@ def test_audio_collator_resamples_before_returning_numpy(monkeypatch):
     assert len(waveforms) == 1
     assert waveforms[0].shape == (32,)
     assert waveforms[0].dtype == np.float32
+
+
+def test_audio_collator_records_decode_errors_and_continues(monkeypatch):
+    def fail(_):
+        raise RuntimeError("corrupt audio")
+
+    monkeypatch.setattr(
+        "scripts.precompute_maskgct_codes.torchaudio.load",
+        fail,
+    )
+
+    with pytest.warns(RuntimeWarning, match="bad.wav"):
+        records, waveforms, failures = AudioCollator(10.0, True)(
+            [{"audio_path": "bad.wav", "_source_index": 3}]
+        )
+
+    assert records == []
+    assert waveforms == []
+    assert len(failures) == 1
+    assert failures[0]["source_index"] == 3
+    assert failures[0]["error"] == "corrupt audio"

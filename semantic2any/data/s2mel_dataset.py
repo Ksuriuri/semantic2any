@@ -19,9 +19,9 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
 
-DEFAULT_MAX_AUDIO_SECONDS = 190.22
-DEFAULT_MAX_PAIR_SECONDS = 190.22
-DEFAULT_MAX_PROMPT_SECONDS = 15.0
+DEFAULT_MAX_AUDIO_SECONDS = 60.0
+DEFAULT_MAX_PAIR_SECONDS = 80.0
+DEFAULT_MAX_PROMPT_SECONDS = 20.0
 _SEMANTIC_CODE_MEMMAPS: dict[str, np.memmap] = {}
 
 
@@ -70,6 +70,15 @@ def _resolve_path(base_dir: Path, value: str | None) -> str | None:
     if not path.is_absolute():
         path = base_dir / path
     return str(path)
+
+
+def _has_semantic_codes(record: dict[str, Any]) -> bool:
+    return bool(
+        record.get("semantic_code_path")
+        and record.get("semantic_code_length")
+        and record.get("semantic_lookup_path")
+        and record.get("semantic_lookup_sha256")
+    )
 
 
 def _is_gcs_uri(path: str) -> bool:
@@ -876,12 +885,7 @@ class S2MelCollator:
 
     @staticmethod
     def _has_semantic_codes(record: dict[str, Any]) -> bool:
-        return bool(
-            record.get("semantic_code_path")
-            and record.get("semantic_code_length")
-            and record.get("semantic_lookup_path")
-            and record.get("semantic_lookup_sha256")
-        )
+        return _has_semantic_codes(record)
 
     def _semantic_code_batch_metadata(
         self,

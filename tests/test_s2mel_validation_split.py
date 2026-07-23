@@ -96,3 +96,73 @@ def test_split_preserves_semantic_code_metadata_and_resolves_paths(
         assert record["semantic_code_length"] == 10
         assert record["semantic_lookup_sha256"] == "checksum"
         assert record["semantic_fingerprint"] == "fingerprint"
+
+
+def test_split_drops_records_without_semantic_codes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    manifests = tmp_path / "manifests"
+    output = tmp_path / "splits"
+    manifests.mkdir()
+    records = [
+        {
+            "id": "coded-0",
+            "audio_path": str(tmp_path / "coded-0.flac"),
+            "semantic_code_path": str(tmp_path / "codes.bin"),
+            "semantic_code_offset": 0,
+            "semantic_code_length": 4,
+            "semantic_lookup_path": str(tmp_path / "lookup.pt"),
+            "semantic_lookup_sha256": "checksum",
+        },
+        {
+            "id": "missing-0",
+            "audio_path": str(tmp_path / "missing-0.flac"),
+        },
+        {
+            "id": "coded-1",
+            "audio_path": str(tmp_path / "coded-1.flac"),
+            "semantic_code_path": str(tmp_path / "codes.bin"),
+            "semantic_code_offset": 4,
+            "semantic_code_length": 4,
+            "semantic_lookup_path": str(tmp_path / "lookup.pt"),
+            "semantic_lookup_sha256": "checksum",
+        },
+        {
+            "id": "missing-1",
+            "audio_path": str(tmp_path / "missing-1.flac"),
+            "semantic_code_path": str(tmp_path / "codes.bin"),
+        },
+    ]
+    (manifests / "manifest.shard00000.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "split_s2mel_validation.py",
+            "--metadata-dir",
+            str(manifests),
+            "--output-dir",
+            str(output),
+            "--valid-size",
+            "1",
+            "--seed",
+            "1234",
+        ],
+    )
+    main()
+
+    train = _read_jsonl(output / "train.jsonl")
+    valid = _read_jsonl(output / "valid.jsonl")
+    summary = json.loads((output / "split_summary.json").read_text(encoding="utf-8"))
+    kept_ids = {record["id"] for record in train + valid}
+
+    assert kept_ids == {"coded-0", "coded-1"}
+    assert len(train) + len(valid) == 2
+    assert len(valid) == 1
+    assert summary["require_semantic_codes"] is True
+    assert summary["skipped_missing_semantic_codes"] == 2

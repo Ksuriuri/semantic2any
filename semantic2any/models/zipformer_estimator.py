@@ -47,7 +47,7 @@ class ZipFormerEstimator(nn.Module):
             in_dim=input_dim,
             out_dim=self.in_channels,
             downsampling_factor=tuple(_get(zip_cfg, "downsampling_factor", (1, 2, 4, 2, 1))),
-            num_encoder_layers=tuple(_get(zip_cfg, "num_layers", (2, 2, 4, 4, 4))),
+            num_encoder_layers=tuple(_get(zip_cfg, "num_layers", (3, 3, 6, 6, 6))),
             cnn_module_kernel=tuple(_get(zip_cfg, "cnn_module_kernel", (31, 15, 7, 15, 31))),
             encoder_dim=int(_get(zip_cfg, "hidden_dim", 512)),
             feedforward_dim=int(_get(zip_cfg, "feedforward_dim", 1536)),

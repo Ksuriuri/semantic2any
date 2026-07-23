@@ -17,6 +17,7 @@ from semantic2any.defaults import (
     DEFAULT_MEL_SAMPLE_RATE,
     DEFAULT_MEL_WIN_LENGTH,
 )
+from semantic2any.data.prompt_bandwidth import simulate_lower_sample_rate
 from semantic2any.data.s2mel_dataset import (
     DEFAULT_MAX_AUDIO_SECONDS,
     DEFAULT_MAX_PAIR_SECONDS,
@@ -25,6 +26,9 @@ from semantic2any.data.s2mel_dataset import (
     collate_paired_features,
 )
 from semantic2any.third_party.indextts import CAMPPlus, mel_spectrogram
+
+DEFAULT_PROMPT_BANDWIDTH_AUG_PROB = 0.3
+DEFAULT_PROMPT_BANDWIDTH_AUG_RATES = (16000, 22050)
 
 
 _USE_CONFIGURED_AUDIO_LIMIT = object()
@@ -171,6 +175,25 @@ class S2MelFeatureAdapter(nn.Module):
         self.sample_rate_16k = int(_get(data_cfg, "sample_rate_16k", 16000))
         self.sample_rate_mel = int(_get(data_cfg, "sample_rate_mel", self.mel_args["sampling_rate"]))
         self.feature_batch_size = max(1, int(_get(data_cfg, "feature_batch_size", 16)))
+        self.prompt_bandwidth_aug_prob = float(
+            _get(data_cfg, "prompt_bandwidth_aug_prob", DEFAULT_PROMPT_BANDWIDTH_AUG_PROB)
+        )
+        if not 0.0 <= self.prompt_bandwidth_aug_prob <= 1.0:
+            raise ValueError(
+                "data.prompt_bandwidth_aug_prob must be in [0, 1], "
+                f"got {self.prompt_bandwidth_aug_prob}"
+            )
+        aug_rates = _get(
+            data_cfg, "prompt_bandwidth_aug_rates", list(DEFAULT_PROMPT_BANDWIDTH_AUG_RATES)
+        )
+        if aug_rates is None:
+            aug_rates = list(DEFAULT_PROMPT_BANDWIDTH_AUG_RATES)
+        self.prompt_bandwidth_aug_rates = tuple(int(rate) for rate in aug_rates)
+        if any(rate <= 0 for rate in self.prompt_bandwidth_aug_rates):
+            raise ValueError(
+                "data.prompt_bandwidth_aug_rates must be positive integers, "
+                f"got {self.prompt_bandwidth_aug_rates}"
+            )
         self._resampler_cache: dict[
             tuple[int, int, str, torch.dtype], torchaudio.transforms.Resample
         ] = {}
@@ -354,6 +377,26 @@ class S2MelFeatureAdapter(nn.Module):
             finalized[target_rate] = [item for item in items if item is not None]
         return finalized
 
+    def _maybe_limit_prompt_bandwidth(
+        self,
+        waveform: torch.Tensor,
+        sample_rate: int,
+        *,
+        enabled: bool,
+    ) -> torch.Tensor:
+        """Optionally band-limit prompt audio used for mel only (not semantic/style)."""
+        if not enabled:
+            return waveform
+        prob = float(getattr(self, "prompt_bandwidth_aug_prob", 0.0))
+        if prob <= 0.0 or random.random() >= prob:
+            return waveform
+        rates = tuple(getattr(self, "prompt_bandwidth_aug_rates", DEFAULT_PROMPT_BANDWIDTH_AUG_RATES))
+        candidates = [rate for rate in rates if int(rate) < int(sample_rate)]
+        if not candidates:
+            return waveform
+        simulate_rate = candidates[0] if len(candidates) == 1 else random.choice(candidates)
+        return simulate_lower_sample_rate(waveform, sample_rate, simulate_rate)
+
     @torch.no_grad()
     def extract_utterance_features(
         self,
@@ -429,6 +472,7 @@ class S2MelFeatureAdapter(nn.Module):
         sample_rates: list[int] | None = None,
         semantic_codes: torch.Tensor | None = None,
         semantic_code_lens: torch.Tensor | None = None,
+        apply_prompt_bandwidth_aug: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Randomly split each waveform into prompt and target before feature extraction."""
         device = self._module_device()
@@ -492,7 +536,11 @@ class S2MelFeatureAdapter(nn.Module):
             resampled[self.sample_rate_16k] if need_16k else []
         )
         for index in range(len(audio_paths)):
-            prompt_audio_mel = segment_waveforms_mel[2 * index]
+            prompt_audio_mel = self._maybe_limit_prompt_bandwidth(
+                segment_waveforms_mel[2 * index],
+                self.sample_rate_mel,
+                enabled=apply_prompt_bandwidth_aug,
+            )
             target_audio_mel = segment_waveforms_mel[2 * index + 1]
             prompt_mels.append(
                 self.mel_spectrogram(prompt_audio_mel.float(), **self.mel_args).squeeze(0)
@@ -640,6 +688,7 @@ class S2MelFeatureAdapter(nn.Module):
         prompt_semantic_code_lens: torch.Tensor | None = None,
         target_semantic_codes: torch.Tensor | None = None,
         target_semantic_code_lens: torch.Tensor | None = None,
+        apply_prompt_bandwidth_aug: bool = True,
     ) -> dict[str, torch.Tensor]:
         if not prompt_audio_paths or len(prompt_audio_paths) != len(target_audio_paths):
             raise ValueError("Prompt and target path lists must have the same non-zero length")
@@ -831,8 +880,13 @@ class S2MelFeatureAdapter(nn.Module):
         target_features: list[dict[str, torch.Tensor]] = []
         device = self._module_device()
         for index, singleton_split in enumerate(singleton_splits):
+            prompt_mel_waveform = self._maybe_limit_prompt_bandwidth(
+                mel_waveforms[2 * index],
+                self.sample_rate_mel,
+                enabled=apply_prompt_bandwidth_aug,
+            )
             prompt_mel = self.mel_spectrogram(
-                mel_waveforms[2 * index].float(), **self.mel_args
+                prompt_mel_waveform.float(), **self.mel_args
             ).squeeze(0)
             target_mel = self.mel_spectrogram(
                 mel_waveforms[2 * index + 1].float(), **self.mel_args

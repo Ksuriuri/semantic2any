@@ -52,7 +52,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--max-audio-seconds", type=float, default=None)
-    parser.add_argument("--skip-audio-errors", action="store_true")
+    parser.add_argument(
+        "--skip-audio-errors",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Record undecodable audio and continue (default: enabled)",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 

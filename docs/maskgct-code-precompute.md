@@ -45,8 +45,8 @@ uv run python scripts/precompute_maskgct_codes.py \
 ```
 
 同一命令可以直接重跑。脚本会校验已提交 manifest，截断 binary 中可能存在的
-未提交尾部，并只处理尚未完成的记录。默认遇到坏音频即失败；需要记录并跳过时
-添加 `--skip-audio-errors`。
+未提交尾部，并只处理尚未完成的记录。坏音频默认写入 `errors/` 后跳过；如需
+严格模式，可添加 `--no-skip-audio-errors` 让首个解码错误终止当前 shard。
 
 ## filtered 数据集的 8 卡提取
 
@@ -94,7 +94,8 @@ uv run python scripts/split_s2mel_validation.py \
 
 split 脚本会保留 semantic offset、length、fingerprint 和 checksum，并将
 `audio_path`、`semantic_code_path`、`semantic_lookup_path` 解析为绝对路径。
-生成的 train/valid manifest 互不重叠。
+生成的 train/valid manifest 互不重叠。若输入 manifest 中已有完整 code 字段，
+脚本会剔除缺少 code 的记录后再划分，因此训练侧无需再动态过滤。
 
 ## 默认训练规则
 
@@ -110,8 +111,8 @@ NUM_PROCESSES=8 bash scripts/train_s2mel_random_split.sh
 
 训练样本按 `speaker_id` 组织：
 
-1. 同一说话人有两条及以上可用音频时，target 取 3–30 秒的完整音频，不做裁切；
-   超过 30 秒的音频不作为 target，但仍可作为 prompt。
+1. 同一说话人有两条及以上可用音频时，target 取 3–60 秒的完整音频，不做裁切；
+   超过 60 秒的音频不作为 target，但仍可作为 prompt。
 2. prompt 随机选择该说话人的另一条音频，至少 3 秒；超过 20 秒时只保留开头
    20 秒，semantic code 同比例保留对应前缀。
 3. 说话人只有一条可用音频时，从该音频随机切分 prompt/target，二者均至少
@@ -119,7 +120,8 @@ NUM_PROCESSES=8 bash scripts/train_s2mel_random_split.sh
    分界，再映射回音频 sample，因此 code 不会在 frame 中间切开。
 4. 验证集不会从训练集借用同说话人 prompt，避免 train/valid 交叉。
 
-当前已生成 code 的 `semantic_max_audio_seconds` 是 30 秒，所以默认配置必须保持
-`data.max_audio_seconds: 30.0`。`data.preload_features` 必须保持 `false`；训练只
-加载约 32 MiB lookup table，不会重新运行 MaskGCT encoder。
+默认配置要求 code manifest 的 `semantic_max_audio_seconds` 为 60 秒；旧的
+30 秒 code 必须重新预计算，否则训练会因配置和 manifest 不匹配而退出。
+`data.preload_features` 必须保持 `false`；训练只加载约 32 MiB lookup table，
+不会重新运行 MaskGCT encoder。
 
