@@ -3,8 +3,8 @@
 See NOTICE.md for provenance, licenses, and the exact upstream revision.
 """
 
-from .audio import mel_spectrogram
+from .audio import mel_spectrogram, mel_spectrogram_batch
 from .campplus import CAMPPlus
 from .maskgct import RepCodec
 
-__all__ = ["CAMPPlus", "RepCodec", "mel_spectrogram"]
+__all__ = ["CAMPPlus", "RepCodec", "mel_spectrogram", "mel_spectrogram_batch"]

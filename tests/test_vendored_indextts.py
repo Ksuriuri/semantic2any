@@ -5,6 +5,10 @@ from omegaconf import OmegaConf
 
 from semantic2any.third_party.indextts.bigvgan import AttrDict, BigVGAN
 from semantic2any.third_party.indextts.campplus import CAMPPlus
+from semantic2any.third_party.indextts.audio import (
+    mel_spectrogram,
+    mel_spectrogram_batch,
+)
 from semantic2any.third_party.indextts.maskgct import RepCodec
 from semantic2any.utils.indextts_adapters import (
     S2MelFeatureAdapter,
@@ -23,6 +27,30 @@ def test_runtime_files_do_not_import_external_indextts_package() -> None:
         source = path.read_text(encoding="utf-8")
         assert "from indextts" not in source
         assert "import indextts" not in source
+
+
+def test_variable_length_batched_mel_matches_single_waveforms() -> None:
+    torch.manual_seed(1234)
+    waveforms = [torch.randn(1, length) for length in (8192, 10001, 12288)]
+    mel_args = {
+        "n_fft": 2048,
+        "num_mels": 128,
+        "sampling_rate": 44100,
+        "hop_size": 512,
+        "win_size": 2048,
+        "fmin": 0.0,
+        "fmax": None,
+        "center": False,
+    }
+    expected = [
+        mel_spectrogram(waveform, **mel_args).squeeze(0)
+        for waveform in waveforms
+    ]
+    actual = mel_spectrogram_batch(waveforms, batch_size=2, **mel_args)
+
+    assert [mel.shape for mel in actual] == [mel.shape for mel in expected]
+    for batched, single in zip(actual, expected, strict=True):
+        torch.testing.assert_close(batched, single)
 
 
 def test_campplus_state_dict_strict_round_trip() -> None:

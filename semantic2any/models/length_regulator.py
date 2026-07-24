@@ -123,16 +123,19 @@ class InterpolateRegulator(nn.Module):
                 # semantic:mel ratio differs from the longest one.
                 if xlens.ndim != 1 or xlens.size(0) != x.size(0):
                     raise ValueError("xlens must be a 1-D length tensor matching the batch size")
-                out = xt.new_zeros(xt.size(0), xt.size(1), max_y)
-                for idx in range(xt.size(0)):
-                    xlen = int(xlens[idx].item())
-                    ylen = int(ylens[idx].item())
-                    if xlen <= 0 or ylen <= 0:
-                        continue
-                    out[idx, :, :ylen] = F.interpolate(
-                        xt[idx : idx + 1, :, :xlen], size=ylen, mode="nearest"
-                    )[0]
-                x = out
+                positions = torch.arange(max_y, device=x.device)
+                source_indices = torch.div(
+                    positions.unsqueeze(0) * xlens.unsqueeze(1),
+                    ylens.clamp_min(1).unsqueeze(1),
+                    rounding_mode="floor",
+                )
+                source_indices = source_indices.clamp(min=0, max=x.size(1) - 1)
+                gathered = x.gather(
+                    1,
+                    source_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)),
+                )
+                valid = positions.unsqueeze(0) < ylens.unsqueeze(1)
+                x = gathered.masked_fill(~valid.unsqueeze(-1), 0).transpose(1, 2)
             else:
                 x = F.interpolate(xt, size=max_y, mode="nearest")
         else:

@@ -8,6 +8,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from semantic2any.data.s2mel_dataset import (
+    LengthBucketBatchSampler,
+    S2MelCollator,
     S2MelInMemoryDataset,
     S2MelSpeakerPairedDataset,
     collate_paired_features,
@@ -114,9 +116,15 @@ class SpeakerPairDatasetTest(unittest.TestCase):
             self.assertEqual(item["prompt"]["speaker_id"], item["target"]["speaker_id"])
             if item["singleton_split"]:
                 self.assertEqual(item["prompt"]["id"], item["target"]["id"])
+                expected_seconds = item["target"]["duration"]
             else:
                 self.assertNotEqual(item["prompt"]["id"], item["target"]["id"])
                 self.assertGreaterEqual(item["prompt"]["duration"], 3.0)
+                expected_seconds = item["target"]["duration"] + min(
+                    item["prompt"]["duration"],
+                    20.0,
+                )
+            self.assertEqual(paired.estimated_sample_seconds(index), expected_seconds)
 
         self.assertEqual(paired.paired_target_count, 2)
         self.assertEqual(paired.singleton_target_count, 1)
@@ -172,6 +180,34 @@ class SpeakerPairDatasetTest(unittest.TestCase):
         self.assertEqual(paired[0]["prompt"]["id"], "long")
         self.assertEqual(paired[0]["target"]["id"], "target")
         self.assertEqual(paired.overlong_target_count, 1)
+
+
+class LengthBucketBatchSamplerTest(unittest.TestCase):
+    def test_groups_world_size_batches_from_same_bucket(self) -> None:
+        lengths = [4, 5, 6, 7, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31]
+        sampler = LengthBucketBatchSampler(
+            lengths,
+            batch_size=2,
+            world_size=2,
+            boundaries=[10, 20, 40],
+            seed=1234,
+            drop_last=True,
+            shuffle=True,
+        )
+        batches = list(sampler)
+
+        self.assertEqual(len(batches) % 2, 0)
+        for start in range(0, len(batches), 2):
+            group = batches[start : start + 2]
+            bucket_ids = {
+                sampler._bucket_id(lengths[index])
+                for batch in group
+                for index in batch
+            }
+            self.assertEqual(len(bucket_ids), 1)
+
+        flattened = [index for batch in batches for index in batch]
+        self.assertEqual(len(flattened), len(set(flattened)))
 
 
 class PairedFeatureTest(unittest.TestCase):
@@ -333,6 +369,51 @@ class PairedAudioExtractionTest(unittest.TestCase):
         self.assertEqual(batch["prompt_semantic_lens"].tolist(), [20, 4])
         self.assertEqual(batch["mel_lens"].tolist(), [30, 10])
         self.assertEqual(batch["semantic_lens"].tolist(), [30, 10])
+
+    def test_worker_paired_mel_batch_finalizes_semantic_codes(self) -> None:
+        collator = S2MelCollator(
+            hop_length=1,
+            sample_rate=1,
+            min_prompt_seconds=3.0,
+            max_prompt_seconds=20.0,
+            min_pair_prompt_seconds=3.0,
+            min_generated_frames=1,
+            min_target_seconds=3.0,
+            max_target_seconds=30.0,
+            extract_mel_in_worker=True,
+        )
+        collator._maybe_limit_prompt_bandwidth = lambda waveform: waveform
+        collator._mel_from_waveform = lambda waveform: torch.zeros(128, waveform.size(-1))
+        batch = {
+            "singleton_splits": [False, True],
+            "records": [{"id": "paired"}, {"id": "singleton"}],
+            "prompt_semantic_codes": torch.stack([torch.arange(30), torch.arange(30)]),
+            "prompt_semantic_code_lens": torch.tensor([30, 10]),
+            "target_semantic_codes": torch.stack([torch.arange(30), torch.arange(30)]),
+            "target_semantic_code_lens": torch.tensor([10, 10]),
+        }
+        with patch("semantic2any.data.s2mel_dataset.random.randint", return_value=4):
+            collator._attach_paired_worker_features(
+                batch,
+                prompt_waveforms=[torch.zeros(1, 30), torch.zeros(1, 10)],
+                prompt_sample_rates=[1, 1],
+                target_waveforms=[torch.zeros(1, 10), torch.zeros(1, 10)],
+                target_sample_rates=[1, 1],
+            )
+
+        self.assertTrue(batch["worker_precomputed_mel"])
+        self.assertEqual(batch["prompt_lens"].tolist(), [20, 4])
+        self.assertEqual(batch["prompt_semantic_lens"].tolist(), [20, 4])
+        self.assertEqual(batch["mel_lens"].tolist(), [30, 10])
+        self.assertEqual(batch["semantic_lens"].tolist(), [30, 10])
+        self.assertFalse(torch.is_floating_point(batch["semantic"]))
+
+        adapter = self._adapter()
+        finalized = adapter.finalize_worker_paired_batch(batch)
+        self.assertTrue(torch.is_floating_point(finalized["semantic"]))
+        self.assertEqual(tuple(finalized["semantic"].shape), (2, 30, 1))
+        self.assertEqual(finalized["semantic"][0, :30, 0].tolist(), list(range(20)) + list(range(10)))
+        self.assertEqual(finalized["semantic"][1, :10, 0].tolist(), list(range(10)))
 
 
 if __name__ == "__main__":

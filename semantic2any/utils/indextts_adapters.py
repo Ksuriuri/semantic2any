@@ -25,7 +25,11 @@ from semantic2any.data.s2mel_dataset import (
     choose_prompt_len,
     collate_paired_features,
 )
-from semantic2any.third_party.indextts import CAMPPlus, mel_spectrogram
+from semantic2any.third_party.indextts import (
+    CAMPPlus,
+    mel_spectrogram,
+    mel_spectrogram_batch,
+)
 
 DEFAULT_PROMPT_BANDWIDTH_AUG_PROB = 0.3
 DEFAULT_PROMPT_BANDWIDTH_AUG_RATES = (16000, 22050)
@@ -175,6 +179,7 @@ class S2MelFeatureAdapter(nn.Module):
         self.sample_rate_16k = int(_get(data_cfg, "sample_rate_16k", 16000))
         self.sample_rate_mel = int(_get(data_cfg, "sample_rate_mel", self.mel_args["sampling_rate"]))
         self.feature_batch_size = max(1, int(_get(data_cfg, "feature_batch_size", 16)))
+        self.mel_batch_size = max(1, int(_get(data_cfg, "mel_batch_size", 2)))
         self.prompt_bandwidth_aug_prob = float(
             _get(data_cfg, "prompt_bandwidth_aug_prob", DEFAULT_PROMPT_BANDWIDTH_AUG_PROB)
         )
@@ -256,6 +261,35 @@ class S2MelFeatureAdapter(nn.Module):
                 raise ValueError(f"Invalid semantic code length {value}")
             outputs.append(decoded[index, :value].float())
         return outputs
+
+    @torch.no_grad()
+    def finalize_worker_paired_batch(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
+        """Move worker-built CPU mels to device and decode discrete semantic ids."""
+        if "semantic" not in batch or "semantic_lens" not in batch:
+            raise ValueError("Worker paired batch must contain semantic code ids and lengths")
+        semantic_ids = batch["semantic"]
+        semantic_lens = batch["semantic_lens"]
+        if torch.is_floating_point(semantic_ids):
+            raise TypeError("Worker paired batch semantic payload must be discrete code ids")
+        semantics = self._semantic_from_codes(semantic_ids, semantic_lens)
+        device = self._module_device()
+        out = dict(batch)
+        out["semantic"] = pad_sequence(
+            semantics,
+            batch_first=True,
+            padding_value=0.0,
+        ).to(device)
+        for key in (
+            "mel",
+            "mel_lens",
+            "semantic_lens",
+            "style",
+            "prompt_lens",
+            "prompt_semantic_lens",
+        ):
+            if key in out and isinstance(out[key], torch.Tensor):
+                out[key] = out[key].to(device)
+        return out
 
     @torch.no_grad()
     def _semantic_from_audio(self, audio_16k: torch.Tensor) -> torch.Tensor:
@@ -879,18 +913,28 @@ class S2MelFeatureAdapter(nn.Module):
         prompt_features: list[dict[str, torch.Tensor]] = []
         target_features: list[dict[str, torch.Tensor]] = []
         device = self._module_device()
-        for index, singleton_split in enumerate(singleton_splits):
+        mel_inputs: list[torch.Tensor] = []
+        for index in range(batch_size):
             prompt_mel_waveform = self._maybe_limit_prompt_bandwidth(
                 mel_waveforms[2 * index],
                 self.sample_rate_mel,
                 enabled=apply_prompt_bandwidth_aug,
             )
-            prompt_mel = self.mel_spectrogram(
-                prompt_mel_waveform.float(), **self.mel_args
-            ).squeeze(0)
-            target_mel = self.mel_spectrogram(
-                mel_waveforms[2 * index + 1].float(), **self.mel_args
-            ).squeeze(0)
+            mel_inputs.extend([prompt_mel_waveform, mel_waveforms[2 * index + 1]])
+        if self.mel_spectrogram is mel_spectrogram:
+            batched_mels = mel_spectrogram_batch(
+                mel_inputs,
+                batch_size=getattr(self, "mel_batch_size", 2),
+                **self.mel_args,
+            )
+        else:
+            batched_mels = [
+                self.mel_spectrogram(waveform.float(), **self.mel_args).squeeze(0)
+                for waveform in mel_inputs
+            ]
+        for index, singleton_split in enumerate(singleton_splits):
+            prompt_mel = batched_mels[2 * index]
+            target_mel = batched_mels[2 * index + 1]
             if code_mode:
                 assert full_prompt_semantics is not None
                 assert full_target_semantics is not None

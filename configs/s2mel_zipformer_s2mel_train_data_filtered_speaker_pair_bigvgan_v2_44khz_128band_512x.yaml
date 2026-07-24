@@ -36,8 +36,12 @@ data:
   num_workers: 8
   prefetch_factor: 2
   decode_audio_in_worker: true
+  extract_mel_in_worker: false
+  length_bucketed_batches: true
+  length_bucket_boundaries: [8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50]
   skip_audio_errors: true
   feature_batch_size: 16
+  mel_batch_size: 4
   async_feature_extraction: false
   preload_features: false
   preload_batch_size: 16

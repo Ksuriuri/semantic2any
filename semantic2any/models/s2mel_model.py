@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import torch
 from torch import nn
-from torch.nn.utils.rnn import pad_sequence
 
 from semantic2any.models.flow_matching import CFM
 from semantic2any.models.length_regulator import InterpolateRegulator
@@ -69,24 +68,28 @@ class Semantic2MelModel(nn.Module):
         starts: torch.Tensor,
         lengths: torch.Tensor,
     ) -> torch.Tensor:
+        max_length = int(lengths.max().item())
+        positions = torch.arange(max_length, device=semantic.device)
+        source_indices = starts.unsqueeze(1) + positions.unsqueeze(0)
+        valid = positions.unsqueeze(0) < lengths.unsqueeze(1)
         if torch.is_floating_point(semantic):
-            segments = [
-                semantic[index, int(start.item()) : int((start + length).item())]
-                for index, (start, length) in enumerate(zip(starts, lengths, strict=True))
-            ]
-            return pad_sequence(segments, batch_first=True, padding_value=0.0)
+            if semantic.ndim != 3:
+                raise ValueError("Continuous semantic batch must be [B, T, C]")
+            indices = source_indices.clamp_max(semantic.size(1) - 1)
+            segments = semantic.gather(
+                1,
+                indices.unsqueeze(-1).expand(-1, -1, semantic.size(-1)),
+            )
+            return segments.masked_fill(~valid.unsqueeze(-1), 0)
 
         if semantic.ndim != 3:
             raise ValueError("Discrete semantic batch must be [B, Q, T]")
-        max_length = int(lengths.max().item())
-        segments = semantic.new_zeros(semantic.size(0), semantic.size(1), max_length)
-        for index, (start, length) in enumerate(zip(starts, lengths, strict=True)):
-            start_value = int(start.item())
-            length_value = int(length.item())
-            segments[index, :, :length_value] = semantic[
-                index, :, start_value : start_value + length_value
-            ]
-        return segments
+        indices = source_indices.clamp_max(semantic.size(-1) - 1)
+        segments = semantic.gather(
+            2,
+            indices.unsqueeze(1).expand(-1, semantic.size(1), -1),
+        )
+        return segments.masked_fill(~valid.unsqueeze(1), 0)
 
     def build_paired_condition(
         self,
@@ -95,6 +98,7 @@ class Semantic2MelModel(nn.Module):
         prompt_lens: torch.Tensor,
         semantic_lens: torch.Tensor,
         prompt_semantic_lens: torch.Tensor,
+        max_mel_frames: int | None = None,
     ) -> torch.Tensor:
         """Length-regulate prompt and target independently across the utterance boundary."""
         target_lens = mel_lens - prompt_lens
@@ -125,19 +129,30 @@ class Semantic2MelModel(nn.Module):
             semantic_lens=target_semantic_lens,
         )
 
-        mu = prompt_mu.new_zeros(
-            prompt_mu.size(0), int(mel_lens.max().item()), prompt_mu.size(-1)
+        total_frames = (
+            int(max_mel_frames)
+            if max_mel_frames is not None
+            else int(mel_lens.max().item())
         )
-        for index, (prompt_len, target_len) in enumerate(
-            zip(prompt_lens, target_lens, strict=True)
-        ):
-            prompt_length = int(prompt_len.item())
-            target_length = int(target_len.item())
-            mu[index, :prompt_length] = prompt_mu[index, :prompt_length]
-            mu[index, prompt_length : prompt_length + target_length] = target_mu[
-                index, :target_length
-            ]
-        return mu
+        positions = torch.arange(total_frames, device=prompt_mu.device)
+        prompt_positions = positions.unsqueeze(0).expand(prompt_mu.size(0), -1)
+        target_positions = prompt_positions - prompt_lens.unsqueeze(1)
+        prompt_values = prompt_mu.gather(
+            1,
+            prompt_positions.clamp_max(prompt_mu.size(1) - 1)
+            .unsqueeze(-1)
+            .expand(-1, -1, prompt_mu.size(-1)),
+        )
+        target_values = target_mu.gather(
+            1,
+            target_positions.clamp(min=0, max=target_mu.size(1) - 1)
+            .unsqueeze(-1)
+            .expand(-1, -1, target_mu.size(-1)),
+        )
+        prompt_mask = prompt_positions < prompt_lens.unsqueeze(1)
+        valid_mask = prompt_positions < mel_lens.unsqueeze(1)
+        mu = torch.where(prompt_mask.unsqueeze(-1), prompt_values, target_values)
+        return mu.masked_fill(~valid_mask.unsqueeze(-1), 0)
 
     def forward(
         self,
@@ -161,6 +176,7 @@ class Semantic2MelModel(nn.Module):
                 prompt_lens,
                 semantic_lens,
                 prompt_semantic_lens,
+                max_mel_frames=mel.size(-1),
             )
         else:
             mu = self.build_condition(

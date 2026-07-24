@@ -150,12 +150,13 @@ class BASECFM(nn.Module, ABC):
         prompt = torch.zeros_like(x1)
         y = y.clone()
         mu = mu.clone()
-        for idx in range(batch):
-            prompt_len = int(prompt_lens[idx].item())
-            prompt[idx, :, :prompt_len] = x1[idx, :, :prompt_len]
-            y[idx, :, :prompt_len] = 0
-            if self.zero_prompt_speech_token:
-                mu[idx, :prompt_len] = 0
+        positions = torch.arange(x1.size(-1), device=x1.device)
+        prompt_mask = positions.unsqueeze(0) < prompt_lens.unsqueeze(1)
+        prompt_mask_channels = prompt_mask.unsqueeze(1)
+        prompt = torch.where(prompt_mask_channels, x1, prompt)
+        y = y.masked_fill(prompt_mask_channels, 0)
+        if self.zero_prompt_speech_token:
+            mu = mu.masked_fill(prompt_mask.unsqueeze(-1), 0)
 
         estimator_out = self.estimator(
             y,
@@ -167,17 +168,26 @@ class BASECFM(nn.Module, ABC):
             prompt_lens=prompt_lens,
         )
 
-        losses = []
-        for idx in range(batch):
-            start = int(prompt_lens[idx].item())
-            end = int(x_lens[idx].item())
-            if end <= start:
-                continue
-            losses.append(self.criterion(estimator_out[idx, :, start:end], velocity[idx, :, start:end]))
-        if not losses:
-            loss = estimator_out.sum() * 0
-        else:
-            loss = torch.stack(losses).mean()
+        loss_mask = (
+            (positions.unsqueeze(0) >= prompt_lens.unsqueeze(1))
+            & (positions.unsqueeze(0) < x_lens.unsqueeze(1))
+        )
+        difference = estimator_out - velocity
+        element_loss = (
+            difference.square()
+            if isinstance(self.criterion, nn.MSELoss)
+            else difference.abs()
+        )
+        masked_loss = element_loss * loss_mask.unsqueeze(1)
+        denominators = (
+            loss_mask.sum(dim=1).clamp_min(1).to(element_loss.dtype)
+            * estimator_out.size(1)
+        )
+        per_sample_loss = masked_loss.sum(dim=(1, 2)) / denominators
+        valid_samples = x_lens > prompt_lens
+        loss = (
+            per_sample_loss * valid_samples.to(per_sample_loss.dtype)
+        ).sum() / valid_samples.sum().clamp_min(1)
 
         return loss, estimator_out + (1 - self.sigma_min) * noise
 

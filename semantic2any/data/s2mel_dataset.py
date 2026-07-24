@@ -16,12 +16,17 @@ import numpy as np
 import torch
 import torchaudio
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
+
+from semantic2any.data.prompt_bandwidth import simulate_lower_sample_rate
+from semantic2any.third_party.indextts import mel_spectrogram
 
 
 DEFAULT_MAX_AUDIO_SECONDS = 30.0
 DEFAULT_MAX_PAIR_SECONDS = 50.0
 DEFAULT_MAX_PROMPT_SECONDS = 20.0
+DEFAULT_PROMPT_BANDWIDTH_AUG_PROB = 0.3
+DEFAULT_PROMPT_BANDWIDTH_AUG_RATES = (16000, 22050)
 _SEMANTIC_CODE_MEMMAPS: dict[str, np.memmap] = {}
 
 
@@ -510,6 +515,7 @@ class S2MelSpeakerPairedDataset(Dataset):
         max_target_seconds: float,
         hop_length: int,
         sample_rate: int,
+        seed: int = 0,
     ) -> None:
         self.target_dataset = target_dataset
         target_records = _dataset_records(target_dataset)
@@ -595,9 +601,42 @@ class S2MelSpeakerPairedDataset(Dataset):
         self.sample_rate = int(sample_rate)
         self.prompt_groups = dict(prompt_groups)
         self.target_records = target_records
+        self.seed = int(seed)
 
     def __len__(self) -> int:
         return len(self.target_indices)
+
+    def _select_prompt_index(self, index: int, target_index: int) -> int:
+        target_identity = _record_identity(
+            self.target_records[target_index],
+            target_index,
+        )
+        group = self.prompt_groups[self.target_speaker_ids[index]]
+        rng = random.Random(self.seed + index)
+        start = rng.randrange(len(group))
+        for offset in range(len(group)):
+            candidate_index = group[(start + offset) % len(group)]
+            if (
+                _record_identity(
+                    self.target_records[candidate_index],
+                    candidate_index,
+                )
+                != target_identity
+            ):
+                return candidate_index
+        raise RuntimeError("Paired sample has no distinct same-speaker prompt")
+
+    def estimated_sample_seconds(self, index: int) -> float:
+        target_index = self.target_indices[index]
+        target_record = self.target_records[target_index]
+        duration = float(target_record.get("duration", self.max_target_seconds))
+        if self.singleton_splits[index]:
+            return duration
+        prompt_index = self._select_prompt_index(index, target_index)
+        prompt_duration = float(
+            self.target_records[prompt_index].get("duration", self.max_prompt_seconds)
+        )
+        return duration + min(prompt_duration, self.max_prompt_seconds)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         target_index = self.target_indices[index]
@@ -606,29 +645,7 @@ class S2MelSpeakerPairedDataset(Dataset):
         if singleton_split:
             prompt = target
         else:
-            target_identity = _record_identity(
-                self.target_records[target_index],
-                target_index,
-            )
-            group = self.prompt_groups[self.target_speaker_ids[index]]
-            for _ in range(8):
-                prompt_index = random.choice(group)
-                prompt_identity = _record_identity(
-                    self.target_records[prompt_index],
-                    prompt_index,
-                )
-                if prompt_identity != target_identity:
-                    break
-            else:
-                prompt_index = next(
-                    candidate_index
-                    for candidate_index in group
-                    if _record_identity(
-                        self.target_records[candidate_index],
-                        candidate_index,
-                    )
-                    != target_identity
-                )
+            prompt_index = self._select_prompt_index(index, target_index)
             prompt = self.target_dataset[prompt_index]
         return {
             "prompt": prompt,
@@ -636,6 +653,80 @@ class S2MelSpeakerPairedDataset(Dataset):
             "speaker_id": target["speaker_id"],
             "singleton_split": singleton_split,
         }
+
+
+class LengthBucketBatchSampler(Sampler[list[int]]):
+    """Yield same-bucket batch groups for Accelerate/DDP sharding."""
+
+    def __init__(
+        self,
+        lengths: list[float],
+        *,
+        batch_size: int,
+        world_size: int,
+        boundaries: list[float],
+        seed: int = 0,
+        drop_last: bool = True,
+        shuffle: bool = True,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if world_size <= 0:
+            raise ValueError("world_size must be positive")
+        self.lengths = [float(length) for length in lengths]
+        self.batch_size = int(batch_size)
+        self.world_size = int(world_size)
+        self.boundaries = sorted(float(boundary) for boundary in boundaries)
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self.shuffle = bool(shuffle)
+        self.epoch = 0
+        self._length = len(self._build_batches())
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def _bucket_id(self, length: float) -> int:
+        for index, boundary in enumerate(self.boundaries):
+            if length <= boundary:
+                return index
+        return len(self.boundaries)
+
+    def _build_batches(self) -> list[list[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        buckets: dict[int, list[int]] = defaultdict(list)
+        for index, length in enumerate(self.lengths):
+            buckets[self._bucket_id(length)].append(index)
+
+        groups: list[list[list[int]]] = []
+        for bucket_indices in buckets.values():
+            indices = list(bucket_indices)
+            if self.shuffle:
+                rng.shuffle(indices)
+            local_batches = [
+                indices[start : start + self.batch_size]
+                for start in range(0, len(indices), self.batch_size)
+            ]
+            if self.drop_last:
+                local_batches = [
+                    batch for batch in local_batches if len(batch) == self.batch_size
+                ]
+            else:
+                local_batches = [batch for batch in local_batches if batch]
+            usable = (len(local_batches) // self.world_size) * self.world_size
+            local_batches = local_batches[:usable]
+            for start in range(0, len(local_batches), self.world_size):
+                groups.append(local_batches[start : start + self.world_size])
+
+        if self.shuffle:
+            rng.shuffle(groups)
+        return [batch for group in groups for batch in group]
+
+    def __iter__(self):
+        yield from self._build_batches()
+
+    def __len__(self) -> int:
+        return self._length
 
 
 def _normalize_mel(mel: torch.Tensor) -> torch.Tensor:
@@ -815,6 +906,14 @@ class S2MelCollator:
         max_audio_seconds: float | None = DEFAULT_MAX_AUDIO_SECONDS,
         expected_semantic_codec: str | None = None,
         expected_semantic_fingerprint: str | None = None,
+        extract_mel_in_worker: bool = False,
+        mel_n_fft: int = 2048,
+        mel_win_length: int = 2048,
+        mel_n_mels: int = 128,
+        mel_fmin: float = 0.0,
+        mel_fmax: float | None = None,
+        prompt_bandwidth_aug_prob: float = DEFAULT_PROMPT_BANDWIDTH_AUG_PROB,
+        prompt_bandwidth_aug_rates: tuple[int, ...] = DEFAULT_PROMPT_BANDWIDTH_AUG_RATES,
     ) -> None:
         self.hop_length = hop_length
         self.sample_rate = sample_rate
@@ -830,6 +929,19 @@ class S2MelCollator:
         self.max_audio_seconds = max_audio_seconds
         self.expected_semantic_codec = expected_semantic_codec
         self.expected_semantic_fingerprint = expected_semantic_fingerprint
+        self.extract_mel_in_worker = extract_mel_in_worker
+        self.mel_args = {
+            "n_fft": int(mel_n_fft),
+            "num_mels": int(mel_n_mels),
+            "sampling_rate": int(sample_rate),
+            "hop_size": int(hop_length),
+            "win_size": int(mel_win_length),
+            "fmin": float(mel_fmin),
+            "fmax": mel_fmax,
+            "center": False,
+        }
+        self.prompt_bandwidth_aug_prob = float(prompt_bandwidth_aug_prob)
+        self.prompt_bandwidth_aug_rates = tuple(int(rate) for rate in prompt_bandwidth_aug_rates)
 
     def _validate_precomputed_metadata(self, records: list[dict[str, Any]]) -> None:
         if self.expected_semantic_codec is None:
@@ -896,6 +1008,146 @@ class S2MelCollator:
             sample_rates.append(sample_rate)
             valid_indices.append(index)
         return waveforms, sample_rates, valid_indices
+
+    def _resample_to_mel_rate(self, waveform: torch.Tensor, sample_rate: int) -> torch.Tensor:
+        sample_rate = int(sample_rate)
+        if sample_rate == self.sample_rate:
+            return waveform
+        return torchaudio.functional.resample(waveform, sample_rate, self.sample_rate)
+
+    def _maybe_limit_prompt_bandwidth(self, waveform: torch.Tensor) -> torch.Tensor:
+        if self.prompt_bandwidth_aug_prob <= 0.0 or not self.prompt_bandwidth_aug_rates:
+            return waveform
+        if random.random() >= self.prompt_bandwidth_aug_prob:
+            return waveform
+        rate = random.choice(self.prompt_bandwidth_aug_rates)
+        return simulate_lower_sample_rate(waveform, self.sample_rate, rate)
+
+    def _mel_from_waveform(self, waveform: torch.Tensor) -> torch.Tensor:
+        return mel_spectrogram(waveform.float(), **self.mel_args).squeeze(0).cpu()
+
+    def _attach_paired_worker_features(
+        self,
+        batch: dict[str, Any],
+        *,
+        prompt_waveforms: list[torch.Tensor],
+        prompt_sample_rates: list[int],
+        target_waveforms: list[torch.Tensor],
+        target_sample_rates: list[int],
+    ) -> None:
+        if self.min_target_seconds is None or self.max_target_seconds is None:
+            raise ValueError("Worker paired mel extraction requires target duration bounds")
+        if self.max_prompt_seconds is None:
+            raise ValueError("Worker paired mel extraction requires max_prompt_seconds")
+        singleton_splits = [bool(value) for value in batch["singleton_splits"]]
+        if not (
+            len(prompt_waveforms)
+            == len(prompt_sample_rates)
+            == len(target_waveforms)
+            == len(target_sample_rates)
+            == len(singleton_splits)
+        ):
+            raise ValueError("Decoded paired audio fields must have matching lengths")
+
+        prompt_codes = batch["prompt_semantic_codes"]
+        prompt_code_lens = batch["prompt_semantic_code_lens"]
+        target_codes = batch["target_semantic_codes"]
+        target_code_lens = batch["target_semantic_code_lens"]
+        prompt_features: list[dict[str, torch.Tensor]] = []
+        target_features: list[dict[str, torch.Tensor]] = []
+        style = torch.zeros(192, dtype=torch.float32)
+
+        for index, singleton_split in enumerate(singleton_splits):
+            if singleton_split:
+                source = target_waveforms[index]
+                source_rate = int(target_sample_rates[index])
+                source_samples = source.size(-1)
+                min_prompt_samples = math.ceil(self.min_pair_prompt_seconds * source_rate)
+                min_target_samples = math.ceil(self.min_target_seconds * source_rate)
+                max_prompt_samples = int(self.max_prompt_seconds * source_rate)
+                lower_sample = min_prompt_samples
+                upper_sample = min(max_prompt_samples, source_samples - min_target_samples)
+                if upper_sample < lower_sample:
+                    raise ValueError("Singleton audio is too short for worker-side paired mel extraction")
+
+                code_length = int(target_code_lens[index])
+                lower_code = max(1, math.ceil(lower_sample * code_length / source_samples))
+                upper_code = min(
+                    code_length - 1,
+                    math.floor(upper_sample * code_length / source_samples),
+                )
+                if upper_code < lower_code:
+                    raise ValueError("Singleton audio has too few semantic frames for worker extraction")
+                split_code = lower_code if upper_code == lower_code else random.randint(lower_code, upper_code)
+                split_sample = round(split_code * source_samples / code_length)
+                split_sample = max(lower_sample, min(upper_sample, split_sample))
+
+                prompt_segment = source[:, :split_sample]
+                target_segment = source[:, split_sample:]
+                prompt_code_ids = target_codes[index, :split_code]
+                target_code_ids = target_codes[index, split_code:code_length]
+                prompt_rate = source_rate
+                target_rate = source_rate
+            else:
+                prompt_source = prompt_waveforms[index]
+                prompt_rate = int(prompt_sample_rates[index])
+                target_segment = target_waveforms[index]
+                target_rate = int(target_sample_rates[index])
+                prompt_samples = min(
+                    prompt_source.size(-1),
+                    int(self.max_prompt_seconds * prompt_rate),
+                )
+                if prompt_samples < math.ceil(self.min_pair_prompt_seconds * prompt_rate):
+                    raise ValueError("Prompt audio is too short for worker-side paired mel extraction")
+                target_seconds = target_segment.size(-1) / target_rate
+                if target_seconds < self.min_target_seconds:
+                    raise ValueError("Target audio is too short for worker-side paired mel extraction")
+                if target_seconds > self.max_target_seconds + (1.0 / target_rate):
+                    raise ValueError("Target audio exceeds worker-side paired mel duration limit")
+
+                prompt_segment = prompt_source[:, :prompt_samples]
+                full_prompt_len = int(prompt_code_lens[index])
+                prompt_keep = max(
+                    1,
+                    min(
+                        full_prompt_len,
+                        round(full_prompt_len * prompt_samples / prompt_source.size(-1)),
+                    ),
+                )
+                prompt_code_ids = prompt_codes[index, :prompt_keep]
+                target_code_ids = target_codes[index, : int(target_code_lens[index])]
+
+            prompt_mel_waveform = self._resample_to_mel_rate(prompt_segment, prompt_rate)
+            prompt_mel_waveform = self._maybe_limit_prompt_bandwidth(prompt_mel_waveform)
+            target_mel_waveform = self._resample_to_mel_rate(target_segment, target_rate)
+            prompt_features.append(
+                {
+                    "mel": self._mel_from_waveform(prompt_mel_waveform),
+                    "semantic": prompt_code_ids.long(),
+                    "style": style,
+                }
+            )
+            target_features.append(
+                {
+                    "mel": self._mel_from_waveform(target_mel_waveform),
+                    "semantic": target_code_ids.long(),
+                    "style": style,
+                }
+            )
+
+        worker_batch = collate_paired_features(
+            prompt_features,
+            target_features,
+            hop_length=self.hop_length,
+            sample_rate=self.sample_rate,
+            max_pair_seconds=self.max_prompt_seconds + self.max_target_seconds,
+            min_prompt_seconds=self.min_pair_prompt_seconds,
+            min_generated_frames=self.min_generated_frames,
+            records=batch.get("records"),
+            is_precomputed=False,
+        )
+        batch.update(worker_batch)
+        batch["worker_precomputed_mel"] = True
 
     @staticmethod
     def _has_precomputed(record: dict[str, Any]) -> bool:
@@ -1181,6 +1433,18 @@ class S2MelCollator:
                 )
             if all(has_semantic_codes):
                 self._attach_paired_semantic_codes(batch, records)
+                if self.extract_mel_in_worker:
+                    if not self.decode_audio_in_worker:
+                        raise ValueError(
+                            "extract_mel_in_worker requires decode_audio_in_worker=true"
+                        )
+                    self._attach_paired_worker_features(
+                        batch,
+                        prompt_waveforms=batch.pop("prompt_audio_waveforms"),
+                        prompt_sample_rates=batch.pop("prompt_audio_sample_rates"),
+                        target_waveforms=batch.pop("target_audio_waveforms"),
+                        target_sample_rates=batch.pop("target_audio_sample_rates"),
+                    )
             return batch
 
         has_precomputed = [self._has_precomputed(record) for record in records]

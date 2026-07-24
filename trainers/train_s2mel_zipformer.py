@@ -26,6 +26,7 @@ from semantic2any.data.s2mel_dataset import (
     DEFAULT_MAX_AUDIO_SECONDS,
     DEFAULT_MAX_PAIR_SECONDS,
     DEFAULT_MAX_PROMPT_SECONDS,
+    LengthBucketBatchSampler,
     S2MelCollator,
     S2MelInMemoryDataset,
     S2MelJsonlDataset,
@@ -262,6 +263,36 @@ def make_source_dataset(cfg, source: str, *, speechdata: bool = False) -> Datase
     return S2MelJsonlDataset(source)
 
 
+def _dataset_length_estimates(dataset: Dataset) -> list[float]:
+    estimate_fn = getattr(dataset, "estimated_sample_seconds", None)
+    if callable(estimate_fn):
+        return [float(estimate_fn(index)) for index in range(len(dataset))]
+    records = getattr(dataset, "records", None)
+    if isinstance(records, list) and len(records) == len(dataset):
+        lengths = []
+        for record in records:
+            duration = record.get("duration") if isinstance(record, dict) else None
+            lengths.append(float(duration) if isinstance(duration, (int, float)) else 0.0)
+        return lengths
+    return [0.0] * len(dataset)
+
+
+def _set_loader_epoch(loader: DataLoader, epoch: int) -> None:
+    seen: set[int] = set()
+
+    def visit(obj) -> None:
+        if obj is None or id(obj) in seen:
+            return
+        seen.add(id(obj))
+        setter = getattr(obj, "set_epoch", None)
+        if callable(setter):
+            setter(epoch)
+        visit(getattr(obj, "batch_sampler", None))
+        visit(getattr(obj, "sampler", None))
+
+    visit(loader)
+
+
 def make_dataloader(
     cfg,
     source: str,
@@ -270,11 +301,14 @@ def make_dataloader(
     speechdata: bool = False,
     persistent_workers: bool = True,
     dataset: Dataset | None = None,
+    world_size: int = 1,
 ) -> DataLoader:
     if dataset is None:
         dataset = make_source_dataset(cfg, source, speechdata=speechdata)
     spect = cfg.preprocess_params.spect_params
     codec = semantic_codec_info(cfg)
+    mel_fmax = _get(spect, "fmax", "None")
+    mel_fmax = None if mel_fmax in (None, "None") else float(mel_fmax)
     collator = S2MelCollator(
         hop_length=int(spect.hop_length),
         sample_rate=int(cfg.preprocess_params.sr),
@@ -296,6 +330,19 @@ def make_dataloader(
         ),
         expected_semantic_codec=codec.name,
         expected_semantic_fingerprint=codec.fingerprint(),
+        extract_mel_in_worker=bool(_get(cfg.data, "extract_mel_in_worker", False)),
+        mel_n_fft=int(_get(spect, "n_fft", 2048)),
+        mel_win_length=int(_get(spect, "win_length", 2048)),
+        mel_n_mels=int(_get(spect, "n_mels", 128)),
+        mel_fmin=float(_get(spect, "fmin", 0.0)),
+        mel_fmax=mel_fmax,
+        prompt_bandwidth_aug_prob=float(
+            _get(cfg.data, "prompt_bandwidth_aug_prob", 0.3)
+        ),
+        prompt_bandwidth_aug_rates=tuple(
+            int(rate)
+            for rate in _get(cfg.data, "prompt_bandwidth_aug_rates", (16000, 22050))
+        ),
     )
     kwargs: dict[str, Any] = {}
     if int(cfg.data.num_workers) > 0:
@@ -303,6 +350,29 @@ def make_dataloader(
         # Validation loaders re-create workers per pass so that the seeded RNG
         # fork in validate() also controls worker seeding (deterministic prompts).
         kwargs["persistent_workers"] = persistent_workers
+    use_buckets = bool(_get(cfg.data, "length_bucketed_batches", False)) and shuffle
+    if use_buckets:
+        boundaries = [
+            float(value)
+            for value in _get(cfg.data, "length_bucket_boundaries", (8, 12, 16, 20, 24, 28, 32, 40, 50))
+        ]
+        batch_sampler = LengthBucketBatchSampler(
+            _dataset_length_estimates(dataset),
+            batch_size=int(cfg.train.batch_size),
+            world_size=int(world_size),
+            boundaries=boundaries,
+            seed=int(cfg.seed),
+            drop_last=True,
+            shuffle=True,
+        )
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=int(cfg.data.num_workers),
+            collate_fn=collator,
+            pin_memory=bool(_get(cfg.data, "pin_memory", True)),
+            **kwargs,
+        )
     return DataLoader(
         dataset,
         batch_size=int(cfg.train.batch_size),
@@ -407,6 +477,7 @@ def make_speaker_paired_dataset(
         max_target_seconds=max_target_seconds,
         hop_length=int(spect.hop_length),
         sample_rate=int(cfg.preprocess_params.sr),
+        seed=int(cfg.seed),
     )
 
 
@@ -543,6 +614,8 @@ def build_training_batch(
         raise ValueError(
             "Cannot mix online semantic batches with precomputed semantic-code batches"
         )
+    if batch.get("worker_precomputed_mel", False):
+        return feature_adapter_ref[0].finalize_worker_paired_batch(batch)
     if batch.get("is_paired", False):
         return feature_adapter_ref[0].extract_paired_from_audio_paths(
             batch["prompt_audio_paths"],
@@ -921,6 +994,7 @@ def main() -> None:
         shuffle=True,
         speechdata=train_is_speechdata,
         dataset=train_dataset,
+        world_size=accelerator.num_processes,
     )
     valid_loader = (
         make_dataloader(
@@ -1029,6 +1103,7 @@ def main() -> None:
             break
         epoch_step = 0
         epoch_loader = train_loader
+        _set_loader_epoch(train_loader, epoch)
         if epoch == start_epoch and resume_epoch_step > 0:
             skip_batches = resume_epoch_step * int(cfg.train.grad_accumulation)
             epoch_loader = accelerator.skip_first_batches(train_loader, skip_batches)
