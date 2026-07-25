@@ -130,6 +130,49 @@ class SpeakerPairDatasetTest(unittest.TestCase):
         self.assertEqual(paired.singleton_target_count, 1)
         self.assertEqual(paired.too_short_target_count, 1)
 
+    def test_pairing_key_keeps_languages_separate(self) -> None:
+        dataset = S2MelInMemoryDataset(
+            [
+                {
+                    "id": "paimon-en-1",
+                    "audio_path": "Genshin/en/a.flac",
+                    "speaker_id": "Genshin__派蒙",
+                    "language": "en",
+                    "duration": 6.0,
+                },
+                {
+                    "id": "paimon-en-2",
+                    "audio_path": "Genshin/en/b.flac",
+                    "speaker_id": "Genshin__派蒙",
+                    "language": "en",
+                    "duration": 6.0,
+                },
+                {
+                    "id": "paimon-ja-1",
+                    "audio_path": "Genshin/ja/a.flac",
+                    "speaker_id": "Genshin__派蒙",
+                    "language": "ja",
+                    "duration": 6.0,
+                },
+            ]
+        )
+        paired = S2MelSpeakerPairedDataset(
+            dataset,
+            min_prompt_seconds=3.0,
+            max_prompt_seconds=20.0,
+            min_target_seconds=3.0,
+            max_target_seconds=30.0,
+            hop_length=1,
+            sample_rate=1,
+        )
+
+        self.assertEqual(paired.paired_target_count, 2)
+        self.assertEqual(paired.singleton_target_count, 1)
+        for index in range(len(paired)):
+            item = paired[index]
+            if not item["singleton_split"]:
+                self.assertEqual(item["prompt"]["language"], item["target"]["language"])
+
     def test_singleton_must_fit_both_minimum_segments(self) -> None:
         dataset = S2MelInMemoryDataset(
             [

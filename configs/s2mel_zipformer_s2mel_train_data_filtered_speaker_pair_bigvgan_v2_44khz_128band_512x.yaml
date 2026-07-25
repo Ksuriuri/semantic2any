@@ -33,7 +33,7 @@ data:
   semantic_fps: 50.0
   sample_rate_16k: 16000
   sample_rate_mel: 44100
-  num_workers: 8
+  num_workers: 2
   prefetch_factor: 2
   decode_audio_in_worker: true
   extract_mel_in_worker: false

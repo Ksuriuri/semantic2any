@@ -466,6 +466,28 @@ def _record_identity(record: dict[str, Any], index: int) -> str:
     return f"index:{index}"
 
 
+def _record_dataset_name(record: dict[str, Any]) -> str:
+    for key in ("dataset", "source_dataset"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    audio_path = record.get("audio_path")
+    if isinstance(audio_path, str) and audio_path:
+        marker = "/s2mel-train-data-filtered/"
+        if marker in audio_path:
+            return audio_path.split(marker, 1)[1].split("/", 1)[0]
+        parts = audio_path.replace("\\", "/").split("/")
+        if len(parts) >= 2:
+            return parts[-2]
+    return ""
+
+
+def _record_pairing_key(record: dict[str, Any], speaker_id: str) -> str:
+    dataset = _record_dataset_name(record)
+    language = record.get("language") or record.get("lang") or ""
+    return "\x1f".join(str(part) for part in (dataset, language, speaker_id) if part)
+
+
 def _record_can_be_prompt(
     record: dict[str, Any],
     *,
@@ -541,11 +563,12 @@ class S2MelSpeakerPairedDataset(Dataset):
                 continue
             if float(duration) >= min_prompt_seconds:
                 identity = _record_identity(record, index)
-                prompt_groups[speaker_id].append(index)
-                prompt_identities[speaker_id].add(identity)
+                pairing_key = _record_pairing_key(record, speaker_id)
+                prompt_groups[pairing_key].append(index)
+                prompt_identities[pairing_key].add(identity)
 
         self.target_indices: list[int] = []
-        self.target_speaker_ids: list[str] = []
+        self.target_pairing_keys: list[str] = []
         self.singleton_splits: list[bool] = []
         self.paired_target_count = 0
         self.singleton_target_count = 0
@@ -566,8 +589,9 @@ class S2MelSpeakerPairedDataset(Dataset):
             if duration > max_target_seconds:
                 self.overlong_target_count += 1
                 continue
+            pairing_key = _record_pairing_key(target_record, speaker_id)
             target_identity = _record_identity(target_record, target_index)
-            identities = prompt_identities.get(speaker_id, set())
+            identities = prompt_identities.get(pairing_key, set())
             singleton_split = not identities or identities == {target_identity}
             if singleton_split:
                 if duration < min_prompt_seconds + min_target_seconds:
@@ -581,7 +605,7 @@ class S2MelSpeakerPairedDataset(Dataset):
                     self.unusable_target_count += 1
                     continue
             self.target_indices.append(target_index)
-            self.target_speaker_ids.append(speaker_id)
+            self.target_pairing_keys.append(pairing_key)
             self.singleton_splits.append(singleton_split)
             self.singleton_target_count += int(singleton_split)
             self.paired_target_count += int(not singleton_split)
@@ -611,7 +635,7 @@ class S2MelSpeakerPairedDataset(Dataset):
             self.target_records[target_index],
             target_index,
         )
-        group = self.prompt_groups[self.target_speaker_ids[index]]
+        group = self.prompt_groups[self.target_pairing_keys[index]]
         rng = random.Random(self.seed + index)
         start = rng.randrange(len(group))
         for offset in range(len(group)):
