@@ -8,8 +8,9 @@
 |------|------|
 | `prepare_vctk_refs.py` | 从 VCTK manifest 准备评估参考集（输入音频 + 截掉 prompt 后的参考尾段） |
 | `run_eval.sh` | 针对单个 checkpoint 运行推理 + 指标计算的完整流程 |
-| `paired_metrics.py` | 计算 SI-SDR 和 LSD（不需要 GPU 或外部依赖） |
-| `summarize_eval.py` | 将多个 run 的指标 JSON 汇总为一张 TSV/JSON 对比表 |
+| `paired_metrics.py` | 计算 SI-SDR、全频 LSD、低频 LSD (20 Hz–4 kHz)、高频 LSD（不需要 GPU） |
+| `summarize_eval.py` | 将多个 run 的指标 JSON 汇总为一张 TSV/JSON 对比表（列顺序与评估 sheet 一致） |
+| `plot_metrics.py` | 从 summarize_eval.py 的 JSON 输出生成各指标随训练步数的折线图 PNG |
 
 ## 依赖
 
@@ -99,7 +100,25 @@ uv run python eval/summarize_eval.py \
   --out-json metrics/summary.json
 ```
 
-输出列：`run`、`pairs`、`si_sdr_mean`、`lsd_mean`、`fad`、`fd`、`is_mean`、`kl_sigmoid`、`kl_softmax`、`speaker_similarity_mean`
+输出列（与评估 sheet 顺序一致）：
+`run | FAD↓ | FD↓ | LSD↓ | Low_LSD↓ | High_LSD↓ | SI-SDR↑ | Speaker_sim↑ | MOS | IS↑ | IS_std | pairs | KL_sigmoid↓ | KL_softmax↓`
+
+### 步骤 4：生成折线图
+
+```bash
+uv run python eval/plot_metrics.py \
+  --summary-json metrics/summary.json \
+  --out-dir metrics/plots
+```
+
+每个指标生成一张 PNG，文件名如 `fad-by-step.png`。Run 名称须包含 `_step<N>` 后缀，脚本自动解析实验名称和步数。若只绘制特定实验：
+
+```bash
+uv run python eval/plot_metrics.py \
+  --summary-json metrics/summary.json \
+  --out-dir metrics/plots \
+  --experiments exp06
+```
 
 ## 指标说明
 
