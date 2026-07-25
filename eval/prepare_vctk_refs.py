@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""Prepare a VCTK evaluation reference set from a manifest and a directory of full reference WAVs.
+
+Symlinks the full reference WAVs into input_full_wav/ and writes tail-only reference WAVs
+(after the prompt cut point) into reference_tail_style-reference/ and reference_tail_style-none/.
+"""
 from __future__ import annotations
 
 import argparse
@@ -32,14 +37,13 @@ def main() -> None:
     manifest = Path(args.manifest)
     full_ref_dir = Path(args.full_ref_dir)
     out_root = Path(args.out_root)
-    input_dir = out_root / "input_full_wav_min6"
+    input_dir = out_root / "input_full_wav"
     ref_reference = out_root / "reference_tail_style-reference"
     ref_none = out_root / "reference_tail_style-none"
-    subset_manifest = out_root / "manifest_min6_prompt3p01.jsonl"
+    subset_manifest = out_root / "manifest_eval.jsonl"
 
-    input_dir.mkdir(parents=True, exist_ok=True)
-    ref_reference.mkdir(parents=True, exist_ok=True)
-    ref_none.mkdir(parents=True, exist_ok=True)
+    for d in (input_dir, ref_reference, ref_none):
+        d.mkdir(parents=True, exist_ok=True)
 
     prompt_frames = int(args.prompt_seconds * args.sample_rate_mel / args.hop_length)
     cut_seconds = prompt_frames * args.hop_length / args.sample_rate_mel
@@ -68,13 +72,12 @@ def main() -> None:
         wav, sr = sf.read(src, dtype="float32", always_2d=True)
         cut = int(round(cut_seconds * sr))
         if len(wav) - cut <= int(round(3.0 * sr)):
-            raise ValueError(f"target shorter than 3s after cut: {src} sr={sr} len={len(wav)} cut={cut}")
+            raise ValueError(f"target shorter than 3 s after cut: {src}")
         stem = src.stem
-        targets = [
+        for dst in (
             ref_reference / f"{stem}_s2mel_style-reference.wav",
             ref_none / f"{stem}_s2mel_style-none.wav",
-        ]
-        for dst in targets:
+        ):
             sf.write(dst, wav[cut:], sr)
 
     with subset_manifest.open("w") as f:
@@ -85,18 +88,11 @@ def main() -> None:
         "manifest": str(manifest),
         "full_ref_dir": str(full_ref_dir),
         "out_root": str(out_root),
-        "input_dir": str(input_dir),
-        "reference_tail_style_reference": str(ref_reference),
-        "reference_tail_style_none": str(ref_none),
-        "subset_manifest": str(subset_manifest),
         "min_duration": args.min_duration,
-        "prompt_seconds_arg": args.prompt_seconds,
-        "prompt_frames": prompt_frames,
+        "prompt_seconds": args.prompt_seconds,
         "cut_seconds": cut_seconds,
         "count": len(selected),
         "speakers": len({r["speaker_id"] for r in selected}),
-        "min_source_duration": min(float(r["duration"]) for r in selected),
-        "max_source_duration": max(float(r["duration"]) for r in selected),
     }
     (out_root / "prepare_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
     print(json.dumps(summary, ensure_ascii=False, indent=2))

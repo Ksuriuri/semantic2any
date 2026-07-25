@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+"""Compute SI-SDR and LSD between reference and generated audio directories."""
+from __future__ import annotations
+
 import argparse
 import json
 import math
@@ -30,8 +33,7 @@ def si_sdr(est, ref, eps=1e-8):
 
 def lsd(est, ref, sr, n_fft=2048, hop_length=512, eps=1e-7):
     n = min(len(est), len(ref))
-    est = est[:n]
-    ref = ref[:n]
+    est, ref = est[:n], ref[:n]
     if n < 2:
         return float("nan")
     nperseg = min(n_fft, n)
@@ -74,9 +76,7 @@ def main():
     names = sorted(set(p.name for p in ref_dir.glob("*.wav")) & set(p.name for p in gen_dir.glob("*.wav")))
     if args.limit:
         names = names[: args.limit]
-    rows = []
-    sis = []
-    lsds = []
+    rows, sis, lsds = [], [], []
     for name in tqdm(names, desc=gen_dir.name):
         ref = load_mono(ref_dir / name, args.sample_rate)
         gen = load_mono(gen_dir / name, args.sample_rate)
@@ -93,7 +93,6 @@ def main():
         "si_sdr": summarize(sis),
         "lsd": summarize(lsds),
         "per_file": rows,
-        "note": "task7 short-audio compatible LSD; same as paired_metrics.py except adaptive nperseg/noverlap for very short clips",
     }
     Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out_json).write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n")

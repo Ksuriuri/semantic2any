@@ -156,16 +156,22 @@ fingerprint，不能在 MaskGCT 与 SAC 实验间混用。
 
 ## 4. 可选评估资产
 
-`scripts/task12_run_semantic2any_eval.sh` 是历史实验评估入口，不参与安装、
-训练或常规推理。其 AudioLDM 指标和 SEED-TTS WavLM 说话人相似度需要
-额外评估源码及约 1.3 GiB 的 `wavlm_large_finetune.pth`。这些资产不要为
-训练机器预下载；只有复现 task12 指标时，才按上游说明准备：
+评估脚本集中在 `eval/` 目录，详见 [eval/README.md](../eval/README.md)。
+训练和常规推理不依赖这些工具；只有需要计算 AudioLDM 或说话人相似度指标时才需要准备以下资产。
 
-- [AudioLDM Evaluation](https://github.com/haoheliu/audioldm_eval)
-- [SEED-TTS Evaluation](https://github.com/BytedanceSpeech/seed-tts-eval)
+### AudioLDM Evaluation（FAD、FD、IS、KL）
 
-task12 脚本中的这组依赖属于可选评估工具，不是 semantic2any 核心运行时
-依赖。
+源码：https://github.com/haoheliu/audioldm_eval  
+在 vae-eval 项目中用独立虚拟环境安装，不要混入本项目的 `.venv`。
+
+### SEED-TTS Evaluation（说话人相似度，WavLM Finetune）
+
+源码：https://github.com/BytedanceSpeech/seed-tts-eval  
+需要约 1.3 GiB 的 `wavlm_large_finetune.pth`，按该仓库 README 中的下载链接获取，
+放置在 `/checkpoints/seed_tts/wavlm_large_finetune.pth`。
+
+以上工具通过 `VAE` 环境变量传入 `eval/run_eval.sh`；若不设置，脚本仅运行
+SI-SDR 和 LSD，无需额外依赖。
 
 ## 5. 离线迁移与校验
 
