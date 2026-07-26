@@ -1075,18 +1075,29 @@ def main() -> None:
     updates_per_epoch = math.ceil(len(train_loader) / int(cfg.train.grad_accumulation))
     total_steps = int(cfg.train.max_steps) if int(cfg.train.max_steps) > 0 else int(cfg.train.epochs) * updates_per_epoch
     scheduler = make_lr_scheduler(optimizer, cfg, num_training_steps=max(1, total_steps))
+    _fresh_lr = bool(_get(cfg.train, "fresh_lr_schedule", False))
     if resume_path is not None and resume_path.is_file() and global_step > 0:
-        # Weights-only checkpoints carry no scheduler state. Fast-forward the LR
-        # schedule so training does not restart warmup at full LR. The prepared
-        # scheduler ticks num_processes times per optimizer step, so replay the
-        # equivalent number of raw ticks here (before accelerator.prepare).
-        for _ in range(global_step * accelerator.num_processes):
-            scheduler.step()
-        if accelerator.is_main_process:
-            print(
-                f"[Resume] Fast-forwarded LR scheduler by {global_step} steps "
-                f"(lr={scheduler.get_last_lr()[0]:.3e}); optimizer moments start fresh"
-            )
+        if _fresh_lr:
+            # fresh_lr_schedule=True: start a new cosine schedule from scratch.
+            # Reset epoch counter so range(0, epochs) gives the full new training.
+            start_epoch = 0
+            if accelerator.is_main_process:
+                print(
+                    f"[Resume] fresh_lr_schedule=True: LR starts at {float(cfg.train.learning_rate):.2e}, "
+                    f"epoch counter reset to 0, training for {int(cfg.train.epochs)} new epochs"
+                )
+        else:
+            # Weights-only checkpoints carry no scheduler state. Fast-forward the LR
+            # schedule so training does not restart warmup at full LR. The prepared
+            # scheduler ticks num_processes times per optimizer step, so replay the
+            # equivalent number of raw ticks here (before accelerator.prepare).
+            for _ in range(global_step * accelerator.num_processes):
+                scheduler.step()
+            if accelerator.is_main_process:
+                print(
+                    f"[Resume] Fast-forwarded LR scheduler by {global_step} steps "
+                    f"(lr={scheduler.get_last_lr()[0]:.3e}); optimizer moments start fresh"
+                )
 
     if valid_loader is None:
         model, optimizer, train_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, scheduler)
