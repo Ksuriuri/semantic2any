@@ -692,12 +692,16 @@ class LengthBucketBatchSampler(Sampler[list[int]]):
         seed: int = 0,
         drop_last: bool = True,
         shuffle: bool = True,
+        sample_weights: list[float] | None = None,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if world_size <= 0:
             raise ValueError("world_size must be positive")
+        if sample_weights is not None and len(sample_weights) != len(lengths):
+            raise ValueError("sample_weights must have the same length as lengths")
         self.lengths = [float(length) for length in lengths]
+        self.sample_weights = [float(w) for w in sample_weights] if sample_weights is not None else None
         self.batch_size = int(batch_size)
         self.world_size = int(world_size)
         self.boundaries = sorted(float(boundary) for boundary in boundaries)
@@ -726,7 +730,12 @@ class LengthBucketBatchSampler(Sampler[list[int]]):
         for bucket_indices in buckets.values():
             indices = list(bucket_indices)
             if self.shuffle:
-                rng.shuffle(indices)
+                if self.sample_weights is not None:
+                    # Weighted sampling with replacement to fill the same number of slots.
+                    weights = [self.sample_weights[i] for i in indices]
+                    indices = rng.choices(indices, weights=weights, k=len(indices))
+                else:
+                    rng.shuffle(indices)
             local_batches = [
                 indices[start : start + self.batch_size]
                 for start in range(0, len(indices), self.batch_size)

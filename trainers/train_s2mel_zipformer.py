@@ -277,6 +277,26 @@ def _dataset_length_estimates(dataset: Dataset) -> list[float]:
     return [0.0] * len(dataset)
 
 
+
+
+def _compute_dataset_sample_weights(dataset: Dataset, dataset_weights: dict[str, float]) -> list[float] | None:
+    """Return per-sample weights derived from dataset_weights config, or None if not configured."""
+    if not dataset_weights:
+        return None
+    records = getattr(dataset, "records", None)
+    if not isinstance(records, list) or len(records) != len(dataset):
+        return None
+    weights = []
+    for record in records:
+        dataset_name = _record_dataset_name(record) if isinstance(record, dict) else ""
+        # Match by prefix: config key "laion_emolia" matches "laion_emolia__ZH_..."
+        w = 1.0
+        for key, val in dataset_weights.items():
+            if dataset_name == key or dataset_name.startswith(key + "__") or dataset_name.startswith(key + "/"):
+                w = float(val)
+                break
+        weights.append(w)
+    return weights
 def _set_loader_epoch(loader: DataLoader, epoch: int) -> None:
     seen: set[int] = set()
 
@@ -356,6 +376,8 @@ def make_dataloader(
             float(value)
             for value in _get(cfg.data, "length_bucket_boundaries", (8, 12, 16, 20, 24, 28, 32, 40, 50))
         ]
+        _raw_dataset_weights = _get(cfg.data, "dataset_weights", {}) or {}
+        _sample_weights = _compute_dataset_sample_weights(dataset, dict(_raw_dataset_weights)) if shuffle else None
         batch_sampler = LengthBucketBatchSampler(
             _dataset_length_estimates(dataset),
             batch_size=int(cfg.train.batch_size),
@@ -364,6 +386,7 @@ def make_dataloader(
             seed=int(cfg.seed),
             drop_last=True,
             shuffle=True,
+            sample_weights=_sample_weights,
         )
         return DataLoader(
             dataset,
