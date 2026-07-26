@@ -56,7 +56,7 @@ data:
   # Prompt-mel only: with this probability, band-limit prompt audio to a
   # randomly chosen rate below (16 kHz / 22.05 kHz simulation). Semantic codes
   # stay on the original prompt; validation disables this augmentation.
-  prompt_bandwidth_aug_prob: 0.1
+  prompt_bandwidth_aug_prob: 0.3
   prompt_bandwidth_aug_rates: [16000, 22050]
 
 preprocess_params:
@@ -134,3 +134,4 @@ train:
   wandb_entity: haoyuanhuang22-jcxy
   wandb_project: semantic2mel
   wandb_run_name: s2mel-train-data-filtered-speaker-pair-bigvgan-v2-44khz-128band-512x
+  wandb_run_id: 07law8n7

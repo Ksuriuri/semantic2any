@@ -935,11 +935,15 @@ def main() -> None:
         wandb_project = str(_get(cfg.train, "wandb_project", "semantic2mel") or "semantic2mel")
         wandb_entity = str(_get(cfg.train, "wandb_entity", "") or "")
         wandb_run_name = str(_get(cfg.train, "wandb_run_name", "") or "")
+        wandb_run_id = str(_get(cfg.train, "wandb_run_id", "") or "")
         wandb_kwargs = {}
         if wandb_entity:
             wandb_kwargs["entity"] = wandb_entity
         if wandb_run_name:
             wandb_kwargs["name"] = wandb_run_name
+        if wandb_run_id:
+            wandb_kwargs["id"] = wandb_run_id
+            wandb_kwargs["resume"] = "must"
         tracker_kwargs = {"init_kwargs": {"wandb": wandb_kwargs}} if wandb_kwargs else {}
         accelerator.init_trackers(
             wandb_project,
