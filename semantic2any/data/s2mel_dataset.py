@@ -731,9 +731,19 @@ class LengthBucketBatchSampler(Sampler[list[int]]):
             indices = list(bucket_indices)
             if self.shuffle:
                 if self.sample_weights is not None:
-                    # Weighted sampling with replacement to fill the same number of slots.
-                    weights = [self.sample_weights[i] for i in indices]
-                    indices = rng.choices(indices, weights=weights, k=len(indices))
+                    # Subsample each weight-group without replacement.
+                    # weight=1.0 → keep all samples; weight=0.2 → keep 20%, randomly
+                    # chosen each epoch (no repeats within an epoch).
+                    wgroups: dict[float, list[int]] = defaultdict(list)
+                    for i in indices:
+                        wgroups[self.sample_weights[i]].append(i)
+                    selected: list[int] = []
+                    for w, group in wgroups.items():
+                        k = len(group) if w >= 1.0 else round(w * len(group))
+                        if k > 0:
+                            selected.extend(rng.sample(group, k))
+                    rng.shuffle(selected)
+                    indices = selected
                 else:
                     rng.shuffle(indices)
             local_batches = [

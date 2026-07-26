@@ -39,12 +39,12 @@ data:
   extract_mel_in_worker: false
   length_bucketed_batches: true
   length_bucket_boundaries: [8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50]
-  # Per-dataset sampling weights. Keys match the dataset name prefix in speaker_id / audio_path.
-  # Values are relative weights (not probabilities); they are normalized within each length bucket.
-  # Omit a dataset to use the default weight of 1.0.
+  # Per-dataset epoch subsampling fractions. Keys match the dataset name prefix in speaker_id / audio_path.
+  # Value = fraction of that dataset to use per epoch (0.2 = 20%), sampled without replacement.
+  # weight >= 1.0 means use all samples. Omit a dataset to use 1.0 (all samples).
   # Example to reduce laion_emolia dominance (currently ~70% of data):
   #   dataset_weights:
-  #     laion_emolia: 0.3
+  #     laion_emolia: 0.2   # use only 20% of laion_emolia per epoch
   dataset_weights: {}
   skip_audio_errors: true
   feature_batch_size: 16
