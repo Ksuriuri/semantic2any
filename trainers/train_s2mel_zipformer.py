@@ -596,6 +596,34 @@ def build_training_batch(
     feature_adapter_ref: list[S2MelFeatureAdapter | None],
     apply_prompt_bandwidth_aug: bool = True,
 ) -> dict[str, torch.Tensor]:
+    built = _build_training_batch_impl(
+        batch,
+        cfg=cfg,
+        accelerator=accelerator,
+        feature_adapter_ref=feature_adapter_ref,
+        apply_prompt_bandwidth_aug=apply_prompt_bandwidth_aug,
+    )
+    # Re-attach per-sample identifiers dropped by the feature adapters so the
+    # spike-sample instrumentation can name the offending audio.
+    try:
+        if isinstance(batch, dict) and isinstance(built, dict):
+            for _k in ("target_audio_paths", "audio_paths", "prompt_audio_paths", "records"):
+                _v = batch.get(_k)
+                if _v is not None and _k not in built:
+                    built[_k] = _v
+    except Exception:
+        pass
+    return built
+
+
+def _build_training_batch_impl(
+    batch: dict[str, Any],
+    *,
+    cfg,
+    accelerator: Accelerator,
+    feature_adapter_ref: list[S2MelFeatureAdapter | None],
+    apply_prompt_bandwidth_aug: bool = True,
+) -> dict[str, torch.Tensor]:
     if batch.get("is_precomputed", False):
         return move_feature_batch_to_device(batch, accelerator.device)
 
@@ -817,6 +845,92 @@ def step_requires_async_prefetch_barrier(
         or (max_steps > 0 and next_global_step >= max_steps)
     )
 
+
+
+# --- spike-sample instrumentation (22kHz loss-spike debug) ---------------------
+import os as _spike_os
+
+_SPIKE_LOSS_ABS = float(_spike_os.environ.get("SPIKE_LOSS_ABS", "1.5"))
+_SPIKE_LOSS_MULT = float(_spike_os.environ.get("SPIKE_LOSS_MULT", "2.5"))
+_SPIKE_GNORM_ABS = float(_spike_os.environ.get("SPIKE_GNORM_ABS", "10.0"))
+_SPIKE_GNORM_MULT = float(_spike_os.environ.get("SPIKE_GNORM_MULT", "4.0"))
+_SPIKE_LOSS_EMA = [None]
+_SPIKE_GNORM_EMA = [None]
+
+
+def _spike_ids_from_batch(batch: dict) -> list:
+    """Best-effort per-sample identifiers for the current micro-batch."""
+    for key in ("target_audio_paths", "audio_paths", "prompt_audio_paths"):
+        v = batch.get(key)
+        if isinstance(v, (list, tuple)) and len(v) > 0:
+            return list(v)
+    recs = batch.get("records")
+    if isinstance(recs, (list, tuple)) and len(recs) > 0:
+        out = []
+        for r in recs:
+            if isinstance(r, dict):
+                out.append(r.get("audio_path") or r.get("id") or "?")
+            else:
+                out.append(str(r))
+        return out
+    return []
+
+
+def _spike_track_loss(loss, batch, global_step, accelerator) -> None:
+    """Log micro-batch sample ids whenever this rank's local loss spikes."""
+    try:
+        lv = float(loss.detach().float().item())
+    except Exception:
+        return
+    ema = _SPIKE_LOSS_EMA[0]
+    thr = max(_SPIKE_LOSS_ABS, _SPIKE_LOSS_MULT * ema) if ema is not None else _SPIKE_LOSS_ABS
+    if (not math.isfinite(lv)) or lv > thr:
+        ids = _spike_ids_from_batch(batch)
+        ema_s = "None" if ema is None else f"{ema:.4f}"
+        print(
+            f"[SpikeSample] step~{global_step} rank={accelerator.process_index} "
+            f"loss={lv:.4f} ema={ema_s} thr={thr:.4f} n={len(ids)} ids={ids}",
+            flush=True,
+        )
+    if math.isfinite(lv):
+        _SPIKE_LOSS_EMA[0] = lv if ema is None else (0.98 * ema + 0.02 * lv)
+
+
+def _spike_track_gnorm(gn, global_step, accelerator) -> None:
+    """Log grad-norm spikes (pre-clip total norm from clip_grad_norm_)."""
+    try:
+        gnf = float(gn) if gn is not None else float("nan")
+    except Exception:
+        return
+    ema = _SPIKE_GNORM_EMA[0]
+    thr = max(_SPIKE_GNORM_ABS, _SPIKE_GNORM_MULT * ema) if ema is not None else _SPIKE_GNORM_ABS
+    if (not math.isfinite(gnf)) or gnf > thr:
+        ema_s = "None" if ema is None else f"{ema:.3f}"
+        print(
+            f"[SpikeGrad] step~{global_step} rank={accelerator.process_index} "
+            f"gnorm={gnf:.3f} ema={ema_s} thr={thr:.3f}",
+            flush=True,
+        )
+    if math.isfinite(gnf):
+        _SPIKE_GNORM_EMA[0] = gnf if ema is None else (0.98 * ema + 0.02 * gnf)
+_SPIKE_SKIP_ENABLE = _spike_os.environ.get("SPIKE_SKIP_ENABLE", "0") == "1"
+_SPIKE_SKIP_GNORM = float(_spike_os.environ.get("SPIKE_SKIP_GNORM", "15.0"))
+
+
+def _spike_should_skip_step(gn) -> bool:
+    """True when this optimizer step should be skipped (grad explosion / NaN)."""
+    if not _SPIKE_SKIP_ENABLE:
+        return False
+    try:
+        gnf = float(gn) if gn is not None else float("nan")
+    except Exception:
+        return False
+    if not math.isfinite(gnf):
+        return True
+    return gnf > _SPIKE_SKIP_GNORM
+
+
+# --- end instrumentation -------------------------------------------------------
 
 def forward_loss(model, batch: dict[str, torch.Tensor]) -> torch.Tensor:
     loss, _ = model(
@@ -1078,7 +1192,20 @@ def main() -> None:
     )
     updates_per_epoch = math.ceil(len(train_loader) / int(cfg.train.grad_accumulation))
     total_steps = int(cfg.train.max_steps) if int(cfg.train.max_steps) > 0 else int(cfg.train.epochs) * updates_per_epoch
-    scheduler = make_lr_scheduler(optimizer, cfg, num_training_steps=max(1, total_steps))
+    # AcceleratedScheduler ticks the LR schedule num_processes times per optimizer step
+    # (when split_batches=False, which is the default). Scale num_training_steps and
+    # warmup_steps accordingly so the cosine period matches the intended optimizer steps.
+    _dl_cfg = getattr(accelerator, "dataloader_config", None)
+    _split = getattr(_dl_cfg, "split_batches", False) or getattr(accelerator, "split_batches", False)
+    _sched_scale = 1 if _split else accelerator.num_processes
+    _warmup_scaled = int(cfg.train.warmup_steps) * _sched_scale
+    _total_scaled = max(1, total_steps * _sched_scale)
+    scheduler = cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=_warmup_scaled,
+        num_training_steps=_total_scaled,
+        min_lr_ratio=float(_get(cfg.train, "min_learning_rate", 1.0e-5)) / float(cfg.train.learning_rate),
+    )
     _fresh_lr = bool(_get(cfg.train, "fresh_lr_schedule", False))
     if resume_path is not None and resume_path.is_file() and global_step > 0:
         if _fresh_lr:
@@ -1133,6 +1260,8 @@ def main() -> None:
         print("[Feature] Asynchronous extraction enabled (one batch ahead)")
     model.train()
     last_saved_step = global_step
+    if _AUX_LOSS_TYPE:
+        _init_aux_loss(cfg, accelerator.device, torch.bfloat16)
     # Per-rank optimizer steps per epoch (prepared loader is already sharded).
     steps_per_epoch = max(1, math.ceil(len(train_loader) / int(cfg.train.grad_accumulation)))
 
@@ -1213,13 +1342,32 @@ def main() -> None:
                         assert current_raw_batch is not None
                         train_batch = async_build_fn(current_raw_batch)
 
-                    loss = forward_loss(model, train_batch)
+                    loss = forward_loss_with_aux(model, train_batch) if _AUX_LOSS_TYPE else forward_loss(model, train_batch)
+                    _spike_track_loss(loss, train_batch, global_step, accelerator)
                     accelerator.backward(loss)
+                    _gn = None
+                    _do_skip = False
                     if accelerator.sync_gradients and float(cfg.train.grad_clip) > 0:
-                        accelerator.clip_grad_norm_(model.parameters(), float(cfg.train.grad_clip))
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                        _gn = accelerator.clip_grad_norm_(model.parameters(), float(cfg.train.grad_clip))
+                        _spike_track_gnorm(_gn, global_step, accelerator)
+                        _do_skip = _spike_should_skip_step(_gn)
+                    if _do_skip:
+                        # Grad explosion / NaN: skip the weight update so it cannot
+                        # corrupt the model; keep the LR schedule advancing.
+                        if accelerator.is_main_process:
+                            _gnv = float(_gn) if _gn is not None else float("nan")
+                            print(
+                                f"[SkipStep] step~{global_step} gnorm={_gnv:.3f} "
+                                f"exceeds SPIKE_SKIP_GNORM={_SPIKE_SKIP_GNORM} "
+                                f"— optimizer.step() skipped",
+                                flush=True,
+                            )
+                        scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
+                    else:
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
 
                 if validation_barrier and async_builder is not None:
                     # Validation workers are recreated on every pass. Tear down
@@ -1324,5 +1472,73 @@ def main() -> None:
     accelerator.end_training()
 
 
+
+# --- Auxiliary loss support (env-var gated) -----------------------------------
+import os as _aux_os
+
+_AUX_LOSS_TYPE = _aux_os.environ.get("AUX_LOSS_TYPE", "")  # "mr_stft" or "bigvgan_loop"
+_AUX_LOSS_WEIGHT = float(_aux_os.environ.get("AUX_LOSS_WEIGHT", "0.1"))
+_AUX_LOSS_MODULE = None
+
+
+def _init_aux_loss(cfg, device, dtype):
+    global _AUX_LOSS_MODULE
+    if _AUX_LOSS_MODULE is not None:
+        return
+    if _AUX_LOSS_TYPE == "mr_stft":
+        from semantic2any.losses.auxiliary_losses import MultiResolutionMelLoss
+        _AUX_LOSS_MODULE = MultiResolutionMelLoss(
+            resolutions=(1, 2, 4, 8), sc_weight=1.0, mag_weight=1.0
+        ).to(device)
+        print(f"[AuxLoss] MultiResolutionMelLoss enabled, weight={_AUX_LOSS_WEIGHT}")
+    elif _AUX_LOSS_TYPE == "bigvgan_loop":
+        from semantic2any.losses.auxiliary_losses import BigVGANLoopLoss
+        from semantic2any.third_party.indextts.bigvgan import BigVGAN
+        vocoder_cfg = _get(cfg, "vocoder", None)
+        model_id = (
+            "nvidia/bigvgan_v2_44khz_128band_512x"
+            if vocoder_cfg is None
+            else str(_get(vocoder_cfg, "model_id", "") or "nvidia/bigvgan_v2_44khz_128band_512x")
+        )
+        cache_dir = str(_get(vocoder_cfg, "cache_dir", "") or "") if vocoder_cfg else ""
+        load_kwargs = {}
+        if cache_dir:
+            load_kwargs["cache_dir"] = cache_dir
+        vocoder = BigVGAN.from_pretrained(model_id, **load_kwargs)
+        vocoder = vocoder.to(device=device)  # keep float32 for stable vocoding
+        vocoder.remove_weight_norm()
+        vocoder.eval()
+        preprocess = _get(cfg, "preprocess_params")
+        sr = int(_get(preprocess, "sr", 44100))
+        _AUX_LOSS_MODULE = BigVGANLoopLoss(
+            vocoder=vocoder,
+            sr=sr,
+            n_fft_list=(2048, 1024, 512),
+            hop_list=(512, 256, 128),
+            win_list=(2048, 1024, 512),
+        ).to(device)
+        print(f"[AuxLoss] BigVGANLoopLoss enabled, weight={_AUX_LOSS_WEIGHT}")
+
+
+def forward_loss_with_aux(model, batch):
+    """forward_loss with optional auxiliary loss."""
+    loss, x1_hat = model(
+        batch["mel"],
+        batch["mel_lens"],
+        batch["prompt_lens"],
+        batch["semantic"],
+        batch["style"],
+        semantic_is_mu=False,
+        semantic_lens=batch.get("semantic_lens"),
+        prompt_semantic_lens=batch.get("prompt_semantic_lens"),
+    )
+    if _AUX_LOSS_MODULE is not None and x1_hat is not None:
+        aux_loss = _AUX_LOSS_MODULE(
+            x1_hat, batch["mel"], batch["mel_lens"], batch["prompt_lens"]
+        )
+        loss = loss + _AUX_LOSS_WEIGHT * aux_loss
+    return loss
+# --- end auxiliary loss support ------------------------------------------------
 if __name__ == "__main__":
     main()
+
