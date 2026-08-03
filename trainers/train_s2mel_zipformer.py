@@ -1478,6 +1478,7 @@ import os as _aux_os
 
 _AUX_LOSS_TYPE = _aux_os.environ.get("AUX_LOSS_TYPE", "")  # "mr_stft" or "bigvgan_loop"
 _AUX_LOSS_WEIGHT = float(_aux_os.environ.get("AUX_LOSS_WEIGHT", "0.1"))
+_FLOW_LOSS_WEIGHT = float(_aux_os.environ.get("FLOW_LOSS_WEIGHT", "1.0"))
 _AUX_LOSS_MODULE = None
 
 
@@ -1536,7 +1537,7 @@ def forward_loss_with_aux(model, batch):
         aux_loss = _AUX_LOSS_MODULE(
             x1_hat, batch["mel"], batch["mel_lens"], batch["prompt_lens"]
         )
-        loss = loss + _AUX_LOSS_WEIGHT * aux_loss
+        loss = _FLOW_LOSS_WEIGHT * loss + _AUX_LOSS_WEIGHT * aux_loss
     return loss
 # --- end auxiliary loss support ------------------------------------------------
 if __name__ == "__main__":
