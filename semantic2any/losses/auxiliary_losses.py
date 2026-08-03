@@ -75,7 +75,7 @@ class BigVGANLoopLoss(nn.Module):
         n_fft_list=(2048, 1024, 512),
         hop_list=(512, 256, 128),
         win_list=(2048, 1024, 512),
-        max_chunk_frames: int = 256,
+        max_chunk_frames: int = 128,
     ):
         super().__init__()
         self.vocoder = vocoder
@@ -103,16 +103,16 @@ class BigVGANLoopLoss(nn.Module):
     def _multi_res_stft_loss(
         self, wav_pred: torch.Tensor, wav_gt: torch.Tensor
     ) -> torch.Tensor:
-        loss = torch.zeros((), device=wav_pred.device, dtype=wav_pred.dtype)
-        for n_fft, hop, win in zip(self.n_fft_list, self.hop_list, self.win_list):
-            mag_pred = self._stft_mag(wav_pred, n_fft, hop, win)
-            mag_gt = self._stft_mag(wav_gt, n_fft, hop, win)
-            sc = (mag_pred - mag_gt).norm(dim=(1, 2)) / mag_gt.norm(dim=(1, 2)).clamp_min(1e-7)
-            log_pred = torch.log(mag_pred.clamp_min(1e-7))
-            log_gt = torch.log(mag_gt.clamp_min(1e-7))
-            mag_l1 = (log_pred - log_gt).abs().mean(dim=(1, 2))
-            loss = loss + sc.mean() + mag_l1.mean()
-        return loss / len(self.n_fft_list)
+        # Waveform L1 + multi-scale L1 (STFT backward broken on CUDA 13.0)
+        min_len = min(wav_pred.size(-1), wav_gt.size(-1))
+        wav_pred = wav_pred[..., :min_len]
+        wav_gt = wav_gt[..., :min_len]
+        loss = (wav_pred - wav_gt).abs().mean()
+        for pool_size in (2, 4, 8):
+            pred_ds = F.avg_pool1d(wav_pred.unsqueeze(1), pool_size, pool_size).squeeze(1)
+            gt_ds = F.avg_pool1d(wav_gt.unsqueeze(1), pool_size, pool_size).squeeze(1)
+            loss = loss + (pred_ds - gt_ds).abs().mean()
+        return loss / 4.0
 
     def forward(
         self,
@@ -143,11 +143,9 @@ class BigVGANLoopLoss(nn.Module):
         x1_hat_chunk = x1_hat[:, :, gen_start:gen_end].float()
         x1_chunk = x1[:, :, gen_start:gen_end].float()
 
-        # Use gradient checkpointing to run BigVGAN without storing intermediates
+        # Direct vocoder forward (gradient checkpoint disabled for CUDA 13.0 compat)
         with torch.amp.autocast(device_type="cuda", enabled=False):
-            wav_pred = checkpoint(
-                self._vocoder_forward, x1_hat_chunk, use_reentrant=False
-            )
+            wav_pred = self._vocoder_forward(x1_hat_chunk)
 
         # GT waveform for this chunk
         hop_size = 512

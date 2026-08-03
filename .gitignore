@@ -10,6 +10,10 @@ venv/
 .cursor/
 pytest-of-*/
 torchinductor_*/
+tmp*wandb-*/
+torchelastic_*/
+
+overfit_exp/
 
 *.log
 wandb/
