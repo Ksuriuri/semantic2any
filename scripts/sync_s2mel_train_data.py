@@ -34,12 +34,17 @@ DEFAULT_DATASETS = (
     "vctk",
     "WutheringWaves",
 )
-DEFAULT_MIN_DURATION = 6.0
+DEFAULT_MIN_DURATION = 3.0
 DEFAULT_MIN_SAMPLE_RATE = 0
 DEFAULT_METADATA_WORKERS = 16
 DEFAULT_WORKERS = 4
+DEFAULT_MIN_SPEAKER_RECORDS = 2
+DEFAULT_MAX_CER = 0.5
+DEFAULT_ASR_PRIMARY = "cohere-transcribe-03-2026"
+DEFAULT_ASR_SECONDARY = "granite-speech-4.1-2b-nar"
 RESERVED_FREE_BYTES = 20 * 1024**3
 COPY_CHUNK_BYTES = 8 * 1024**2
+SYNC_STATE_FILE = ".sync-state.json"
 T = TypeVar("T")
 
 
@@ -48,6 +53,72 @@ def log(event: str, **fields: Any) -> None:
         json.dumps({"event": event, **fields}, ensure_ascii=False, sort_keys=True),
         flush=True,
     )
+
+
+def compute_cer(reference: str, hypothesis: str) -> float:
+    """Compute Character Error Rate between two strings."""
+    if not reference and not hypothesis:
+        return 0.0
+    if not reference:
+        return 1.0
+    ref = list(reference.strip())
+    hyp = list(hypothesis.strip())
+    n = len(ref)
+    m = len(hyp)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i
+    for j in range(m + 1):
+        dp[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if ref[i - 1] == hyp[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1]
+            else:
+                dp[i][j] = 1 + min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
+    return dp[n][m] / n if n > 0 else 0.0
+
+
+def load_asr_texts(
+    fs: gcsfs.GCSFileSystem,
+    dataset_prefix: str,
+    asr_model: str,
+    attempts: int,
+) -> dict[str, str]:
+    """Load ASR transcriptions for a dataset into a dict keyed by record id."""
+    asr_prefix = f"{dataset_prefix}/asr/{asr_model}"
+    try:
+        asr_paths = sorted(
+            str(p) for p in retry(
+                f"glob {asr_prefix}/*.jsonl",
+                lambda: fs.glob(f"{asr_prefix}/*.jsonl"),
+                attempts,
+            )
+        )
+    except Exception:
+        return {}
+    if not asr_paths:
+        return {}
+    texts: dict[str, str] = {}
+    for asr_path in asr_paths:
+        try:
+            with retry(
+                f"open {asr_path}",
+                lambda p=asr_path: fs.open(p, "r"),
+                attempts,
+            ) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    rid = row.get("id")
+                    text = row.get("text")
+                    if rid and isinstance(text, str) and text.strip():
+                        texts[rid] = text.strip()
+        except Exception as exc:
+            log("asr_load_warning", asr_path=asr_path, error=str(exc))
+    return texts
 
 
 def retry(description: str, operation: Callable[[], T], attempts: int) -> T:
@@ -79,6 +150,78 @@ def atomic_write_json(path: Path, value: Any) -> None:
         file_obj.flush()
         os.fsync(file_obj.fileno())
     tmp_path.replace(path)
+
+
+def _filter_params_key(args: argparse.Namespace) -> str:
+    """Hash of filter parameters to detect config changes between runs."""
+    params = {
+        "min_duration": args.min_duration,
+        "min_sample_rate": args.min_sample_rate,
+        "max_cer": args.max_cer if not args.no_cer_filter else None,
+        "min_speaker_records": args.min_speaker_records if not args.no_speaker_filter else None,
+        "asr_primary": args.asr_primary if not args.no_cer_filter else None,
+        "asr_secondary": args.asr_secondary if not args.no_cer_filter else None,
+    }
+    return hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def load_sync_state(output_root: Path) -> dict[str, Any]:
+    state_path = output_root / SYNC_STATE_FILE
+    if not state_path.is_file():
+        return {}
+    try:
+        with state_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_sync_state(output_root: Path, state: dict[str, Any]) -> None:
+    atomic_write_json(output_root / SYNC_STATE_FILE, state)
+
+
+def detect_new_tars(
+    fs: gcsfs.GCSFileSystem,
+    dataset: str,
+    attempts: int,
+    sync_state: dict[str, Any],
+    filter_key: str,
+) -> tuple[dict[str, dict[str, Any]], list[str], bool]:
+    """Compare GCS tar listing against saved state.
+
+    Returns (current_audio_details, new_tar_keys, needs_rescan).
+    needs_rescan is True if there are new tars or filter params changed.
+    """
+    dataset_prefix = f"{SOURCE_PREFIX}/{dataset}"
+    audio_details = glob_details(fs, f"{dataset_prefix}/audio/*.tar", attempts)
+
+    dataset_state = sync_state.get("datasets", {}).get(dataset, {})
+    saved_filter_key = dataset_state.get("filter_key", "")
+    saved_tars = set(dataset_state.get("synced_tars", []))
+
+    current_tars = set(audio_details.keys())
+    new_tars = sorted(current_tars - saved_tars)
+
+    if saved_filter_key != filter_key:
+        log(
+            "incremental_filter_changed",
+            dataset=dataset,
+            reason="filter parameters changed since last sync",
+        )
+        return audio_details, list(current_tars), True
+
+    if new_tars:
+        log(
+            "incremental_new_tars",
+            dataset=dataset,
+            new_tar_count=len(new_tars),
+            total_tars=len(current_tars),
+            examples=new_tars[:5],
+        )
+        return audio_details, new_tars, True
+
+    log("incremental_no_change", dataset=dataset, total_tars=len(current_tars))
+    return audio_details, [], False
 
 
 def parse_audio_path(dataset: str, audio_path: Any) -> tuple[str, str, str]:
@@ -248,6 +391,12 @@ def scan_dataset(
     sample_seed: int,
     metadata_workers: int,
     attempts: int,
+    *,
+    max_cer: float = DEFAULT_MAX_CER,
+    asr_primary: str = DEFAULT_ASR_PRIMARY,
+    asr_secondary: str = DEFAULT_ASR_SECONDARY,
+    skip_cer: bool = False,
+    audio_details: dict[str, dict[str, Any]] | None = None,
 ) -> DatasetPlan:
     dataset_prefix = f"{SOURCE_PREFIX}/{dataset}"
     metadata_paths = glob_paths(
@@ -255,15 +404,32 @@ def scan_dataset(
         f"{dataset_prefix}/metadata/*.jsonl",
         attempts,
     )
-    audio_details = glob_details(
-        fs,
-        f"{dataset_prefix}/audio/*.tar",
-        attempts,
-    )
+    if audio_details is None:
+        audio_details = glob_details(
+            fs,
+            f"{dataset_prefix}/audio/*.tar",
+            attempts,
+        )
     if not metadata_paths:
         raise FileNotFoundError(f"No metadata shards found for {dataset}")
     if not audio_details:
         raise FileNotFoundError(f"No audio tar shards found for {dataset}")
+
+    # Load ASR texts for CER filtering
+    asr_primary_texts: dict[str, str] = {}
+    asr_secondary_texts: dict[str, str] = {}
+    if not skip_cer:
+        dataset_prefix = f"{SOURCE_PREFIX}/{dataset}"
+        asr_primary_texts = load_asr_texts(fs, dataset_prefix, asr_primary, attempts)
+        asr_secondary_texts = load_asr_texts(fs, dataset_prefix, asr_secondary, attempts)
+        log(
+            "asr_loaded",
+            dataset=dataset,
+            primary_model=asr_primary,
+            primary_records=len(asr_primary_texts),
+            secondary_model=asr_secondary,
+            secondary_records=len(asr_secondary_texts),
+        )
     source_metadata_shards = len(metadata_paths)
     if metadata_shard_sample and metadata_shard_sample < len(metadata_paths):
         metadata_paths = sorted(
@@ -316,6 +482,30 @@ def scan_dataset(
             if duration <= min_duration or sample_rate < min_sample_rate:
                 continue
 
+            # CER filtering
+            if not skip_cer:
+                record_id_for_cer = row.get("id", "")
+                metadata_text = row.get("text")
+                has_text = isinstance(metadata_text, str) and metadata_text.strip()
+                if has_text:
+                    # Use metadata text vs primary ASR
+                    asr_text = asr_primary_texts.get(record_id_for_cer)
+                    if asr_text:
+                        cer = compute_cer(metadata_text.strip(), asr_text)
+                        if cer > max_cer:
+                            continue
+                else:
+                    # Use primary ASR vs secondary ASR
+                    primary_text = asr_primary_texts.get(record_id_for_cer)
+                    secondary_text = asr_secondary_texts.get(record_id_for_cer)
+                    if primary_text and secondary_text:
+                        cer = compute_cer(primary_text, secondary_text)
+                        if cer > max_cer:
+                            continue
+                    elif not primary_text and not secondary_text:
+                        # No ASR available and no text — skip
+                        continue
+
             record_id = row.get("id")
             if not isinstance(record_id, str) or not record_id:
                 raise ValueError(f"{location}: missing id")
@@ -338,7 +528,8 @@ def scan_dataset(
                 )
 
             output_metadata = dict(row)
-            output_metadata["audio_path"] = f"../{dataset}/{basename}"
+            output_metadata["dataset"] = dataset
+            output_metadata["audio_path"] = f"../audios/{dataset}/{basename}"
             selected = SelectedRecord(
                 metadata=output_metadata,
                 member=member,
@@ -385,7 +576,7 @@ def scan_dataset(
 
 
 def write_metadata_tmp(output_root: Path, plan: DatasetPlan) -> Path:
-    (output_root / plan.name).mkdir(parents=True, exist_ok=True)
+    (output_root / "audios" / plan.name).mkdir(parents=True, exist_ok=True)
     metadata_dir = output_root / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
     metadata_tmp = metadata_dir / f"{plan.name}.jsonl.tmp"
@@ -510,7 +701,7 @@ def extract_dataset(
     attempts: int,
     workers: int,
 ) -> None:
-    dataset_dir = output_root / plan.name
+    dataset_dir = output_root / "audios" / plan.name
     tar_items = sorted(plan.by_tar.items())
     extracted_total = 0
     reused_total = 0
@@ -607,18 +798,24 @@ def verify_and_finalize_dataset(
     min_duration: float,
     min_sample_rate: int,
 ) -> dict[str, Any]:
-    dataset_dir = output_root / plan.name
+    dataset_dir = output_root / "audios" / plan.name
     expected_names = {selected.basename for selected in plan.selected}
     actual_names = {
         path.name for path in dataset_dir.glob("*.flac") if path.is_file()
     }
-    if expected_names != actual_names:
-        missing = sorted(expected_names - actual_names)
-        extras = sorted(actual_names - expected_names)
+    missing = expected_names - actual_names
+    if missing:
         raise ValueError(
-            f"{plan.name}: output FLAC set mismatch: "
-            f"missing={missing[:5]} ({len(missing)}), "
-            f"extras={extras[:5]} ({len(extras)})"
+            f"{plan.name}: missing expected FLACs: "
+            f"{sorted(missing)[:5]} ({len(missing)} total)"
+        )
+    extras = actual_names - expected_names
+    if extras:
+        log(
+            "verify_extras",
+            dataset=plan.name,
+            extra_count=len(extras),
+            note="leftover files from previous sync, safe to ignore",
         )
 
     total_bytes = 0
@@ -631,7 +828,7 @@ def verify_and_finalize_dataset(
         total_bytes += path.stat().st_size
 
     expected_audio_paths = {
-        f"../{plan.name}/{selected.basename}" for selected in plan.selected
+        f"../audios/{plan.name}/{selected.basename}" for selected in plan.selected
     }
     metadata_audio_paths: set[str] = set()
     rows = 0
@@ -747,8 +944,161 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_DATASETS),
         help="Dataset child prefixes under gs://.../preprocessed/.",
     )
+    parser.add_argument(
+        "--min-speaker-records",
+        type=int,
+        default=DEFAULT_MIN_SPEAKER_RECORDS,
+        help="Drop speakers with fewer than N records after duration filtering.",
+    )
+    parser.add_argument(
+        "--max-cer",
+        type=float,
+        default=DEFAULT_MAX_CER,
+        help="Max CER between text and ASR transcription (drop if CER > this).",
+    )
+    parser.add_argument(
+        "--asr-primary",
+        default=DEFAULT_ASR_PRIMARY,
+        help="Primary ASR model folder name for CER computation.",
+    )
+    parser.add_argument(
+        "--asr-secondary",
+        default=DEFAULT_ASR_SECONDARY,
+        help="Secondary ASR model folder for cross-ASR CER when text is null.",
+    )
+    parser.add_argument("--no-cer-filter", action="store_true", help="Skip CER filtering.")
+    parser.add_argument("--no-speaker-filter", action="store_true", help="Skip speaker count filtering.")
+    parser.add_argument("--no-pull-maskgct-codes", action="store_true",
+                        help="Skip downloading maskGCT semantic codes from GCS.")
+    parser.add_argument("--force-rescan", action="store_true",
+                        help="Ignore sync state and re-scan all datasets from scratch.")
     parser.add_argument("--preflight-only", action="store_true")
     return parser.parse_args()
+
+
+
+def download_maskgct_codes(
+    fs: gcsfs.GCSFileSystem,
+    output_root: Path,
+    plans: list,
+    attempts: int,
+    workers: int,
+) -> None:
+    """Download maskGCT semantic codes and write filtered manifests."""
+    codes_root = output_root / "maskgct-codes"
+    codes_root.mkdir(parents=True, exist_ok=True)
+    bins_dir = codes_root / "bins"
+    bins_dir.mkdir(parents=True, exist_ok=True)
+    manifests_dir = codes_root / "manifests"
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+
+    for plan in plans:
+        dataset = plan.name
+        selected_ids = {s.metadata.get("id") for s in plan.selected}
+        if not selected_ids:
+            continue
+
+        dataset_prefix = f"{SOURCE_PREFIX}/{dataset}"
+        codes_prefix = f"{dataset_prefix}/features/maskGCT_codes"
+
+        # List available shards
+        try:
+            all_files = retry(
+                f"ls {codes_prefix}",
+                lambda: fs.ls(codes_prefix),
+                attempts,
+            )
+        except Exception as exc:
+            log("maskgct_skip", dataset=dataset, reason=str(exc))
+            continue
+
+        bin_files = sorted(f for f in all_files if f.endswith(".u2.bin"))
+        jsonl_files = sorted(f for f in all_files if f.endswith(".jsonl"))
+
+        if not bin_files or not jsonl_files:
+            log("maskgct_skip", dataset=dataset, reason="no bin/jsonl files")
+            continue
+
+        # Scan JSONL to find which shards contain selected records
+        needed_bins: set[str] = set()
+        filtered_records: list[str] = []
+        total_scanned = 0
+
+        for jsonl_path in jsonl_files:
+            try:
+                with retry(
+                    f"open {jsonl_path}",
+                    lambda p=jsonl_path: fs.open(p, "r"),
+                    attempts,
+                ) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        total_scanned += 1
+                        row = json.loads(line)
+                        record_id = row.get("id")
+                        if record_id in selected_ids:
+                            code_path = row.get("semantic_code_path", "")
+                            if code_path:
+                                needed_bins.add(code_path)
+                            filtered_records.append(line)
+            except Exception as exc:
+                log("maskgct_jsonl_error", dataset=dataset, path=jsonl_path, error=str(exc))
+
+        log(
+            "maskgct_scan",
+            dataset=dataset,
+            total_scanned=total_scanned,
+            filtered_records=len(filtered_records),
+            needed_bins=len(needed_bins),
+        )
+
+        # Download needed bin shards
+        dataset_bins_dir = bins_dir / dataset
+        dataset_bins_dir.mkdir(parents=True, exist_ok=True)
+
+        for bin_file in bin_files:
+            bin_name = bin_file.rsplit("/", 1)[-1]
+            if bin_name not in needed_bins:
+                continue
+            target = dataset_bins_dir / bin_name
+            if target.is_file() and target.stat().st_size > 0:
+                continue
+            tmp = target.with_name(f".{target.name}.tmp")
+            try:
+                with retry(
+                    f"download {bin_file}",
+                    lambda p=bin_file: fs.open(p, "rb"),
+                    attempts,
+                ) as src, tmp.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                tmp.replace(target)
+                log("maskgct_bin_downloaded", dataset=dataset, file=bin_name,
+                    size_mb=round(target.stat().st_size / 1024 / 1024, 1))
+            except Exception as exc:
+                tmp.unlink(missing_ok=True)
+                log("maskgct_bin_error", dataset=dataset, file=bin_name, error=str(exc))
+
+        # Write filtered manifest
+        manifest_path = manifests_dir / f"{dataset}.jsonl"
+        manifest_tmp = manifest_path.with_name(f"{manifest_path.name}.tmp")
+        with manifest_tmp.open("w", encoding="utf-8") as f:
+            for line in filtered_records:
+                # Rewrite semantic_code_path to local relative path
+                row = json.loads(line)
+                bin_name = row.get("semantic_code_path", "")
+                row["semantic_code_path"] = str(dataset_bins_dir / bin_name)
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        manifest_tmp.replace(manifest_path)
+        log(
+            "maskgct_manifest_written",
+            dataset=dataset,
+            records=len(filtered_records),
+            path=str(manifest_path),
+        )
+
+    log("MASKGCT_CODES_COMPLETE", output=str(codes_root))
 
 
 def main() -> None:
@@ -779,6 +1129,10 @@ def main() -> None:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(key_file)
     os.environ["GOOGLE_CLOUD_PROJECT"] = PROJECT
     fs = gcsfs.GCSFileSystem(project=PROJECT, token=str(key_file))
+
+    filter_key = _filter_params_key(args)
+    sync_state = load_sync_state(output_root) if not args.force_rescan else {}
+
     log(
         "start",
         source=f"gs://{SOURCE_PREFIX}",
@@ -788,7 +1142,34 @@ def main() -> None:
         min_sample_rate=args.min_sample_rate,
         metadata_workers=args.metadata_workers,
         workers=args.workers,
+        incremental=not args.force_rescan,
+        filter_key=filter_key,
     )
+
+    # Incremental detection: check which datasets have new tar shards
+    datasets_to_scan: list[str] = []
+    prefetched_audio_details: dict[str, dict[str, dict[str, Any]]] = {}
+    skipped_datasets: list[str] = []
+    for dataset in args.datasets:
+        audio_details, new_tars, needs_rescan = detect_new_tars(
+            fs, dataset, args.attempts, sync_state, filter_key,
+        )
+        if needs_rescan:
+            datasets_to_scan.append(dataset)
+            prefetched_audio_details[dataset] = audio_details
+        else:
+            skipped_datasets.append(dataset)
+
+    if skipped_datasets:
+        log(
+            "incremental_skipped",
+            datasets=skipped_datasets,
+            reason="no new tar shards and filters unchanged",
+        )
+
+    if not datasets_to_scan:
+        log("ALL_UP_TO_DATE", message="no new data detected, nothing to do")
+        return
 
     plans = [
         scan_dataset(
@@ -800,9 +1181,65 @@ def main() -> None:
             args.sample_seed,
             args.metadata_workers,
             args.attempts,
+            max_cer=args.max_cer,
+            asr_primary=args.asr_primary,
+            asr_secondary=args.asr_secondary,
+            skip_cer=args.no_cer_filter,
+            audio_details=prefetched_audio_details.get(dataset),
         )
-        for dataset in args.datasets
+        for dataset in datasets_to_scan
     ]
+
+    # Speaker count filtering
+    if not args.no_speaker_filter and args.min_speaker_records > 0:
+        for plan in plans:
+            speaker_counts: dict[str, int] = defaultdict(int)
+            for selected in plan.selected:
+                speaker_id = selected.metadata.get("speaker_id")
+                if isinstance(speaker_id, str) and speaker_id:
+                    speaker_counts[speaker_id] += 1
+            removed_speakers = {
+                sid for sid, count in speaker_counts.items()
+                if count < args.min_speaker_records
+            }
+            if removed_speakers:
+                before_count = len(plan.selected)
+                kept = []
+                removed_tars: set[tuple[str, str, int]] = set()
+                for selected in plan.selected:
+                    speaker_id = selected.metadata.get("speaker_id")
+                    if isinstance(speaker_id, str) and speaker_id in removed_speakers:
+                        removed_tars.add((
+                            next(
+                                tar_key
+                                for tar_key, members in plan.by_tar.items()
+                                if selected.member in members
+                                and selected.member_occurrence in members[selected.member]
+                            ),
+                            selected.member,
+                            selected.member_occurrence,
+                        ))
+                        duration = selected.metadata.get("duration", 0)
+                        plan.selected_duration_seconds -= float(duration)
+                    else:
+                        kept.append(selected)
+                plan.selected = kept
+                # Clean up by_tar
+                for tar_key, member, occurrence in removed_tars:
+                    if member in plan.by_tar.get(tar_key, {}):
+                        plan.by_tar[tar_key][member].pop(occurrence, None)
+                        if not plan.by_tar[tar_key][member]:
+                            del plan.by_tar[tar_key][member]
+                    if tar_key in plan.by_tar and not plan.by_tar[tar_key]:
+                        del plan.by_tar[tar_key]
+                log(
+                    "speaker_filter",
+                    dataset=plan.name,
+                    removed_speakers=len(removed_speakers),
+                    records_before=before_count,
+                    records_after=len(plan.selected),
+                    min_speaker_records=args.min_speaker_records,
+                )
     if args.sample_metadata:
         rng = random.Random(args.sample_seed)
         reservoir: list[tuple[str, dict[str, Any]]] = []
@@ -850,6 +1287,10 @@ def main() -> None:
         reserved_free_bytes=RESERVED_FREE_BYTES,
     )
     if args.preflight_only:
+        if skipped_datasets:
+            log("PREFLIGHT_NOTE", message=f"{len(skipped_datasets)} datasets skipped (no new tars)")
+        if not args.no_pull_maskgct_codes:
+            log("PREFLIGHT_NOTE", message="maskGCT codes will be downloaded after sync")
         return
 
     metadata_tmp_paths = {
@@ -876,11 +1317,32 @@ def main() -> None:
             )
         )
 
+    # Download maskGCT codes if requested
+    if not args.no_pull_maskgct_codes:
+        download_maskgct_codes(fs, output_root, plans, args.attempts, args.workers)
+
+    # Update sync state with successfully synced tar shards
+    updated_state = load_sync_state(output_root)
+    if "datasets" not in updated_state:
+        updated_state["datasets"] = {}
+    for plan in plans:
+        current_tars = sorted(prefetched_audio_details.get(plan.name, {}).keys())
+        updated_state["datasets"][plan.name] = {
+            "filter_key": filter_key,
+            "synced_tars": current_tars,
+            "synced_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "selected_records": len(plan.selected),
+        }
+    save_sync_state(output_root, updated_state)
+    log("SYNC_STATE_SAVED", datasets=len(plans))
+
     summary = {
         "source": f"gs://{SOURCE_PREFIX}",
         "output_root": str(output_root),
         "duration_filter": f"> {args.min_duration}",
         "sample_rate_filter": f">= {args.min_sample_rate}",
+        "cer_filter": f"<= {args.max_cer}" if not args.no_cer_filter else "disabled",
+        "speaker_filter": f">= {args.min_speaker_records} records" if not args.no_speaker_filter else "disabled",
         "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "datasets": summaries,
         "totals": {

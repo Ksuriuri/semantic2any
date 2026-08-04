@@ -255,3 +255,78 @@ class BigVGANLoopLoss(nn.Module):
         mel_loss = self._mel_recon_loss(wav_pred, gt_wav_chunk)
         stft_loss = self._stft_recon_loss(wav_pred, gt_wav_chunk)
         return mel_loss + self.stft_weight * stft_loss
+
+
+class BigVGANWaveformLoss(nn.Module):
+    """BigVGAN-in-the-loop waveform L1 loss.
+
+    pred mel -> BigVGAN -> waveform -> multi-scale waveform L1 vs GT waveform.
+    Direct time-domain supervision that effectively suppresses artifacts.
+    """
+
+    def __init__(
+        self,
+        vocoder: nn.Module,
+        sr: int = 44100,
+        max_chunk_frames: int = 128,
+        pool_sizes: tuple[int, ...] = (2, 4, 8),
+    ):
+        super().__init__()
+        self.vocoder = vocoder
+        for p in self.vocoder.parameters():
+            p.requires_grad_(False)
+        self.sr = sr
+        self.max_chunk_frames = max_chunk_frames
+        self.pool_sizes = pool_sizes
+        self._gt_wav_cache = None
+
+    def _vocoder_forward(self, mel: torch.Tensor) -> torch.Tensor:
+        return self.vocoder(mel).squeeze(1)
+
+    def forward(
+        self,
+        x1_hat: torch.Tensor,
+        x1: torch.Tensor,
+        mel_lens: torch.Tensor,
+        prompt_lens: torch.Tensor,
+        gt_wav: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if gt_wav is None:
+            gt_wav = self._gt_wav_cache
+        if gt_wav is None:
+            with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=False):
+                gt_wav = self.vocoder(x1.float()).squeeze(1)
+            self._gt_wav_cache = gt_wav.detach()
+
+        B = x1_hat.size(0)
+        prompt_frames = prompt_lens[0].item() if B == 1 else int(prompt_lens.max().item())
+        mel_end = mel_lens[0].item() if B == 1 else int(mel_lens.max().item())
+
+        gen_start = prompt_frames
+        gen_end = min(mel_end, gen_start + self.max_chunk_frames)
+        if gen_end <= gen_start:
+            return torch.zeros((), device=x1_hat.device, dtype=x1_hat.dtype)
+
+        x1_hat_chunk = x1_hat[:, :, gen_start:gen_end].float()
+
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            wav_pred = self._vocoder_forward(x1_hat_chunk)
+
+        hop_size = 512
+        wav_start = gen_start * hop_size
+        wav_end = gen_end * hop_size
+        gt_wav_chunk = gt_wav[:, wav_start:wav_end]
+
+        min_len = min(wav_pred.size(-1), gt_wav_chunk.size(-1))
+        if min_len < 512:
+            return torch.zeros((), device=x1_hat.device, dtype=x1_hat.dtype)
+        wav_pred = wav_pred[..., :min_len]
+        gt_wav_chunk = gt_wav_chunk[..., :min_len]
+
+        # Multi-scale waveform L1
+        loss = (wav_pred - gt_wav_chunk).abs().mean()
+        for pool_size in self.pool_sizes:
+            pred_ds = F.avg_pool1d(wav_pred.unsqueeze(1), pool_size, pool_size).squeeze(1)
+            gt_ds = F.avg_pool1d(gt_wav_chunk.unsqueeze(1), pool_size, pool_size).squeeze(1)
+            loss = loss + (pred_ds - gt_ds).abs().mean()
+        return loss / (1.0 + len(self.pool_sizes))

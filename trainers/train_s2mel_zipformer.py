@@ -1476,7 +1476,7 @@ def main() -> None:
 # --- Auxiliary loss support (env-var gated) -----------------------------------
 import os as _aux_os
 
-_AUX_LOSS_TYPE = _aux_os.environ.get("AUX_LOSS_TYPE", "")  # "mr_stft" or "bigvgan_loop"
+_AUX_LOSS_TYPE = _aux_os.environ.get("AUX_LOSS_TYPE", "bigvgan_waveform")
 _AUX_LOSS_WEIGHT = float(_aux_os.environ.get("AUX_LOSS_WEIGHT", "0.1"))
 _FLOW_LOSS_WEIGHT = float(_aux_os.environ.get("FLOW_LOSS_WEIGHT", "1.0"))
 _AUX_LOSS_MODULE = None
@@ -1519,6 +1519,28 @@ def _init_aux_loss(cfg, device, dtype):
             win_list=(2048, 1024, 512),
         ).to(device)
         print(f"[AuxLoss] BigVGANLoopLoss enabled, weight={_AUX_LOSS_WEIGHT}")
+    elif _AUX_LOSS_TYPE == "bigvgan_waveform":
+        from semantic2any.losses.auxiliary_losses import BigVGANWaveformLoss
+        from semantic2any.third_party.indextts.bigvgan import BigVGAN
+        vocoder_cfg = _get(cfg, "vocoder", None)
+        model_id = (
+            "nvidia/bigvgan_v2_44khz_128band_512x"
+            if vocoder_cfg is None
+            else str(_get(vocoder_cfg, "model_id", "") or "nvidia/bigvgan_v2_44khz_128band_512x")
+        )
+        cache_dir = str(_get(vocoder_cfg, "cache_dir", "") or "") if vocoder_cfg else ""
+        load_kwargs = {}
+        if cache_dir:
+            load_kwargs["cache_dir"] = cache_dir
+        vocoder = BigVGAN.from_pretrained(model_id, **load_kwargs)
+        vocoder = vocoder.to(device=device)
+        vocoder.remove_weight_norm()
+        vocoder.eval()
+        _AUX_LOSS_MODULE = BigVGANWaveformLoss(
+            vocoder=vocoder,
+            sr=int(_get(_get(cfg, "preprocess_params"), "sr", 44100)),
+        ).to(device)
+        print(f"[AuxLoss] BigVGANWaveformLoss enabled, weight={_AUX_LOSS_WEIGHT}")
 
 
 def forward_loss_with_aux(model, batch):
