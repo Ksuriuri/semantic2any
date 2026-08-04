@@ -33,3 +33,4 @@ gcs-key.json
 key.json
 
 .DS_Store
+_experiment_scripts/
