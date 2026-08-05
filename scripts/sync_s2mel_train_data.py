@@ -278,7 +278,7 @@ def _filter_params_key(args: argparse.Namespace) -> str:
         "min_speaker_records": args.min_speaker_records if not args.no_speaker_filter else None,
         "asr_primary": args.asr_primary if not args.no_cer_filter else None,
         "asr_secondary": args.asr_secondary if not args.no_cer_filter else None,
-        "require_maskgct_codes": args.require_maskgct_codes,
+        "require_maskgct_codes": not args.no_require_maskgct_codes,
     }
     return hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -1127,8 +1127,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-cer-filter", action="store_true", help="Skip CER filtering.")
     parser.add_argument("--no-speaker-filter", action="store_true", help="Skip speaker count filtering.")
-    parser.add_argument("--require-maskgct-codes", action="store_true",
-                        help="Only keep records that have maskGCT codes on GCS.")
+    parser.add_argument("--no-require-maskgct-codes", action="store_true",
+                        help="Disable filtering records by maskGCT codes availability.")
     parser.add_argument("--no-pull-maskgct-codes", action="store_true",
                         help="Skip downloading maskGCT semantic codes from GCS.")
     parser.add_argument("--force-rescan", action="store_true",
@@ -1346,7 +1346,7 @@ def main() -> None:
             asr_primary=args.asr_primary,
             asr_secondary=args.asr_secondary,
             skip_cer=args.no_cer_filter,
-            require_maskgct_codes=args.require_maskgct_codes,
+            require_maskgct_codes=not args.no_require_maskgct_codes,
             audio_details=prefetched_audio_details.get(dataset),
         )
         for dataset in datasets_to_scan
