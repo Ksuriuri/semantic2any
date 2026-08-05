@@ -55,28 +55,93 @@ def log(event: str, **fields: Any) -> None:
     )
 
 
-def compute_cer(reference: str, hypothesis: str) -> float:
-    """Compute Character Error Rate between two strings."""
-    if not reference and not hypothesis:
-        return 0.0
-    if not reference:
-        return 1.0
-    ref = list(reference.strip())
-    hyp = list(hypothesis.strip())
-    n = len(ref)
-    m = len(hyp)
-    dp = [[0] * (m + 1) for _ in range(n + 1)]
-    for i in range(n + 1):
-        dp[i][0] = i
-    for j in range(m + 1):
-        dp[0][j] = j
+import re
+import unicodedata
+
+try:
+    from rapidfuzz.distance import Levenshtein as _rf_lev
+    _USE_RAPIDFUZZ = True
+except ImportError:
+    _USE_RAPIDFUZZ = False
+
+_CJK_RANGES = (
+    (0x4E00, 0x9FFF), (0x3400, 0x4DBF), (0x3000, 0x303F),
+    (0x3040, 0x309F), (0x30A0, 0x30FF), (0xAC00, 0xD7AF),
+)
+
+def _is_cjk_lang(language: str) -> bool:
+    return language.lower() in ("zh", "ja", "ko", "cmn", "yue", "jpn", "kor", "chinese", "japanese", "korean")
+
+def _normalize_text(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text.strip().lower())
+    text = re.sub(r"[^\w]", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+def _edit_distance(ref_seq: list | str, hyp_seq: list | str) -> int:
+    if _USE_RAPIDFUZZ:
+        if isinstance(ref_seq, list):
+            return _rf_lev.distance(ref_seq, hyp_seq)
+        return _rf_lev.distance(ref_seq, hyp_seq)
+    n, m = len(ref_seq), len(hyp_seq)
+    if n == 0:
+        return m
+    if m == 0:
+        return n
+    prev = list(range(m + 1))
+    curr = [0] * (m + 1)
     for i in range(1, n + 1):
+        curr[0] = i
         for j in range(1, m + 1):
-            if ref[i - 1] == hyp[j - 1]:
-                dp[i][j] = dp[i - 1][j - 1]
+            if ref_seq[i - 1] == hyp_seq[j - 1]:
+                curr[j] = prev[j - 1]
             else:
-                dp[i][j] = 1 + min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
-    return dp[n][m] / n if n > 0 else 0.0
+                curr[j] = 1 + min(prev[j], curr[j - 1], prev[j - 1])
+        prev, curr = curr, prev
+    return prev[m]
+
+def compute_error_rate(reference: str, hypothesis: str, use_wer: bool = False) -> float:
+    """Compute WER (word-level) or CER (char-level) after normalization."""
+    ref_norm = _normalize_text(reference)
+    hyp_norm = _normalize_text(hypothesis)
+    if not ref_norm and not hyp_norm:
+        return 0.0
+    if not ref_norm:
+        return 1.0
+    if use_wer:
+        ref_seq = ref_norm.split()
+        hyp_seq = hyp_norm.split()
+        n = len(ref_seq)
+        if n == 0:
+            return 1.0
+        return _edit_distance(ref_seq, hyp_seq) / n
+    else:
+        n = len(ref_norm)
+        if n == 0:
+            return 1.0
+        return _edit_distance(ref_norm, hyp_norm) / n
+
+
+def _read_one_asr_shard(
+    fs: gcsfs.GCSFileSystem,
+    asr_path: str,
+    attempts: int,
+) -> dict[str, str]:
+    texts: dict[str, str] = {}
+    with retry(
+        f"open {asr_path}",
+        lambda p=asr_path: fs.open(p, "r"),
+        attempts,
+    ) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            rid = row.get("id")
+            text = row.get("text")
+            if rid and isinstance(text, str) and text.strip():
+                texts[rid] = text.strip()
+    return texts
 
 
 def load_asr_texts(
@@ -84,8 +149,9 @@ def load_asr_texts(
     dataset_prefix: str,
     asr_model: str,
     attempts: int,
+    workers: int = 16,
 ) -> dict[str, str]:
-    """Load ASR transcriptions for a dataset into a dict keyed by record id."""
+    """Load ASR transcriptions concurrently into a dict keyed by record id."""
     asr_prefix = f"{dataset_prefix}/asr/{asr_model}"
     try:
         asr_paths = sorted(
@@ -100,25 +166,76 @@ def load_asr_texts(
     if not asr_paths:
         return {}
     texts: dict[str, str] = {}
-    for asr_path in asr_paths:
-        try:
-            with retry(
-                f"open {asr_path}",
-                lambda p=asr_path: fs.open(p, "r"),
-                attempts,
-            ) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    row = json.loads(line)
-                    rid = row.get("id")
-                    text = row.get("text")
-                    if rid and isinstance(text, str) and text.strip():
-                        texts[rid] = text.strip()
-        except Exception as exc:
-            log("asr_load_warning", asr_path=asr_path, error=str(exc))
+    with ThreadPoolExecutor(max_workers=min(workers, len(asr_paths))) as executor:
+        futures = {
+            executor.submit(_read_one_asr_shard, fs, p, attempts): p
+            for p in asr_paths
+        }
+        for future in as_completed(futures):
+            asr_path = futures[future]
+            try:
+                shard_texts = future.result()
+                texts.update(shard_texts)
+            except Exception as exc:
+                log("asr_load_warning", asr_path=asr_path, error=str(exc))
     return texts
+
+
+def _read_one_maskgct_shard(
+    fs: gcsfs.GCSFileSystem,
+    jsonl_path: str,
+    attempts: int,
+) -> set[str]:
+    ids: set[str] = set()
+    with retry(
+        f"open {jsonl_path}",
+        lambda p=jsonl_path: fs.open(p, "r"),
+        attempts,
+    ) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            rid = row.get("id")
+            if rid:
+                ids.add(rid)
+    return ids
+
+
+def load_maskgct_code_ids(
+    fs: gcsfs.GCSFileSystem,
+    dataset_prefix: str,
+    attempts: int,
+    workers: int = 16,
+) -> set[str]:
+    """Load the set of record IDs that have maskGCT codes on GCS."""
+    codes_prefix = f"{dataset_prefix}/features/maskGCT_codes"
+    try:
+        all_files = retry(
+            f"glob {codes_prefix}/*.jsonl",
+            lambda: fs.glob(f"{codes_prefix}/*.jsonl"),
+            attempts,
+        )
+    except Exception:
+        return set()
+    jsonl_paths = sorted(str(p) for p in all_files)
+    if not jsonl_paths:
+        return set()
+    ids: set[str] = set()
+    with ThreadPoolExecutor(max_workers=min(workers, len(jsonl_paths))) as executor:
+        futures = {
+            executor.submit(_read_one_maskgct_shard, fs, p, attempts): p
+            for p in jsonl_paths
+        }
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                shard_ids = future.result()
+                ids.update(shard_ids)
+            except Exception as exc:
+                log("maskgct_ids_load_warning", path=path, error=str(exc))
+    return ids
 
 
 def retry(description: str, operation: Callable[[], T], attempts: int) -> T:
@@ -161,6 +278,7 @@ def _filter_params_key(args: argparse.Namespace) -> str:
         "min_speaker_records": args.min_speaker_records if not args.no_speaker_filter else None,
         "asr_primary": args.asr_primary if not args.no_cer_filter else None,
         "asr_secondary": args.asr_secondary if not args.no_cer_filter else None,
+        "require_maskgct_codes": args.require_maskgct_codes,
     }
     return hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -396,6 +514,7 @@ def scan_dataset(
     asr_primary: str = DEFAULT_ASR_PRIMARY,
     asr_secondary: str = DEFAULT_ASR_SECONDARY,
     skip_cer: bool = False,
+    require_maskgct_codes: bool = False,
     audio_details: dict[str, dict[str, Any]] | None = None,
 ) -> DatasetPlan:
     dataset_prefix = f"{SOURCE_PREFIX}/{dataset}"
@@ -419,17 +538,59 @@ def scan_dataset(
     asr_primary_texts: dict[str, str] = {}
     asr_secondary_texts: dict[str, str] = {}
     if not skip_cer:
-        dataset_prefix = f"{SOURCE_PREFIX}/{dataset}"
+        asr_primary_used = asr_primary
+        asr_secondary_used = asr_secondary
         asr_primary_texts = load_asr_texts(fs, dataset_prefix, asr_primary, attempts)
         asr_secondary_texts = load_asr_texts(fs, dataset_prefix, asr_secondary, attempts)
+        # Auto-detect available ASR models if configured ones return empty
+        if not asr_primary_texts or not asr_secondary_texts:
+            try:
+                asr_dirs = sorted(
+                    p.rsplit("/", 1)[-1]
+                    for p in retry(
+                        f"ls {dataset_prefix}/asr",
+                        lambda: fs.ls(f"{dataset_prefix}/asr"),
+                        attempts,
+                    )
+                    if not p.endswith(".jsonl")
+                )
+            except Exception:
+                asr_dirs = []
+            if asr_dirs:
+                if not asr_primary_texts and asr_dirs:
+                    for candidate in asr_dirs:
+                        if candidate != asr_secondary_used:
+                            asr_primary_texts = load_asr_texts(fs, dataset_prefix, candidate, attempts)
+                            if asr_primary_texts:
+                                asr_primary_used = candidate
+                                break
+                if not asr_secondary_texts and len(asr_dirs) > 1:
+                    for candidate in asr_dirs:
+                        if candidate != asr_primary_used:
+                            asr_secondary_texts = load_asr_texts(fs, dataset_prefix, candidate, attempts)
+                            if asr_secondary_texts:
+                                asr_secondary_used = candidate
+                                break
         log(
             "asr_loaded",
             dataset=dataset,
-            primary_model=asr_primary,
+            primary_model=asr_primary_used,
             primary_records=len(asr_primary_texts),
-            secondary_model=asr_secondary,
+            secondary_model=asr_secondary_used,
             secondary_records=len(asr_secondary_texts),
         )
+    # Load maskGCT code IDs if filtering is required
+    maskgct_ids: set[str] = set()
+    if require_maskgct_codes:
+        maskgct_ids = load_maskgct_code_ids(fs, dataset_prefix, attempts, metadata_workers)
+        log(
+            "maskgct_ids_loaded",
+            dataset=dataset,
+            ids_count=len(maskgct_ids),
+        )
+        if not maskgct_ids:
+            log("maskgct_ids_warning", dataset=dataset, reason="no maskGCT code IDs found, all records will be filtered out")
+
     source_metadata_shards = len(metadata_paths)
     if metadata_shard_sample and metadata_shard_sample < len(metadata_paths):
         metadata_paths = sorted(
@@ -472,9 +633,7 @@ def scan_dataset(
             )
             tar_key = f"{dataset_prefix}/{tar_relative}"
             if tar_key not in audio_details:
-                raise FileNotFoundError(
-                    f"{location}: referenced tar does not exist: gs://{tar_key}"
-                )
+                continue
             occurrence_key = (tar_key, member)
             member_occurrence = member_occurrences[occurrence_key]
             member_occurrences[occurrence_key] += 1
@@ -482,38 +641,38 @@ def scan_dataset(
             if duration <= min_duration or sample_rate < min_sample_rate:
                 continue
 
-            # CER filtering
+            # WER/CER filtering (WER for English-like, CER for CJK)
             if not skip_cer:
                 record_id_for_cer = row.get("id", "")
+                record_lang = row.get("language", dataset.split("_")[-1] if "single_speaker_" in dataset else "")
+                use_wer = not _is_cjk_lang(record_lang)
                 metadata_text = row.get("text")
                 has_text = isinstance(metadata_text, str) and metadata_text.strip()
                 if has_text:
-                    # Use metadata text vs primary ASR
                     asr_text = asr_primary_texts.get(record_id_for_cer)
                     if asr_text:
-                        cer = compute_cer(metadata_text.strip(), asr_text)
-                        if cer > max_cer:
+                        err = compute_error_rate(metadata_text.strip(), asr_text, use_wer=use_wer)
+                        if err > max_cer:
                             continue
                 else:
-                    # Use primary ASR vs secondary ASR
                     primary_text = asr_primary_texts.get(record_id_for_cer)
                     secondary_text = asr_secondary_texts.get(record_id_for_cer)
                     if primary_text and secondary_text:
-                        cer = compute_cer(primary_text, secondary_text)
-                        if cer > max_cer:
+                        err = compute_error_rate(primary_text, secondary_text, use_wer=use_wer)
+                        if err > max_cer:
                             continue
                     elif not primary_text and not secondary_text:
-                        # No ASR available and no text — skip
                         continue
 
             record_id = row.get("id")
             if not isinstance(record_id, str) or not record_id:
                 raise ValueError(f"{location}: missing id")
             if record_id in seen_ids:
-                raise ValueError(
-                    f"{dataset}: duplicate selected id {record_id!r}: "
-                    f"{seen_ids[record_id]} and {location}"
-                )
+                continue
+
+            # maskGCT codes filter
+            if require_maskgct_codes and record_id not in maskgct_ids:
+                continue
 
             basename = flat_output_name(
                 tar_relative,
@@ -968,6 +1127,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-cer-filter", action="store_true", help="Skip CER filtering.")
     parser.add_argument("--no-speaker-filter", action="store_true", help="Skip speaker count filtering.")
+    parser.add_argument("--require-maskgct-codes", action="store_true",
+                        help="Only keep records that have maskGCT codes on GCS.")
     parser.add_argument("--no-pull-maskgct-codes", action="store_true",
                         help="Skip downloading maskGCT semantic codes from GCS.")
     parser.add_argument("--force-rescan", action="store_true",
@@ -1185,6 +1346,7 @@ def main() -> None:
             asr_primary=args.asr_primary,
             asr_secondary=args.asr_secondary,
             skip_cer=args.no_cer_filter,
+            require_maskgct_codes=args.require_maskgct_codes,
             audio_details=prefetched_audio_details.get(dataset),
         )
         for dataset in datasets_to_scan
