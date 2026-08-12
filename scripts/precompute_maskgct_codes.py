@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Precompute compact MaskGCT semantic indices into resumable binary shards."""
+"""Precompute compact semantic code indices into resumable binary shards.
+
+Handles both semantic codecs.  ``maskgct`` stores a [8192, 1024] lookup table
+beside the codes; ``indextts25`` (the default) stores a decoder bundle instead,
+because its decode is context dependent and has no per-code table.  Either way
+the manifest points at the artifact through ``semantic_lookup_path`` /
+``semantic_lookup_sha256``, so the codes can only ever be decoded by the same
+weights that produced them.
+"""
 
 from __future__ import annotations
 
@@ -25,17 +33,29 @@ from tqdm.auto import tqdm
 
 from semantic2any.data.s2mel_dataset import S2MelJsonlDataset
 from semantic2any.utils.semantic_codecs import (
+    SEMANTIC_CODEC_FRAMES_PER_CODE,
+    IndexTTS25SemanticCodec,
     MaskGCTSemanticCodec,
     build_semantic_codec,
     resolve_semantic_codec_config,
     semantic_codec_info,
+    semantic_frames_per_code,
     sha256_file,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract one uint16 MaskGCT code per 50 Hz semantic frame."
+        description=(
+            "Extract one uint16 semantic code per code frame "
+            "(50 Hz for maskgct, 25 Hz for indextts25)."
+        )
+    )
+    parser.add_argument(
+        "--semantic-codec",
+        default=None,
+        choices=sorted(SEMANTIC_CODEC_FRAMES_PER_CODE),
+        help="Override semantic_codec.type from the config.",
     )
     parser.add_argument(
         "--source",
@@ -175,11 +195,11 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
     tmp_path.replace(path)
 
 
-def _install_lookup_once(path: Path, lookup: torch.Tensor) -> None:
+def _install_payload_once(path: Path, payload: Any) -> None:
     if path.is_file():
         return
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    torch.save({"lookup": lookup.float().cpu().contiguous()}, tmp_path)
+    torch.save(payload, tmp_path)
     try:
         os.link(tmp_path, path)
     except FileExistsError:
@@ -262,7 +282,8 @@ def main() -> None:
     cfg = OmegaConf.load(args.config)
     if args.model_dir is not None:
         cfg.paths.model_dir = args.model_dir
-    info = resolve_semantic_codec_config(cfg, "maskgct")
+    # None keeps whatever the config pinned, which now defaults to indextts25.
+    info = resolve_semantic_codec_config(cfg, args.semantic_codec)
     max_audio_seconds = (
         float(args.max_audio_seconds)
         if args.max_audio_seconds is not None
@@ -282,7 +303,9 @@ def main() -> None:
     binary_path = codes_dir / f"codes.{suffix}.bin"
     manifest_path = manifests_dir / f"manifest.{suffix}.jsonl"
     errors_path = errors_dir / f"errors.{suffix}.jsonl"
-    lookup_path = output_dir / "maskgct_lookup.pt"
+    lookup_path = output_dir / (
+        "maskgct_lookup.pt" if info.name == "maskgct" else f"{info.name}_decoder.pt"
+    )
     metadata_path = output_dir / "semantic_code_metadata.json"
 
     if args.overwrite:
@@ -355,29 +378,59 @@ def main() -> None:
         cfg, model_dir=Path(cfg.paths.model_dir).expanduser().resolve()
     )
     if not isinstance(backend, MaskGCTSemanticCodec):
-        raise TypeError("Expected MaskGCTSemanticCodec")
+        raise TypeError(f"{info.name} precompute needs a w2v-bert semantic codec")
     backend = backend.to(device).eval()
 
-    lookup = backend.codebook_lookup()
-    _install_lookup_once(lookup_path, lookup)
-    installed_payload = torch.load(lookup_path, map_location="cpu")
-    installed_lookup = (
-        installed_payload.get("lookup")
-        if isinstance(installed_payload, dict)
-        else installed_payload
-    )
-    if not isinstance(installed_lookup, torch.Tensor) or not torch.equal(
-        installed_lookup.float(), lookup.float()
-    ):
-        raise ValueError(f"Existing lookup table does not match this codec: {lookup_path}")
+    if isinstance(backend, IndexTTS25SemanticCodec):
+        # Context-dependent decode: store the decode-side weights rather than a
+        # per-code table that cannot exist.
+        bundle = backend.decoder_bundle()
+        _install_payload_once(lookup_path, bundle)
+        installed = torch.load(lookup_path, map_location="cpu", weights_only=False)
+        if (
+            not isinstance(installed, dict)
+            or installed.get("codec_type") != bundle["codec_type"]
+            or installed.get("arch") != bundle["arch"]
+            or installed.get("source_checkpoint_sha256")
+            != bundle["source_checkpoint_sha256"]
+            or set(installed.get("state_dict", {})) != set(bundle["state_dict"])
+            or not all(
+                torch.equal(installed["state_dict"][key].float(), value.float())
+                for key, value in bundle["state_dict"].items()
+            )
+        ):
+            raise ValueError(
+                f"Existing decoder bundle does not match this codec: {lookup_path}"
+            )
+        codebook_size = int(bundle["arch"]["codebook_size"])
+        codebook_dim = int(bundle["semantic_dim"])
+        lookup_kind = "decoder_bundle"
+    else:
+        lookup = backend.codebook_lookup()
+        _install_payload_once(lookup_path, {"lookup": lookup.float().cpu().contiguous()})
+        installed_payload = torch.load(lookup_path, map_location="cpu")
+        installed_lookup = (
+            installed_payload.get("lookup")
+            if isinstance(installed_payload, dict)
+            else installed_payload
+        )
+        if not isinstance(installed_lookup, torch.Tensor) or not torch.equal(
+            installed_lookup.float(), lookup.float()
+        ):
+            raise ValueError(f"Existing lookup table does not match this codec: {lookup_path}")
+        codebook_size = int(lookup.size(0))
+        codebook_dim = int(lookup.size(1))
+        lookup_kind = "lookup_table"
 
     metadata = {
         **semantic_codec_info(cfg).to_dict(),
-        "representation": "maskgct_codes",
-        "codebook_size": int(lookup.size(0)),
-        "codebook_dim": int(lookup.size(1)),
+        "representation": f"{info.name}_codes",
+        "codebook_size": codebook_size,
+        "codebook_dim": codebook_dim,
+        "frames_per_code": semantic_frames_per_code(info.name),
         "code_dtype": "uint16-le",
         "lookup_dtype": "float32",
+        "lookup_kind": lookup_kind,
         "lookup_file": lookup_path.name,
         "lookup_sha256": sha256_file(lookup_path),
         "checkpoint_path": str(backend.checkpoint_path),
@@ -435,10 +488,13 @@ def main() -> None:
                 codes = codes.detach().cpu().long().contiguous()
                 if codes.ndim != 1 or codes.numel() == 0:
                     raise ValueError(
-                        f"Invalid MaskGCT codes for {record['audio_path']}: {tuple(codes.shape)}"
+                        f"Invalid {info.name} codes for {record['audio_path']}: "
+                        f"{tuple(codes.shape)}"
                     )
-                if int(codes.min()) < 0 or int(codes.max()) >= 8192:
-                    raise ValueError(f"Out-of-range MaskGCT code for {record['audio_path']}")
+                if int(codes.min()) < 0 or int(codes.max()) >= codebook_size:
+                    raise ValueError(
+                        f"Out-of-range {info.name} code for {record['audio_path']}"
+                    )
                 encoded = codes.numpy().astype("<u2", copy=False)
                 binary.write(encoded.tobytes(order="C"))
                 binary.flush()

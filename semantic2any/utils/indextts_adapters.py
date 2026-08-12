@@ -85,25 +85,28 @@ class S2MelFeatureAdapter(nn.Module):
         self.model_dir = Path(_get(paths_cfg, "model_dir")).expanduser().resolve()
 
         from semantic2any.utils.semantic_codecs import (
-            MaskGCTCodebookDecoder,
+            SemanticCodeDecoder,
+            build_semantic_code_decoder,
             build_semantic_codec,
             semantic_codec_type,
         )
 
+        codec_type = semantic_codec_type(cfg)
         needs_model_dir = (
-            (semantic_lookup_path is None and semantic_codec_type(cfg) == "maskgct")
+            (semantic_lookup_path is None and codec_type in ("maskgct", "indextts25"))
             or self.use_style_condition
         )
         if needs_model_dir and not self.model_dir.exists():
             raise FileNotFoundError(f"model_dir does not exist: {self.model_dir}")
-        self.semantic_decoder: MaskGCTCodebookDecoder | None = None
+        self.semantic_decoder: SemanticCodeDecoder | None = None
         self.semantic_backend: nn.Module | None = None
         if semantic_lookup_path is not None:
-            if semantic_codec_type(cfg) != "maskgct":
-                raise ValueError("Precomputed MaskGCT codes require semantic_codec.type=maskgct")
-            self.semantic_decoder = MaskGCTCodebookDecoder(
+            # The stored artifact decides how the codes decode; the configured
+            # type only has to agree with it.
+            self.semantic_decoder = build_semantic_code_decoder(
                 semantic_lookup_path,
                 expected_sha256=semantic_lookup_sha256,
+                expected_codec=codec_type,
             )
         else:
             self.semantic_backend = build_semantic_codec(cfg, model_dir=self.model_dir)
@@ -240,6 +243,36 @@ class S2MelFeatureAdapter(nn.Module):
             )
         return self.semantic_backend.extract(waveforms)
 
+    @property
+    def semantic_frames_per_code(self) -> int:
+        """Decoded feature frames per stored code (2 for IndexTTS-2.5)."""
+        decoder = getattr(self, "semantic_decoder", None)
+        return 1 if decoder is None else int(getattr(decoder, "frames_per_code", 1))
+
+    def _code_rows(
+        self,
+        codes: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """Slice a padded code batch into unpadded per-sample rows.
+
+        Slicing before decoding is what keeps padding out of the decoder; for
+        the per-code MaskGCT table it is numerically identical to the old
+        decode-then-slice order.
+        """
+        if codes.ndim == 3 and codes.size(1) == 1:
+            codes = codes[:, 0]
+        if codes.ndim != 2 or lengths.ndim != 1 or lengths.size(0) != codes.size(0):
+            raise ValueError("Semantic codes must be [B,T] with matching [B] lengths")
+        codes = codes.to(self._module_device())
+        rows = []
+        for index, length in enumerate(lengths):
+            value = int(length.item())
+            if value <= 0 or value > codes.size(1):
+                raise ValueError(f"Invalid semantic code length {value}")
+            rows.append(codes[index, :value])
+        return rows
+
     @torch.no_grad()
     def _semantic_from_codes(
         self,
@@ -247,31 +280,48 @@ class S2MelFeatureAdapter(nn.Module):
         lengths: torch.Tensor,
     ) -> list[torch.Tensor]:
         if self.semantic_decoder is None:
-            raise RuntimeError("No MaskGCT semantic lookup table is loaded")
-        if codes.ndim == 3 and codes.size(1) == 1:
-            codes = codes[:, 0]
-        if codes.ndim != 2 or lengths.ndim != 1 or lengths.size(0) != codes.size(0):
-            raise ValueError("Semantic codes must be [B,T] with matching [B] lengths")
-        device = self._module_device()
-        decoded = self.semantic_decoder(codes.to(device))
-        outputs = []
-        for index, length in enumerate(lengths):
-            value = int(length.item())
-            if value <= 0 or value > decoded.size(1):
-                raise ValueError(f"Invalid semantic code length {value}")
-            outputs.append(decoded[index, :value].float())
-        return outputs
+            raise RuntimeError("No semantic code decoder is loaded")
+        return [
+            item.float()
+            for item in self.semantic_decoder.decode_sequences(
+                self._code_rows(codes, lengths)
+            )
+        ]
 
     @torch.no_grad()
     def finalize_worker_paired_batch(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
         """Move worker-built CPU mels to device and decode discrete semantic ids."""
         if "semantic" not in batch or "semantic_lens" not in batch:
             raise ValueError("Worker paired batch must contain semantic code ids and lengths")
+        if self.semantic_decoder is None:
+            raise RuntimeError("No semantic code decoder is loaded")
         semantic_ids = batch["semantic"]
         semantic_lens = batch["semantic_lens"]
+        prompt_semantic_lens = batch.get("prompt_semantic_lens")
         if torch.is_floating_point(semantic_ids):
             raise TypeError("Worker paired batch semantic payload must be discrete code ids")
-        semantics = self._semantic_from_codes(semantic_ids, semantic_lens)
+        if not isinstance(prompt_semantic_lens, torch.Tensor):
+            raise ValueError("Worker paired batch must carry prompt_semantic_lens")
+        rows = self._code_rows(semantic_ids, semantic_lens)
+        # The worker concatenates prompt and target codes into one row, but
+        # prompt and target are different audio: decode them separately so a
+        # context-dependent decoder never sees the seam, which inference has no
+        # equivalent of.  For the per-code MaskGCT table this is a no-op.
+        sequences: list[torch.Tensor] = []
+        for index, row in enumerate(rows):
+            split = int(prompt_semantic_lens[index])
+            if not 0 < split < row.numel():
+                raise ValueError(
+                    f"Invalid prompt semantic code length {split} for a "
+                    f"{row.numel()}-code pair"
+                )
+            sequences.extend([row[:split], row[split:]])
+        decoded = self.semantic_decoder.decode_sequences(sequences)
+        semantics = [
+            torch.cat([decoded[2 * index], decoded[2 * index + 1]], dim=0).float()
+            for index in range(len(rows))
+        ]
+        frames_per_code = self.semantic_frames_per_code
         device = self._module_device()
         out = dict(batch)
         out["semantic"] = pad_sequence(
@@ -279,6 +329,12 @@ class S2MelFeatureAdapter(nn.Module):
             batch_first=True,
             padding_value=0.0,
         ).to(device)
+        # Lengths arrive counted in codes; downstream everything is counted in
+        # decoded frames.
+        out["semantic_lens"] = torch.tensor(
+            [item.size(0) for item in semantics], dtype=torch.long
+        )
+        out["prompt_semantic_lens"] = prompt_semantic_lens * frames_per_code
         for key in (
             "mel",
             "mel_lens",
@@ -590,13 +646,25 @@ class S2MelFeatureAdapter(nn.Module):
                     torch.zeros(int(getattr(self, "style_dim", 192)), device=device)
                 )
 
-        full_semantics = (
-            self._semantic_from_codes(semantic_codes, semantic_code_lens)
-            if semantic_codes is not None and semantic_code_lens is not None
-            else None
-        )
         segment_semantics: list[torch.Tensor] = []
-        if full_semantics is None:
+        if semantic_codes is not None and semantic_code_lens is not None:
+            assert self.semantic_decoder is not None
+            code_sequences: list[torch.Tensor] = []
+            for index, row in enumerate(
+                self._code_rows(semantic_codes, semantic_code_lens)
+            ):
+                if row.numel() < 2:
+                    raise ValueError("Random split requires at least two semantic codes")
+                split = max(
+                    1,
+                    min(row.numel() - 1, round(row.numel() * split_fractions[index])),
+                )
+                code_sequences.extend([row[:split], row[split:]])
+            segment_semantics = [
+                item.float()
+                for item in self.semantic_decoder.decode_sequences(code_sequences)
+            ]
+        else:
             semantic_waveforms_16k = [
                 waveform.squeeze(0).detach().cpu().numpy()
                 for waveform in segment_waveforms_16k
@@ -615,21 +683,8 @@ class S2MelFeatureAdapter(nn.Module):
         for index, (prompt_mel, target_mel) in enumerate(
             zip(prompt_mels, target_mels, strict=True)
         ):
-            if full_semantics is None:
-                prompt_semantic = segment_semantics[2 * index]
-                target_semantic = segment_semantics[2 * index + 1]
-            else:
-                full_semantic = full_semantics[index]
-                if full_semantic.size(0) < 2:
-                    raise ValueError("Random split requires at least two semantic code frames")
-                prompt_semantic_len = round(
-                    full_semantic.size(0) * split_fractions[index]
-                )
-                prompt_semantic_len = max(
-                    1, min(full_semantic.size(0) - 1, prompt_semantic_len)
-                )
-                prompt_semantic = full_semantic[:prompt_semantic_len]
-                target_semantic = full_semantic[prompt_semantic_len:]
+            prompt_semantic = segment_semantics[2 * index]
+            target_semantic = segment_semantics[2 * index + 1]
             mels.append(torch.cat([prompt_mel, target_mel], dim=-1).transpose(0, 1))
             semantics.append(torch.cat([prompt_semantic, target_semantic], dim=0))
             prompt_lens.append(prompt_mel.size(-1))
@@ -882,21 +937,20 @@ class S2MelFeatureAdapter(nn.Module):
         mel_waveforms = resampled[self.sample_rate_mel]
         waveforms_16k = resampled[self.sample_rate_16k] if need_16k else []
 
-        full_prompt_semantics: list[torch.Tensor] | None = None
-        full_target_semantics: list[torch.Tensor] | None = None
+        prompt_code_rows: list[torch.Tensor] | None = None
+        target_code_rows: list[torch.Tensor] | None = None
         online_semantics: list[torch.Tensor] = []
         if code_mode:
             assert prompt_semantic_codes is not None
             assert prompt_semantic_code_lens is not None
             assert target_semantic_codes is not None
             assert target_semantic_code_lens is not None
-            full_prompt_semantics = self._semantic_from_codes(
-                prompt_semantic_codes,
-                prompt_semantic_code_lens,
+            assert self.semantic_decoder is not None
+            prompt_code_rows = self._code_rows(
+                prompt_semantic_codes, prompt_semantic_code_lens
             )
-            full_target_semantics = self._semantic_from_codes(
-                target_semantic_codes,
-                target_semantic_code_lens,
+            target_code_rows = self._code_rows(
+                target_semantic_codes, target_semantic_code_lens
             )
         else:
             semantic_waveforms = [
@@ -932,33 +986,44 @@ class S2MelFeatureAdapter(nn.Module):
                 self.mel_spectrogram(waveform.float(), **self.mel_args).squeeze(0)
                 for waveform in mel_inputs
             ]
+        code_sequences: list[torch.Tensor] = []
+        for index, singleton_split in enumerate(singleton_splits):
+            if not code_mode:
+                continue
+            assert prompt_code_rows is not None
+            assert target_code_rows is not None
+            if singleton_split:
+                split_code = singleton_code_splits[index]
+                assert split_code is not None
+                target_row = target_code_rows[index]
+                code_sequences.extend([target_row[:split_code], target_row[split_code:]])
+            else:
+                prompt_row = prompt_code_rows[index]
+                prompt_keep = max(
+                    1,
+                    min(
+                        prompt_row.numel(),
+                        round(
+                            prompt_row.numel()
+                            * prompt_segments[index].size(-1)
+                            / prompt_sources[index].size(-1)
+                        ),
+                    ),
+                )
+                code_sequences.extend([prompt_row[:prompt_keep], target_code_rows[index]])
+        code_semantics: list[torch.Tensor] = []
+        if code_mode:
+            assert self.semantic_decoder is not None
+            code_semantics = [
+                item.float()
+                for item in self.semantic_decoder.decode_sequences(code_sequences)
+            ]
         for index, singleton_split in enumerate(singleton_splits):
             prompt_mel = batched_mels[2 * index]
             target_mel = batched_mels[2 * index + 1]
             if code_mode:
-                assert full_prompt_semantics is not None
-                assert full_target_semantics is not None
-                if singleton_split:
-                    split_code = singleton_code_splits[index]
-                    assert split_code is not None
-                    full_semantic = full_target_semantics[index]
-                    prompt_semantic = full_semantic[:split_code]
-                    target_semantic = full_semantic[split_code:]
-                else:
-                    full_prompt = full_prompt_semantics[index]
-                    prompt_keep = max(
-                        1,
-                        min(
-                            full_prompt.size(0),
-                            round(
-                                full_prompt.size(0)
-                                * prompt_segments[index].size(-1)
-                                / prompt_sources[index].size(-1)
-                            ),
-                        ),
-                    )
-                    prompt_semantic = full_prompt[:prompt_keep]
-                    target_semantic = full_target_semantics[index]
+                prompt_semantic = code_semantics[2 * index]
+                target_semantic = code_semantics[2 * index + 1]
             else:
                 prompt_semantic = online_semantics[2 * index]
                 target_semantic = online_semantics[2 * index + 1]

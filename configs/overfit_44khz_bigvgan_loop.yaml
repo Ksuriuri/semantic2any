@@ -7,6 +7,9 @@ paths:
   w2v_bert_dir: w2v-bert-2.0
   w2v_stat: wav2vec2bert_stats.pt
 
+semantic_codec:
+  # Pinned: these codes/manifests predate the indextts25 default.
+  type: maskgct
 vocoder:
   model_id: nvidia/bigvgan_v2_44khz_128band_512x
   cache_dir: checkpoints/huggingface

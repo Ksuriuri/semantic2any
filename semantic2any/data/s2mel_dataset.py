@@ -20,6 +20,7 @@ from torch.utils.data import Dataset, Sampler
 
 from semantic2any.data.prompt_bandwidth import simulate_lower_sample_rate
 from semantic2any.third_party.indextts import mel_spectrogram
+from semantic2any.utils.semantic_codecs import canonical_semantic_codec
 
 
 DEFAULT_MAX_AUDIO_SECONDS = 30.0
@@ -517,7 +518,12 @@ def _record_has_singleton_semantic_budget(
     code_length = record.get("semantic_code_length")
     if not isinstance(code_length, (int, float)):
         return True
-    semantic_fps = record.get("semantic_fps", 50.0)
+    # Code rate, not feature rate.  Fall back to semantic_frame_rate: manifests
+    # written by the code-generation workers only carry that spelling, and
+    # assuming 50 Hz for a 25 Hz record would halve its apparent duration.
+    semantic_fps = record.get("semantic_fps")
+    if semantic_fps is None:
+        semantic_fps = record.get("semantic_frame_rate", 50.0)
     if not isinstance(semantic_fps, (int, float)) or semantic_fps <= 0:
         return True
     min_code_frames = math.ceil((min_prompt_seconds + min_target_seconds) * float(semantic_fps))
@@ -995,10 +1001,14 @@ class S2MelCollator:
                 flattened.extend((record["prompt"], record["target"]))
             else:
                 flattened.append(record)
+        expected_codec = canonical_semantic_codec(self.expected_semantic_codec)
         for record in flattened:
             actual_codec = record.get("semantic_codec")
             actual_fingerprint = record.get("semantic_fingerprint")
-            if actual_codec is not None and actual_codec != self.expected_semantic_codec:
+            if (
+                actual_codec is not None
+                and canonical_semantic_codec(actual_codec) != expected_codec
+            ):
                 raise ValueError(
                     "Precomputed semantic codec mismatch: "
                     f"manifest={actual_codec}, config={self.expected_semantic_codec}"
@@ -1214,11 +1224,14 @@ class S2MelCollator:
         lookup_paths = {str(record["semantic_lookup_path"]) for record in records}
         lookup_hashes = {str(record["semantic_lookup_sha256"]) for record in records}
         fingerprints = {str(record.get("semantic_fingerprint", "")) for record in records}
-        codecs = {str(record.get("semantic_codec", "")) for record in records}
+        codecs = {
+            canonical_semantic_codec(record.get("semantic_codec", ""))
+            for record in records
+        }
         if len(lookup_paths) != 1 or len(lookup_hashes) != 1:
             raise ValueError("A batch must use one semantic lookup table and checksum")
-        if len(fingerprints) != 1 or len(codecs) != 1 or codecs != {"maskgct"}:
-            raise ValueError("A semantic code batch must use one MaskGCT fingerprint")
+        if len(fingerprints) != 1 or len(codecs) != 1 or codecs == {""}:
+            raise ValueError("A semantic code batch must use one semantic codec fingerprint")
         encoded_max_durations = {
             float(record["semantic_max_audio_seconds"])
             for record in records

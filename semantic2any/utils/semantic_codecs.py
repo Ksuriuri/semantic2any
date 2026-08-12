@@ -43,6 +43,11 @@ class SemanticCodecInfo:
         return {**asdict(self), "fingerprint": self.fingerprint()}
 
 
+# The new default.  Set ``semantic_codec.type: maskgct`` to get the old
+# MaskGCT RepCodec back.
+DEFAULT_SEMANTIC_CODEC = "indextts25"
+
+
 SEMANTIC_CODEC_SPECS = {
     "maskgct": SemanticCodecInfo(
         name="maskgct",
@@ -51,6 +56,16 @@ SEMANTIC_CODEC_SPECS = {
         sample_rate=16000,
         is_discrete=False,
         source_model="IndexTTS/MaskGCT-RepCodec",
+    ),
+    "indextts25": SemanticCodecInfo(
+        name="indextts25",
+        semantic_dim=1024,
+        # Code rate.  The decoder upsamples 2x, so the features s2mel consumes
+        # stay at 50 Hz -- see SEMANTIC_CODEC_FRAMES_PER_CODE.
+        semantic_fps=25.0,
+        sample_rate=16000,
+        is_discrete=False,
+        source_model="IndexTTS-2.5/EnhancedCodec",
     ),
     "sac": SemanticCodecInfo(
         name="sac",
@@ -64,10 +79,46 @@ SEMANTIC_CODEC_SPECS = {
     ),
 }
 
+# Decoded feature frames per stored code.  MaskGCT decodes per frame;
+# IndexTTS-2.5 downsamples by 2 before quantizing and upsamples again when
+# decoding, so its codes run at 25 Hz while the features stay at 50 Hz.
+#
+# Deliberately kept out of SemanticCodecInfo: its fields feed fingerprint(),
+# and every manifest already written carries the fingerprint of the current
+# field set.
+SEMANTIC_CODEC_FRAMES_PER_CODE = {"maskgct": 1, "indextts25": 2, "sac": 1}
+
+# Codecs sharing MaskGCT's w2v-bert layer-17 front end and asset layout.
+W2V_BERT_CODECS = ("maskgct", "indextts25")
+
+# Manifest spellings that mean the same codec.  The code-generation workers
+# stamp "indextts2.5"; the config selector stays a plain identifier because it
+# also names files.
+SEMANTIC_CODEC_ALIASES = {
+    "indextts2.5": "indextts25",
+    "indextts-2.5": "indextts25",
+    "indextts_2.5": "indextts25",
+    "enhancedcodec": "indextts25",
+}
+
+
+def canonical_semantic_codec(name: Any) -> str:
+    key = str(name).strip().lower()
+    return SEMANTIC_CODEC_ALIASES.get(key, key)
+
+
+def semantic_frames_per_code(name: str) -> int:
+    return SEMANTIC_CODEC_FRAMES_PER_CODE[str(name).lower()]
+
+
+def semantic_feature_fps(info: SemanticCodecInfo) -> float:
+    """Rate of the features s2mel consumes; codes may be slower."""
+    return info.semantic_fps * semantic_frames_per_code(info.name)
+
 
 def semantic_codec_type(cfg: Any) -> str:
     codec_cfg = _get(cfg, "semantic_codec", None)
-    name = str(_get(codec_cfg, "type", "maskgct")).lower()
+    name = canonical_semantic_codec(_get(codec_cfg, "type", DEFAULT_SEMANTIC_CODEC))
     if name not in SEMANTIC_CODEC_SPECS:
         choices = ", ".join(sorted(SEMANTIC_CODEC_SPECS))
         raise ValueError(f"Unsupported semantic codec {name!r}; choose one of: {choices}")
@@ -84,7 +135,7 @@ def resolve_semantic_codec_config(cfg: Any, codec_type: str | None = None) -> Se
     if codec_type is not None:
         cfg.semantic_codec.type = str(codec_type).lower()
     elif _get(cfg.semantic_codec, "type", None) is None:
-        cfg.semantic_codec.type = "maskgct"
+        cfg.semantic_codec.type = DEFAULT_SEMANTIC_CODEC
 
     name = semantic_codec_type(cfg)
     info = semantic_codec_info(cfg)
@@ -104,7 +155,7 @@ def semantic_codec_info(cfg: Any) -> SemanticCodecInfo:
     name = semantic_codec_type(cfg)
     base = SEMANTIC_CODEC_SPECS[name]
     codec_cfg = _get(cfg, "semantic_codec", None)
-    if name == "maskgct":
+    if name in W2V_BERT_CODECS:
         paths_cfg = _get(cfg, "paths", None)
         model_dir = str(_get(paths_cfg, "model_dir", "") or "")
         checkpoint = str(_get(paths_cfg, "semantic_codec_ckpt", "") or "auto")
@@ -169,6 +220,17 @@ def prepare_feature_metadata(
 
 
 class MaskGCTSemanticCodec(nn.Module):
+    CODEC_NAME = "maskgct"
+    DOWNSAMPLE_SCALE = 1
+    STRICT_LOAD = False
+    CKPT_CANDIDATES = (
+        "semantic_codec.safetensors",
+        "semantic_codec/model.safetensors",
+        "semantic_codec.pth",
+        "semantic_codec.pt",
+    )
+    CKPT_GLOB = "**/*semantic*codec*.safetensors"
+
     def __init__(self, cfg: Any, model_dir: Path) -> None:
         super().__init__()
 
@@ -207,7 +269,9 @@ class MaskGCTSemanticCodec(nn.Module):
         # RepCodec's constructor defaults are the published MaskGCT dimensions.
         # A legacy IndexTTS config can still override them, but the minimal
         # asset bundle intentionally does not require the unrelated config.
-        self.codec = build_semantic_codec(semantic_codec_cfg).eval()
+        self.codec = build_semantic_codec(
+            semantic_codec_cfg, downsample_scale=self.DOWNSAMPLE_SCALE
+        ).eval()
 
         configured = str(_get(paths_cfg, "semantic_codec_ckpt", "") or "")
         if configured:
@@ -215,15 +279,10 @@ class MaskGCTSemanticCodec(nn.Module):
             if not checkpoint.is_file():
                 raise FileNotFoundError(f"semantic codec checkpoint not found: {checkpoint}")
         else:
-            candidates = [
-                model_dir / "semantic_codec.safetensors",
-                model_dir / "semantic_codec/model.safetensors",
-                model_dir / "semantic_codec.pth",
-                model_dir / "semantic_codec.pt",
-            ]
+            candidates = [model_dir / name for name in self.CKPT_CANDIDATES]
             checkpoint = next((path for path in candidates if path.is_file()), None)
             if checkpoint is None:
-                matches = sorted(model_dir.glob("**/*semantic*codec*.safetensors"))
+                matches = sorted(model_dir.glob(self.CKPT_GLOB))
                 checkpoint = matches[0] if matches else None
             if checkpoint is None:
                 raise FileNotFoundError(
@@ -236,14 +295,18 @@ class MaskGCTSemanticCodec(nn.Module):
             )
         else:
             state = torch.load(checkpoint, map_location="cpu")
-            self.codec.load_state_dict(state.get("state_dict", state), strict=False)
+            for key in ("model", "state_dict"):
+                if isinstance(state, dict) and isinstance(state.get(key), dict):
+                    state = state[key]
+                    break
+            self.codec.load_state_dict(state, strict=self.STRICT_LOAD)
         self.checkpoint_path = checkpoint.resolve()
         self.requires_grad_(False)
         self.eval()
 
     @property
     def info(self) -> SemanticCodecInfo:
-        return SEMANTIC_CODEC_SPECS["maskgct"]
+        return SEMANTIC_CODEC_SPECS[self.CODEC_NAME]
 
     def _quantize(
         self, feature: torch.Tensor
@@ -301,7 +364,7 @@ class MaskGCTSemanticCodec(nn.Module):
         lookup = self.codebook_lookup()
         return {
             **self.info.to_dict(),
-            "representation": "maskgct_codes",
+            "representation": f"{self.CODEC_NAME}_codes",
             "codebook_size": int(lookup.size(0)),
             "codebook_dim": int(lookup.size(1)),
             "code_dtype": "uint16",
@@ -335,16 +398,151 @@ class MaskGCTSemanticCodec(nn.Module):
             for index in range(feature.size(0))
         ]
 
+    def _codes_from_feature(self, feature: torch.Tensor) -> torch.Tensor:
+        return self._quantize(feature)[0]
+
     @torch.no_grad()
     def extract_codes(self, waveforms: list[np.ndarray]) -> list[torch.Tensor]:
         feature, lengths = self._encode_semantic_features(waveforms)
         return [
-            self._quantize(feature[index : index + 1, : int(lengths[index])])[0]
+            self._codes_from_feature(feature[index : index + 1, : int(lengths[index])])
             for index in range(feature.size(0))
         ]
 
 
-class MaskGCTCodebookDecoder(nn.Module):
+class IndexTTS25SemanticCodec(MaskGCTSemanticCodec):
+    """IndexTTS-2.5's EnhancedCodec: same w2v-bert front end, 25 Hz codes.
+
+    Architecturally this is the vendored ``RepCodec`` with
+    ``downsample_scale=2`` -- the same module hierarchy upstream calls
+    ``EnhancedCodec`` -- so ``codec.pth`` loads without any key translation.
+
+    Its decode side is **context dependent** (ConvNeXt stack plus a 2x
+    upsample), which has two consequences the MaskGCT path never had to worry
+    about: there is no per-code embedding table to precompute, and code
+    sequences must be decoded one unpadded utterance at a time.
+    """
+
+    CODEC_NAME = "indextts25"
+    DOWNSAMPLE_SCALE = 2
+    STRICT_LOAD = True
+    CKPT_CANDIDATES = ("codec.pth", "codec.pt", "codec.safetensors")
+    CKPT_GLOB = "**/codec.pth"
+
+    DECODE_PREFIXES = ("quantizer.", "decoder.", "up.")
+
+    def _codes_from_feature(self, feature: torch.Tensor) -> torch.Tensor:
+        codes, _ = self.codec.quantize(feature)
+        if codes.ndim == 2 and codes.size(0) == 1:
+            codes = codes.squeeze(0)
+        if codes.ndim != 1:
+            raise ValueError(
+                "IndexTTS-2.5 extraction expects one codebook and one utterance, "
+                f"got codes with shape {tuple(codes.shape)}"
+            )
+        return codes.long()
+
+    def _quantize(self, feature: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # quantize() returns the 25 Hz quantizer output; what s2mel consumes is
+        # decode()'s 50 Hz reconstruction, so ignore the former.
+        codes = self._codes_from_feature(feature)
+        return codes, self.decode_codes(codes).float()
+
+    def decode_codes(self, codes: torch.Tensor) -> torch.Tensor:
+        """Decode code ids to the 50 Hz features s2mel consumes."""
+        squeeze = False
+        if codes.ndim == 1:
+            codes = codes.unsqueeze(0)
+            squeeze = True
+        elif codes.ndim == 3 and codes.size(1) == 1:
+            codes = codes.squeeze(1)
+        if codes.ndim != 2:
+            raise ValueError(
+                "IndexTTS-2.5 codes must be [T], [B,T], or [B,1,T], "
+                f"got {tuple(codes.shape)}"
+            )
+        codebook_size = int(self.codec.quantizer.codebook_size)
+        if codes.numel() and (
+            int(codes.min().item()) < 0 or int(codes.max().item()) >= codebook_size
+        ):
+            raise ValueError(f"IndexTTS-2.5 codes must be in [0, {codebook_size})")
+        decoded = self.codec.decode(codes.long()).float()
+        return decoded.squeeze(0) if squeeze else decoded
+
+    def codebook_lookup(self) -> torch.Tensor:
+        raise TypeError(
+            "IndexTTS-2.5's decode is context dependent, so no "
+            "[codebook_size, dim] lookup table exists: decoding "
+            "arange(codebook_size) as one sequence would return a table in "
+            "which every code has been mixed through its neighbours. Use "
+            "decoder_bundle() instead."
+        )
+
+    def decoder_bundle(self) -> dict[str, Any]:
+        """Decode-side weights, to be stored beside the codes they belong to."""
+        state = {
+            key: value.detach().cpu().clone()
+            for key, value in self.codec.state_dict().items()
+            if key.startswith(self.DECODE_PREFIXES)
+        }
+        if not state:
+            raise ValueError("Refusing to write an empty decoder bundle")
+        return {
+            "codec_type": self.CODEC_NAME,
+            "frames_per_code": semantic_frames_per_code(self.CODEC_NAME),
+            "semantic_dim": int(self.info.semantic_dim),
+            "arch": {
+                "codebook_size": int(self.codec.codebook_size),
+                "hidden_size": int(self.codec.hidden_size),
+                "codebook_dim": int(self.codec.codebook_dim),
+                "vocos_dim": int(self.codec.vocos_dim),
+                "vocos_intermediate_dim": int(self.codec.vocos_intermediate_dim),
+                "vocos_num_layers": int(self.codec.vocos_num_layers),
+                "num_quantizers": int(self.codec.num_quantizers),
+                "downsample_scale": int(self.codec.downsample_scale),
+            },
+            "state_dict": state,
+            "source_checkpoint": str(self.checkpoint_path),
+            "source_checkpoint_sha256": sha256_file(self.checkpoint_path),
+        }
+
+    def codebook_metadata(self) -> dict[str, Any]:
+        return {
+            **self.info.to_dict(),
+            "representation": f"{self.CODEC_NAME}_codes",
+            "codebook_size": int(self.codec.quantizer.codebook_size),
+            "codebook_dim": int(self.info.semantic_dim),
+            "frames_per_code": semantic_frames_per_code(self.CODEC_NAME),
+            "code_dtype": "uint16",
+            "checkpoint_path": str(self.checkpoint_path),
+            "checkpoint_sha256": sha256_file(self.checkpoint_path),
+        }
+
+
+class SemanticCodeDecoder(nn.Module):
+    """Frozen decode side of a semantic codec, paired with stored code ids.
+
+    ``decode_sequences`` deliberately takes a list of already-sliced, unpadded
+    1-D code tensors rather than a padded ``[B, T]`` batch: a context-dependent
+    decoder has no length mask, so a padded batch leaks padding into every
+    sample's tail (measured 2-3 orders of magnitude above the decoder's own
+    noise floor) while inference never pads.
+    """
+
+    codec_name = "maskgct"
+    frames_per_code = 1
+
+    @torch.no_grad()
+    def decode_sequences(self, sequences: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Decode one sequence at a time; always correct, never batched.
+
+        Subclasses override this only to batch it where batching is provably
+        equivalent.
+        """
+        return [self(item.reshape(1, -1))[0] for item in sequences]
+
+
+class MaskGCTCodebookDecoder(SemanticCodeDecoder):
     """Lightweight frozen decoder for precomputed MaskGCT indices."""
 
     def __init__(
@@ -352,6 +550,7 @@ class MaskGCTCodebookDecoder(nn.Module):
         lookup_path: str | Path,
         *,
         expected_sha256: str | None = None,
+        payload: Any | None = None,
     ) -> None:
         super().__init__()
         lookup_path = Path(lookup_path).expanduser()
@@ -364,7 +563,8 @@ class MaskGCTCodebookDecoder(nn.Module):
                     "MaskGCT lookup table checksum mismatch: "
                     f"expected={expected_sha256}, actual={self.lookup_sha256}"
                 )
-        payload = torch.load(lookup_path, map_location="cpu")
+        if payload is None:
+            payload = torch.load(lookup_path, map_location="cpu")
         lookup = payload.get("lookup") if isinstance(payload, dict) else payload
         if not isinstance(lookup, torch.Tensor):
             raise TypeError(f"Invalid MaskGCT lookup payload in {lookup_path}")
@@ -394,6 +594,191 @@ class MaskGCTCodebookDecoder(nn.Module):
         ):
             raise ValueError(f"MaskGCT codes must be in [0, {self.lookup.size(0)})")
         return F.embedding(codes, self.lookup)
+
+    @torch.no_grad()
+    def decode_sequences(self, sequences: list[torch.Tensor]) -> list[torch.Tensor]:
+        if not sequences:
+            return []
+        # A per-code gather over the concatenation is exactly equal to decoding
+        # each sequence on its own, so this keeps the single-kernel fast path.
+        lengths = [int(item.numel()) for item in sequences]
+        flat = self(torch.cat([item.reshape(-1) for item in sequences], dim=0))
+        return list(torch.split(flat, lengths, dim=0))
+
+
+class IndexTTS25CodeDecoder(SemanticCodeDecoder):
+    """Frozen IndexTTS-2.5 decode side for precomputed 25 Hz code ids."""
+
+    codec_name = "indextts25"
+    frames_per_code = 2
+
+    def __init__(
+        self,
+        bundle_path: str | Path,
+        *,
+        expected_sha256: str | None = None,
+        payload: Any | None = None,
+    ) -> None:
+        super().__init__()
+        from semantic2any.third_party.indextts.maskgct import RepCodec
+
+        bundle_path = Path(bundle_path).expanduser()
+        if not bundle_path.is_file():
+            raise FileNotFoundError(
+                f"IndexTTS-2.5 decoder bundle not found: {bundle_path}"
+            )
+        self.lookup_sha256 = sha256_file(bundle_path)
+        if expected_sha256 and self.lookup_sha256 != expected_sha256:
+            raise ValueError(
+                "IndexTTS-2.5 decoder bundle checksum mismatch: "
+                f"expected={expected_sha256}, actual={self.lookup_sha256}"
+            )
+        if payload is None:
+            payload = torch.load(bundle_path, map_location="cpu", weights_only=False)
+        arch, state = _indextts25_bundle_contents(payload, bundle_path)
+        frames_per_code = int(payload.get("frames_per_code", self.frames_per_code))
+        if frames_per_code != int(arch.get("downsample_scale", 2)):
+            raise ValueError(
+                "IndexTTS-2.5 bundle is inconsistent: frames_per_code="
+                f"{frames_per_code} but downsample_scale={arch.get('downsample_scale')}"
+            )
+        self.frames_per_code = frames_per_code
+        codec = RepCodec(**arch)
+        missing, unexpected = codec.load_state_dict(state, strict=False)
+        stray = [key for key in missing if not key.startswith(("encoder.", "down."))]
+        if unexpected or stray:
+            raise ValueError(
+                "IndexTTS-2.5 decoder bundle does not match the vendored "
+                f"RepCodec: missing={stray[:5]}, unexpected={list(unexpected)[:5]}"
+            )
+        # The encode side is dead weight once the codes are stored.
+        codec.encoder = None
+        if getattr(codec, "down", None) is not None:
+            codec.down = None
+        codec.eval()
+        codec.requires_grad_(False)
+        self.codec = codec
+        self.codebook_size = int(codec.quantizer.codebook_size)
+        self.semantic_dim = int(arch["hidden_size"])
+        self.bundle_path = bundle_path.resolve()
+        self.source_checkpoint = str(payload.get("source_checkpoint", ""))
+        self.source_checkpoint_sha256 = str(payload.get("source_checkpoint_sha256", ""))
+
+    @torch.no_grad()
+    def forward(self, codes: torch.Tensor) -> torch.Tensor:
+        if codes.ndim == 1:
+            codes = codes.unsqueeze(0)
+        elif codes.ndim == 3:
+            if codes.size(1) != 1:
+                raise ValueError(
+                    f"IndexTTS-2.5 uses one codebook, got shape {tuple(codes.shape)}"
+                )
+            codes = codes[:, 0]
+        if codes.ndim != 2:
+            raise ValueError(
+                f"IndexTTS-2.5 codes must be [T] or [B,T], got {tuple(codes.shape)}"
+            )
+        if codes.numel() and (
+            int(codes.min().item()) < 0 or int(codes.max().item()) >= self.codebook_size
+        ):
+            raise ValueError(f"IndexTTS-2.5 codes must be in [0, {self.codebook_size})")
+        # Frozen fp32 feature extractor: keep it out of the training autocast so
+        # the same codes always decode to the same features.
+        with torch.autocast(device_type=codes.device.type, enabled=False):
+            return self.codec.decode(codes.long()).float()
+
+    @torch.no_grad()
+    def decode_sequences(self, sequences: list[torch.Tensor]) -> list[torch.Tensor]:
+        # One decode per sequence.  Batching would need equal lengths, and
+        # padding is not equivalent here (see SemanticCodeDecoder).
+        return [self(item.reshape(1, -1))[0] for item in sequences]
+
+
+def _indextts25_bundle_contents(
+    payload: Any, bundle_path: Path
+) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+    if not isinstance(payload, dict):
+        raise TypeError(f"Invalid IndexTTS-2.5 decoder payload in {bundle_path}")
+    if isinstance(payload.get("state_dict"), dict) and isinstance(
+        payload.get("arch"), dict
+    ):
+        return dict(payload["arch"]), dict(payload["state_dict"])
+    # A raw upstream codec.pth is accepted too, so a decoder can be built
+    # straight from IndexTTS-2.5's release.
+    state = payload.get("model") if isinstance(payload.get("model"), dict) else payload
+    if not isinstance(state, dict) or "quantizer.quantizers.0.codebook.weight" not in state:
+        raise TypeError(f"Invalid IndexTTS-2.5 decoder payload in {bundle_path}")
+    codebook = state["quantizer.quantizers.0.codebook.weight"]
+    hidden = int(state["decoder.1.weight"].shape[0])
+    arch = {
+        "codebook_size": int(codebook.shape[0]),
+        "codebook_dim": int(codebook.shape[1]),
+        "hidden_size": hidden,
+        "vocos_dim": int(state["decoder.0.embed.weight"].shape[0]),
+        "vocos_intermediate_dim": int(state["decoder.0.convnext.0.pwconv1.weight"].shape[0]),
+        "vocos_num_layers": 1
+        + max(
+            int(key.split(".")[3])
+            for key in state
+            if key.startswith("decoder.0.convnext.")
+        ),
+        "num_quantizers": 1
+        + max(
+            int(key.split(".")[2])
+            for key in state
+            if key.startswith("quantizer.quantizers.")
+        ),
+        "downsample_scale": 2 if any(key.startswith("up.") for key in state) else 1,
+    }
+    return arch, {
+        key: value
+        for key, value in state.items()
+        if key.startswith(IndexTTS25SemanticCodec.DECODE_PREFIXES)
+    }
+
+
+def build_semantic_code_decoder(
+    path: str | Path,
+    *,
+    expected_sha256: str | None = None,
+    expected_codec: str | None = None,
+) -> SemanticCodeDecoder:
+    """Build the decode side from the artifact the codes were stored with.
+
+    The artifact, not the config, decides how codes decode, so stored codes and
+    their decoder cannot drift apart.  ``expected_codec`` only cross-checks the
+    configured selector against what the artifact actually is.
+    """
+    path = Path(path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Semantic code decoder artifact not found: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(payload, dict) and payload.get("codec_type"):
+        codec_name = canonical_semantic_codec(payload["codec_type"])
+    elif isinstance(payload, dict) and (
+        isinstance(payload.get("model"), dict)
+        or "quantizer.quantizers.0.codebook.weight" in payload
+    ):
+        codec_name = "indextts25"
+    else:
+        codec_name = "maskgct"
+    if expected_codec is not None and codec_name != canonical_semantic_codec(
+        expected_codec
+    ):
+        raise ValueError(
+            "Precomputed semantic codes were stored with codec "
+            f"{codec_name!r} but semantic_codec.type is "
+            f"{canonical_semantic_codec(expected_codec)!r}: {path}"
+        )
+    if codec_name == "maskgct":
+        return MaskGCTCodebookDecoder(
+            path, expected_sha256=expected_sha256, payload=payload
+        )
+    if codec_name == "indextts25":
+        return IndexTTS25CodeDecoder(
+            path, expected_sha256=expected_sha256, payload=payload
+        )
+    raise ValueError(f"Unsupported semantic code decoder artifact: {codec_name}")
 
 
 class SACSemanticCodec(nn.Module):
@@ -503,4 +888,6 @@ def build_semantic_codec(cfg: Any, *, model_dir: Path) -> nn.Module:
     name = semantic_codec_type(cfg)
     if name == "maskgct":
         return MaskGCTSemanticCodec(cfg, model_dir)
+    if name == "indextts25":
+        return IndexTTS25SemanticCodec(cfg, model_dir)
     return SACSemanticCodec(cfg)

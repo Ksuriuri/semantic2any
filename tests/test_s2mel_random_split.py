@@ -14,6 +14,7 @@ from semantic2any.data.s2mel_dataset import (
     choose_prompt_len,
 )
 from semantic2any.utils.indextts_adapters import IndexTTSFeatureAdapter
+from semantic2any.utils.semantic_codecs import SemanticCodeDecoder
 
 
 class RandomPromptSplitTest(unittest.TestCase):
@@ -95,7 +96,7 @@ class PromptStyleExtractionTest(unittest.TestCase):
         self.assertEqual(batch["prompt_semantic_lens"].tolist(), [4])
 
     def test_precomputed_codes_follow_the_random_audio_split(self) -> None:
-        class Decoder(torch.nn.Module):
+        class Decoder(SemanticCodeDecoder):
             def forward(self, codes):
                 return codes.float().unsqueeze(-1).expand(-1, -1, 4)
 

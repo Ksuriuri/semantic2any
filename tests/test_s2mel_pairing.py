@@ -17,6 +17,7 @@ from semantic2any.data.s2mel_dataset import (
 )
 from semantic2any.models.s2mel_model import Semantic2MelModel
 from semantic2any.utils.indextts_adapters import IndexTTSFeatureAdapter
+from semantic2any.utils.semantic_codecs import SemanticCodeDecoder
 
 
 def _feature(
@@ -307,7 +308,7 @@ class PairedFeatureTest(unittest.TestCase):
 class PairedAudioExtractionTest(unittest.TestCase):
     @staticmethod
     def _adapter() -> IndexTTSFeatureAdapter:
-        class Decoder(nn.Module):
+        class Decoder(SemanticCodeDecoder):
             def forward(self, codes):
                 return codes.float().unsqueeze(-1)
 

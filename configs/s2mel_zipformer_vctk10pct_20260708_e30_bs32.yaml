@@ -96,3 +96,6 @@ train:
   wandb_entity: haoyuanhuang22-jcxy
   wandb_project: semantic2mel
   wandb_run_name: s2mel_zipformer-vctk-20260708-e30-bs32
+semantic_codec:
+  # Pinned: these codes/manifests predate the indextts25 default.
+  type: maskgct

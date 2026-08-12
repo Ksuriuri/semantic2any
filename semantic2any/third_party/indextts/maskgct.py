@@ -314,6 +314,31 @@ class RepCodec(nn.Module):
             return all_indices.squeeze(0), quantized_out.transpose(1, 2)
         return all_indices, quantized_out.transpose(1, 2)
 
+    def decode(self, codes):
+        """Reconstruct features from code ids (IndexTTS-2.5 EnhancedCodec.decode).
+
+        With ``downsample_scale == 2`` the codes sit at half the feature rate,
+        so the result is twice as long as ``codes`` -- back at the 50 Hz
+        w2v-bert rate.  Unlike MaskGCT's per-frame ``vq2emb`` this runs a
+        ConvNeXt stack, so the value at frame t depends on its neighbours: the
+        caller must pass one unpadded utterance per row.
+        """
+        if codes.dim() == 2:
+            codes = codes.unsqueeze(0)
+        if codes.dim() != 3:
+            raise ValueError(
+                f"codes must be [B,T] or [N,B,T], got {tuple(codes.shape)}"
+            )
+        x = self.decoder(self.quantizer.vq2emb(codes.long()))
+        if self.downsample_scale is not None and self.downsample_scale > 1:
+            x = F.interpolate(
+                x.transpose(1, 2),
+                scale_factor=int(self.downsample_scale),
+                mode="nearest",
+            )
+            x = self.up(x).transpose(1, 2)
+        return x
+
 
 def build_semantic_model(stat_path, *, model_path):
     model = Wav2Vec2BertModel.from_pretrained(model_path)
@@ -322,5 +347,23 @@ def build_semantic_model(stat_path, *, model_path):
     return model, stats["mean"], torch.sqrt(stats["var"])
 
 
-def build_semantic_codec(cfg):
-    return RepCodec(cfg=cfg).eval()
+def build_semantic_codec(cfg, *, downsample_scale=None):
+    """Build the RepCodec variant a caller asked for.
+
+    IndexTTS's published ``semantic_codec`` config block omits
+    ``downsample_scale``, so the codec variant pins it explicitly rather than
+    trusting whichever default the config happens to inherit.
+    """
+    if (
+        downsample_scale is not None
+        and cfg is not None
+        and hasattr(cfg, "downsample_scale")
+        and int(getattr(cfg, "downsample_scale")) != int(downsample_scale)
+    ):
+        raise ValueError(
+            "semantic_codec.downsample_scale in the config "
+            f"({getattr(cfg, 'downsample_scale')}) contradicts the requested "
+            f"codec variant ({downsample_scale})"
+        )
+    kwargs = {} if downsample_scale is None else {"downsample_scale": int(downsample_scale)}
+    return RepCodec(cfg=cfg, **kwargs).eval()
