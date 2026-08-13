@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC
+import os as _fm_os
 
 import torch
 from torch import nn
@@ -11,6 +12,13 @@ from semantic2any.defaults import DEFAULT_MEL_CHANNELS
 
 def _get(obj, name: str, default=None):
     return getattr(obj, name, obj.get(name, default) if isinstance(obj, dict) else default)
+
+
+_X1HAT_MODE = _fm_os.environ.get("S2MEL_X1HAT_MODE", "onestep").strip().lower()
+if _X1HAT_MODE not in ("onestep", "velocity"):
+    raise ValueError(
+        f"S2MEL_X1HAT_MODE must be 'onestep' or 'velocity', got {_X1HAT_MODE!r}"
+    )
 
 
 class BASECFM(nn.Module, ABC):
@@ -154,6 +162,8 @@ class BASECFM(nn.Module, ABC):
         prompt_mask = positions.unsqueeze(0) < prompt_lens.unsqueeze(1)
         prompt_mask_channels = prompt_mask.unsqueeze(1)
         prompt = torch.where(prompt_mask_channels, x1, prompt)
+        # Keep the unmasked interpolant for the one-step x1 estimate below.
+        y_unmasked = y
         y = y.masked_fill(prompt_mask_channels, 0)
         if self.zero_prompt_speech_token:
             mu = mu.masked_fill(prompt_mask.unsqueeze(-1), 0)
@@ -172,24 +182,44 @@ class BASECFM(nn.Module, ABC):
             (positions.unsqueeze(0) >= prompt_lens.unsqueeze(1))
             & (positions.unsqueeze(0) < x_lens.unsqueeze(1))
         )
-        difference = estimator_out - velocity
+        # fp32 for the residual and everything downstream: under fp16 autocast
+        # |d| > 256 already overflows on squaring (max 65504), and one inf
+        # inside the loss mask is enough to lose the whole step.
+        difference = (estimator_out - velocity).float()
         element_loss = (
             difference.square()
             if isinstance(self.criterion, nn.MSELoss)
             else difference.abs()
         )
-        masked_loss = element_loss * loss_mask.unsqueeze(1)
+        # Select, do not multiply: under fp16 `element_loss` can be inf in a
+        # region this mask excludes (the unconstrained prompt segment, or the
+        # padding tail), and `inf * 0 = nan` would poison the whole batch.
+        masked_loss = torch.where(
+            loss_mask.unsqueeze(1), element_loss, element_loss.new_zeros(())
+        )
         denominators = (
             loss_mask.sum(dim=1).clamp_min(1).to(element_loss.dtype)
             * estimator_out.size(1)
         )
         per_sample_loss = masked_loss.sum(dim=(1, 2)) / denominators
         valid_samples = x_lens > prompt_lens
-        loss = (
-            per_sample_loss * valid_samples.to(per_sample_loss.dtype)
+        # Same reason as above: a degenerate sample (x_lens <= prompt_lens) is
+        # excluded, so its loss must be dropped rather than multiplied by zero.
+        loss = torch.where(
+            valid_samples, per_sample_loss, per_sample_loss.new_zeros(())
         ).sum() / valid_samples.sum().clamp_min(1)
 
-        return loss, estimator_out + (1 - self.sigma_min) * noise
+        # One-step estimate of x1, consumed only by the auxiliary loss.
+        #   y + (1-t) * v_pred  == x1 + sigma_min * noise  when v_pred is exact,
+        # and its error is (1-t) * (v_pred - velocity), so it becomes accurate as
+        # t -> 1.  The older `estimator_out + (1-sigma_min)*noise` is also exact
+        # for a perfect v_pred but carries the full velocity error at every t,
+        # which pinned the aux's phase term at the random-phase bound.
+        if _X1HAT_MODE == "onestep":
+            x1_hat = y_unmasked + (1 - time) * estimator_out
+        else:
+            x1_hat = estimator_out + (1 - self.sigma_min) * noise
+        return loss, x1_hat
 
 
 class CFM(BASECFM):

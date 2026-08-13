@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -83,6 +84,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--show-progress", action="store_true")
+    parser.add_argument(
+        "--hf-suppress-khz",
+        type=float,
+        default=0.0,
+        help=(
+            "Attenuate high-frequency mel bands above this cutoff (kHz) "
+            "before vocoding and low-pass the final waveform (e.g. 14.0). "
+            "0 = disabled. Use to suppress HF hiss when the model's "
+            "high-band mel is unreliable."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -200,6 +212,7 @@ def infer_one(
     temperature: float,
     show_progress: bool,
     style_mode: str,
+    hf_suppress_khz: float,
 ) -> None:
     batch = feature_adapter.extract_from_audio_paths([str(audio_path)])
     mel = batch["mel"].to(device=device, dtype=dtype)
@@ -229,10 +242,18 @@ def infer_one(
     )
     generated = generated[:, :, prompt_len:mel_len]
 
-    wav = vocoder(generated.to(device=device, dtype=dtype))[0]
     sample_rate = int(
         _get(_get(cfg, "preprocess_params"), "sr", DEFAULT_MEL_SAMPLE_RATE)
     )
+    wav = vocoder(generated.to(device=device, dtype=dtype))[0]
+    if hf_suppress_khz > 0.0:
+        cutoff_hz = hf_suppress_khz * 1000.0
+        wav = torchaudio.functional.lowpass_biquad(
+            wav.to(device=device, dtype=torch.float32),
+            sample_rate,
+            cutoff_freq=cutoff_hz,
+            Q=0.707,
+        ).to(dtype=dtype)
     save_wav(output_path, wav, sample_rate)
     print(
         f">> wrote {output_path} "
@@ -291,6 +312,11 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     for audio_path in input_paths:
         output_path = output_dir / f"{audio_path.stem}_s2mel_style-{args.style_mode}.wav"
+        hf_suffix = f"_hfsuppress{args.hf_suppress_khz:g}k" if args.hf_suppress_khz > 0.0 else ""
+        if hf_suffix:
+            output_path = output_dir / (
+                f"{audio_path.stem}_s2mel_style-{args.style_mode}{hf_suffix}.wav"
+            )
         infer_one(
             audio_path=audio_path,
             output_path=output_path,
@@ -307,6 +333,7 @@ def main() -> None:
             temperature=args.temperature,
             show_progress=args.show_progress,
             style_mode=args.style_mode,
+            hf_suppress_khz=args.hf_suppress_khz,
         )
 
 

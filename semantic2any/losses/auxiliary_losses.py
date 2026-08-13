@@ -95,15 +95,192 @@ class Conv1DSTFT(nn.Module):
         self.register_buffer("kernel", kernel)
         self.n_freq = n_freq
 
-    def forward(self, wav: torch.Tensor) -> torch.Tensor:
-        """Returns magnitude spectrogram (B, n_freq, T)."""
+    def forward(
+        self, wav: torch.Tensor, return_complex: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """STFT of ``wav``.
+
+        Default returns the magnitude spectrogram (B, n_freq, T).  With
+        ``return_complex=True`` returns ``(real, imag)`` so callers can derive
+        phases or complex products.
+        """
         pad_len = self.n_fft // 2
         x = F.pad(wav, (pad_len, pad_len), mode="reflect")
         out = F.conv1d(x.unsqueeze(1), self.kernel, stride=self.hop_length)
         real = out[:, : self.n_freq, :]
         imag = out[:, self.n_freq :, :]
+        if return_complex:
+            return real, imag
         return torch.sqrt(real ** 2 + imag ** 2 + 1e-8)
 
+
+class MultiResolutionSTFTLoss(nn.Module):
+    """WaveFM-style refined multi-resolution STFT loss (NAACL 2025, App. C).
+
+    For each STFT resolution the loss combines:
+      * anti-wrapped phase-angle L1, masked where either squared magnitude is
+        below ``mag_min`` (phases are meaningless there),
+      * log-magnitude L1 over all bins,
+      * MSE on the frequency/time gradients and the Laplacian of the
+        magnitude spectrogram (edge/structure supervision).
+
+    Resolution defaults follow the WaveFM appendix (fft/hop/win), which are
+    hop = fft/8 and win = fft/2.  The conv1d-based STFT is used instead of
+    ``torch.stft`` to stay compatible with the CUDA 13.0 backward bug.
+
+    Every forward stores each term (per resolution and averaged over
+    resolutions) in ``last_components`` so the trainer can log the individual
+    loss values.  ``component_keys`` is fixed at construction time, so all
+    ranks always report the same keys even on the early-return paths.
+    """
+
+    TERM_NAMES = ("mag_l1", "phase_l1", "grad_freq", "grad_time", "laplacian", "total")
+
+    def __init__(
+        self,
+        fft_sizes: tuple[int, ...] = (1024, 2048, 512),
+        hop_sizes: tuple[int, ...] = (128, 256, 64),
+        win_lengths: tuple[int, ...] = (512, 1024, 256),
+        mag_min: float = 1e-6,
+        phase_weight: float = 1.0,
+        mag_weight: float = 1.0,
+        grad_weight_freq: float = 4.0,
+        grad_weight_time: float = 4.0,
+        grad_weight_lap: float = 2.0,
+    ):
+        super().__init__()
+        if not (len(fft_sizes) == len(hop_sizes) == len(win_lengths)):
+            raise ValueError("fft/hop/win resolution lists must have equal length")
+        self.mag_min = mag_min
+        self.phase_weight = phase_weight
+        self.mag_weight = mag_weight
+        self.grad_weight_freq = grad_weight_freq
+        self.grad_weight_time = grad_weight_time
+        self.grad_weight_lap = grad_weight_lap
+        self.stft_modules = nn.ModuleList(
+            Conv1DSTFT(n_fft, hop, win)
+            for n_fft, hop, win in zip(fft_sizes, hop_sizes, win_lengths)
+        )
+        self.resolution_names = tuple(f"res{n_fft}" for n_fft in fft_sizes)
+        self.component_keys = tuple(
+            list(self.TERM_NAMES)
+            + [f"{res}/{term}" for res in self.resolution_names for term in self.TERM_NAMES]
+        )
+        self.last_components: dict[str, torch.Tensor] = {}
+        # Structure kernels on (F, T) magnitude spectrograms (WaveFM App. C).
+        freq_kernel = torch.tensor(
+            [[-1.0, -2.0, -1.0], [1.0, 2.0, 1.0]], dtype=torch.float32
+        ).view(1, 1, 2, 3) / 4.0
+        time_kernel = torch.tensor(
+            [[-1.0, 1.0], [-2.0, 2.0], [-1.0, 1.0]], dtype=torch.float32
+        ).view(1, 1, 3, 2) / 4.0
+        lap_kernel = torch.tensor(
+            [
+                [-1.0, -1.0, -1.0],
+                [-1.0, 8.0, -1.0],
+                [-1.0, -1.0, -1.0],
+            ],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3) / 8.0
+        self.register_buffer("freq_kernel", freq_kernel)
+        self.register_buffer("time_kernel", time_kernel)
+        self.register_buffer("lap_kernel", lap_kernel)
+
+    def zero_components(self, device, dtype) -> None:
+        """Fill ``last_components`` with zeros (early-return paths)."""
+        self.last_components = {
+            key: torch.zeros((), device=device, dtype=dtype)
+            for key in self.component_keys
+        }
+
+    @staticmethod
+    def _filter2d(
+        x: torch.Tensor,
+        kernel: torch.Tensor,
+        pad: tuple[int, int, int, int],
+    ) -> torch.Tensor:
+        x = F.pad(x.unsqueeze(1), pad, mode="constant")
+        return F.conv2d(x, kernel).squeeze(1)
+
+    def forward(
+        self, wav_pred: torch.Tensor, wav_gt: torch.Tensor
+    ) -> torch.Tensor:
+        """WaveFM MR-STFT loss between predicted and GT waveforms (B, T)."""
+        if wav_pred.shape != wav_gt.shape:
+            min_len = min(wav_pred.size(-1), wav_gt.size(-1))
+            if min_len < 256:
+                self.zero_components(wav_pred.device, wav_pred.dtype)
+                return torch.zeros((), device=wav_pred.device, dtype=wav_pred.dtype)
+            wav_pred = wav_pred[..., :min_len]
+            wav_gt = wav_gt[..., :min_len]
+
+        device, dtype = wav_pred.device, wav_pred.dtype
+        components: dict[str, torch.Tensor] = {}
+        term_sums = {
+            name: torch.zeros((), device=device, dtype=dtype)
+            for name in self.TERM_NAMES
+        }
+        total = torch.zeros((), device=device, dtype=dtype)
+        for res_name, stft_mod in zip(self.resolution_names, self.stft_modules):
+            real_pred, imag_pred = stft_mod(wav_pred, return_complex=True)
+            real_gt, imag_gt = stft_mod(wav_gt, return_complex=True)
+            sq_pred = real_pred ** 2 + imag_pred ** 2
+            sq_gt = real_gt ** 2 + imag_gt ** 2
+            mask = (sq_gt > self.mag_min) & (sq_pred > self.mag_min)
+            mag_pred = torch.sqrt(sq_pred + self.mag_min)
+            mag_gt = torch.sqrt(sq_gt + self.mag_min)
+
+            # Log-magnitude L1 over all bins.
+            mag_loss = (mag_gt.log() - mag_pred.log()).abs().mean()
+
+            # Anti-wrapped phase-angle L1 on significant bins.
+            if mask.any():
+                phase_pred = torch.atan2(imag_pred[mask], real_pred[mask])
+                phase_gt = torch.atan2(imag_gt[mask], real_gt[mask])
+                delta = phase_gt - phase_pred
+                phase_loss = torch.atan2(
+                    torch.sin(delta), torch.cos(delta)
+                ).abs().mean()
+            else:
+                phase_loss = torch.zeros((), device=wav_pred.device, dtype=wav_pred.dtype)
+
+            # Edge/structure terms on magnitude spectrograms.
+            df_gt = self._filter2d(mag_gt, self.freq_kernel, (1, 1, 1, 0))
+            df_pred = self._filter2d(mag_pred, self.freq_kernel, (1, 1, 1, 0))
+            dt_gt = self._filter2d(mag_gt, self.time_kernel, (1, 0, 1, 1))
+            dt_pred = self._filter2d(mag_pred, self.time_kernel, (1, 0, 1, 1))
+            lap_gt = self._filter2d(mag_gt, self.lap_kernel, (1, 1, 1, 1))
+            lap_pred = self._filter2d(mag_pred, self.lap_kernel, (1, 1, 1, 1))
+            df_loss = (df_gt - df_pred).pow(2).mean()
+            dt_loss = (dt_gt - dt_pred).pow(2).mean()
+            lap_loss = (lap_gt - lap_pred).pow(2).mean()
+
+            res_total = (
+                self.phase_weight * phase_loss
+                + self.mag_weight * mag_loss
+                + self.grad_weight_freq * df_loss
+                + self.grad_weight_time * dt_loss
+                + self.grad_weight_lap * lap_loss
+            )
+            total = total + res_total
+
+            res_terms = {
+                "mag_l1": mag_loss,
+                "phase_l1": phase_loss,
+                "grad_freq": df_loss,
+                "grad_time": dt_loss,
+                "laplacian": lap_loss,
+                "total": res_total,
+            }
+            for name, value in res_terms.items():
+                components[f"{res_name}/{name}"] = value.detach()
+                term_sums[name] = term_sums[name] + value.detach()
+
+        n_res = len(self.stft_modules)
+        for name, value in term_sums.items():
+            components[name] = value / n_res
+        self.last_components = components
+        return total / n_res
 
 class BigVGANLoopLoss(nn.Module):
     """BigVGAN-in-the-loop loss: mel reconstruction + STFT reconstruction.
@@ -218,13 +395,6 @@ class BigVGANLoopLoss(nn.Module):
         prompt_lens: torch.Tensor,
         gt_wav: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if gt_wav is None:
-            gt_wav = self._gt_wav_cache
-        if gt_wav is None:
-            with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=False):
-                gt_wav = self.vocoder(x1.float()).squeeze(1)
-            self._gt_wav_cache = gt_wav.detach()
-
         B = x1_hat.size(0)
         prompt_frames = prompt_lens[0].item() if B == 1 else int(prompt_lens.max().item())
         mel_end = mel_lens[0].item() if B == 1 else int(mel_lens.max().item())
@@ -235,15 +405,26 @@ class BigVGANLoopLoss(nn.Module):
             return torch.zeros((), device=x1_hat.device, dtype=x1_hat.dtype)
 
         x1_hat_chunk = x1_hat[:, :, gen_start:gen_end].float()
+        if gt_wav is None:
+            # Vocode only the generated chunk of the ground-truth mel, per
+            # batch.  Caching the first batch's full waveform was both wrong
+            # (compared every batch against batch #1) and fragile (a NaN batch
+            # poisoned the cache forever).
+            with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=False):
+                gt_wav = self.vocoder(x1[:, :, gen_start:gen_end].float()).squeeze(1)
+            gt_wav = gt_wav.detach()
+
+        # Never let a single corrupt (NaN) sample poison the loss: return a
+        # zero aux loss so the flow loss still trains on healthy samples.
+        if not torch.isfinite(x1_hat).all() or not torch.isfinite(gt_wav).all():
+            return torch.zeros((), device=x1_hat.device, dtype=x1_hat.dtype)
 
         with torch.amp.autocast(device_type="cuda", enabled=False):
             wav_pred = self._vocoder_forward(x1_hat_chunk)
 
-        # GT waveform for this chunk
-        hop_size = 512
-        wav_start = gen_start * hop_size
-        wav_end = gen_end * hop_size
-        gt_wav_chunk = gt_wav[:, wav_start:wav_end]
+        # gt_wav is the vocoded chunk for frames [gen_start, gen_end), so its
+        # sample axis is already chunk-relative; no absolute-frame offset.
+        gt_wav_chunk = gt_wav
 
         # Trim to matching length
         min_len = min(wav_pred.size(-1), gt_wav_chunk.size(-1))
@@ -291,13 +472,6 @@ class BigVGANWaveformLoss(nn.Module):
         prompt_lens: torch.Tensor,
         gt_wav: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if gt_wav is None:
-            gt_wav = self._gt_wav_cache
-        if gt_wav is None:
-            with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=False):
-                gt_wav = self.vocoder(x1.float()).squeeze(1)
-            self._gt_wav_cache = gt_wav.detach()
-
         B = x1_hat.size(0)
         prompt_frames = prompt_lens[0].item() if B == 1 else int(prompt_lens.max().item())
         mel_end = mel_lens[0].item() if B == 1 else int(mel_lens.max().item())
@@ -308,14 +482,26 @@ class BigVGANWaveformLoss(nn.Module):
             return torch.zeros((), device=x1_hat.device, dtype=x1_hat.dtype)
 
         x1_hat_chunk = x1_hat[:, :, gen_start:gen_end].float()
+        if gt_wav is None:
+            # Vocode only the generated chunk of the ground-truth mel, per
+            # batch.  Caching the first batch's full waveform was both wrong
+            # (compared every batch against batch #1) and fragile (a NaN batch
+            # poisoned the cache forever).
+            with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=False):
+                gt_wav = self.vocoder(x1[:, :, gen_start:gen_end].float()).squeeze(1)
+            gt_wav = gt_wav.detach()
+
+        # Never let a single corrupt (NaN) sample poison the loss: return a
+        # zero aux loss so the flow loss still trains on healthy samples.
+        if not torch.isfinite(x1_hat).all() or not torch.isfinite(gt_wav).all():
+            return torch.zeros((), device=x1_hat.device, dtype=x1_hat.dtype)
 
         with torch.amp.autocast(device_type="cuda", enabled=False):
             wav_pred = self._vocoder_forward(x1_hat_chunk)
 
-        hop_size = 512
-        wav_start = gen_start * hop_size
-        wav_end = gen_end * hop_size
-        gt_wav_chunk = gt_wav[:, wav_start:wav_end]
+        # gt_wav is the vocoded chunk for frames [gen_start, gen_end), so its
+        # sample axis is already chunk-relative; no absolute-frame offset.
+        gt_wav_chunk = gt_wav
 
         min_len = min(wav_pred.size(-1), gt_wav_chunk.size(-1))
         if min_len < 512:
@@ -330,3 +516,123 @@ class BigVGANWaveformLoss(nn.Module):
             gt_ds = F.avg_pool1d(gt_wav_chunk.unsqueeze(1), pool_size, pool_size).squeeze(1)
             loss = loss + (pred_ds - gt_ds).abs().mean()
         return loss / (1.0 + len(self.pool_sizes))
+
+
+class BigVGANMRSTFTLoss(nn.Module):
+    """WaveFM MR-STFT in the BigVGAN loop.
+
+    pred mel chunk -> frozen BigVGAN -> waveform -> WaveFM-style
+    multi-resolution STFT loss vs the GT waveform chunk.  Optionally mixes a
+    small waveform L1 term (``wave_l1_weight``) so the time-domain signal stays
+    aligned while the spectral terms push out broadband hiss.
+
+    ``last_components`` carries every individual term of the last forward (the
+    MR-STFT sub-terms, the waveform L1 and the combined aux total) so the
+    trainer can log them separately.
+    """
+
+    def __init__(
+        self,
+        vocoder: nn.Module,
+        sr: int = 44100,
+        max_chunk_frames: int = 128,
+        wave_l1_weight: float = 0.0,
+        stft_kwargs: dict | None = None,
+    ):
+        super().__init__()
+        self.vocoder = vocoder
+        for p in self.vocoder.parameters():
+            p.requires_grad_(False)
+        self.sr = sr
+        self.max_chunk_frames = max_chunk_frames
+        self.wave_l1_weight = wave_l1_weight
+        self.stft_loss = MultiResolutionSTFTLoss(**(stft_kwargs or {}))
+        self.component_keys = tuple(
+            ["total", "mrstft", "wave_l1"]
+            + [f"mrstft/{key}" for key in self.stft_loss.component_keys]
+        )
+        self.last_components: dict[str, torch.Tensor] = {}
+
+    def zero_components(self, device, dtype) -> None:
+        """Fill ``last_components`` with zeros (early-return paths)."""
+        self.stft_loss.zero_components(device, dtype)
+        self.last_components = {
+            key: torch.zeros((), device=device, dtype=dtype)
+            for key in self.component_keys
+        }
+
+    def _record_components(
+        self,
+        mrstft: torch.Tensor,
+        wave_l1: torch.Tensor,
+        total: torch.Tensor,
+    ) -> None:
+        components = {
+            f"mrstft/{key}": value
+            for key, value in self.stft_loss.last_components.items()
+        }
+        components["mrstft"] = mrstft.detach()
+        components["wave_l1"] = wave_l1.detach()
+        components["total"] = total.detach()
+        self.last_components = components
+
+    def _vocoder_forward(self, mel: torch.Tensor) -> torch.Tensor:
+        return self.vocoder(mel).squeeze(1)
+
+    def forward(
+        self,
+        x1_hat: torch.Tensor,
+        x1: torch.Tensor,
+        mel_lens: torch.Tensor,
+        prompt_lens: torch.Tensor,
+        gt_wav: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B = x1_hat.size(0)
+        prompt_frames = prompt_lens[0].item() if B == 1 else int(prompt_lens.max().item())
+        mel_end = mel_lens[0].item() if B == 1 else int(mel_lens.max().item())
+
+        gen_start = prompt_frames
+        gen_end = min(mel_end, gen_start + self.max_chunk_frames)
+        if gen_end <= gen_start:
+            self.zero_components(x1_hat.device, x1_hat.dtype)
+            return torch.zeros((), device=x1_hat.device, dtype=x1_hat.dtype)
+
+        x1_hat_chunk = x1_hat[:, :, gen_start:gen_end].float()
+        if gt_wav is None:
+            # Vocode only the generated chunk of the ground-truth mel, per
+            # batch.  Caching the first batch's full waveform was both wrong
+            # (compared every batch against batch #1) and fragile (a NaN batch
+            # poisoned the cache forever).
+            with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=False):
+                gt_wav = self.vocoder(x1[:, :, gen_start:gen_end].float()).squeeze(1)
+            gt_wav = gt_wav.detach()
+
+        # Never let a single corrupt (NaN) sample poison the loss: return a
+        # zero aux loss so the flow loss still trains on healthy samples.
+        if not torch.isfinite(x1_hat).all() or not torch.isfinite(gt_wav).all():
+            self.zero_components(x1_hat.device, x1_hat.dtype)
+            return torch.zeros((), device=x1_hat.device, dtype=x1_hat.dtype)
+
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            wav_pred = self._vocoder_forward(x1_hat_chunk)
+
+        # gt_wav is the vocoded chunk for frames [gen_start, gen_end), so its
+        # sample axis is already chunk-relative; no absolute-frame offset.
+        min_len = min(wav_pred.size(-1), gt_wav.size(-1))
+        if min_len < 512:
+            self.zero_components(x1_hat.device, x1_hat.dtype)
+            return torch.zeros((), device=x1_hat.device, dtype=x1_hat.dtype)
+        wav_pred = wav_pred[..., :min_len]
+        gt_wav_chunk = gt_wav[..., :min_len]
+
+        mrstft = self.stft_loss(wav_pred, gt_wav_chunk)
+        if self.wave_l1_weight > 0:
+            wave_l1 = (wav_pred - gt_wav_chunk).abs().mean()
+            loss = mrstft + self.wave_l1_weight * wave_l1
+        else:
+            # Still reported for monitoring, but kept out of the graph.
+            with torch.no_grad():
+                wave_l1 = (wav_pred - gt_wav_chunk).abs().mean()
+            loss = mrstft
+        self._record_components(mrstft, wave_l1, loss)
+        return loss

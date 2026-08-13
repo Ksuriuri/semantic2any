@@ -230,7 +230,57 @@ def trim_paired_feature_lengths(
 class S2MelJsonlDataset(Dataset):
     """JSONL manifest dataset for semantic2mel training."""
 
-    def __init__(self, manifest_path: str | Path) -> None:
+    # Fields used by s2mel training.  Dropping unused keys (text, source,
+    # metadata_path, ...) drastically shrinks the per-rank in-memory index
+    # when the same large manifest is loaded by every DDP rank.
+    _KEEP_FIELDS = (
+        "id",
+        "dataset",
+        "audio_path",
+        "semantic_code_path",
+        "semantic_code_offset",
+        "semantic_code_length",
+        "semantic_frame_rate",
+        "codebook_size",
+        "speaker_id",
+        "language",
+        "duration",
+        "sample_rate",
+        # Precomputed MaskGCT codes.  Without these `_has_semantic_codes()` is
+        # False on every record once unused fields are dropped, and training
+        # silently falls back to encoding audio with w2v-bert every step.
+        "semantic_lookup_path",
+        "semantic_lookup_sha256",
+        "semantic_codec",
+        "semantic_fingerprint",
+        "semantic_fps",
+        "semantic_codebooks",
+        "semantic_max_audio_seconds",
+    )
+
+    # These values repeat across millions of rows (one lookup table and
+    # checksum, a few thousand code shards, tens of thousands of speakers), so
+    # sharing one str object per distinct value keeps the per-rank index small.
+    _INTERNED_FIELDS = (
+        "dataset",
+        "language",
+        "speaker_id",
+        "semantic_code_path",
+        "semantic_lookup_path",
+        "semantic_lookup_sha256",
+        "semantic_codec",
+        "semantic_fingerprint",
+        "_manifest_path",
+    )
+
+    def __init__(
+        self,
+        manifest_path: str | Path,
+        *,
+        rank: int | None = None,
+        world_size: int = 1,
+        drop_unused_fields: bool = False,
+    ) -> None:
         self.manifest_path = Path(manifest_path).expanduser()
         if self.manifest_path.is_dir():
             self.manifest_paths = sorted(self.manifest_path.glob("*.jsonl"))
@@ -244,6 +294,7 @@ class S2MelJsonlDataset(Dataset):
             raise ValueError(f"No JSONL manifests found under {self.manifest_path}")
 
         self.records: list[dict[str, Any]] = []
+        interned: dict[str, str] = {}
         for current_manifest in self.manifest_paths:
             base_dir = current_manifest.parent
             with current_manifest.open("r", encoding="utf-8") as f:
@@ -261,8 +312,28 @@ class S2MelJsonlDataset(Dataset):
                         "semantic_lookup_path",
                     ):
                         record[key] = _resolve_path(base_dir, record.get(key))
+                    if drop_unused_fields:
+                        record = {
+                            key: record[key]
+                            for key in self._KEEP_FIELDS
+                            if key in record
+                        }
+                    if rank is not None:
+                        speaker_id = record.get("speaker_id")
+                        if isinstance(speaker_id, str) and speaker_id:
+                            key = _record_pairing_key(record, speaker_id)
+                            shard_id = int(
+                                hashlib.sha256(key.encode("utf-8")).hexdigest(),
+                                16,
+                            ) % max(1, int(world_size))
+                            if shard_id != rank:
+                                continue
                     record["_line_no"] = line_no
                     record["_manifest_path"] = str(current_manifest)
+                    for field in self._INTERNED_FIELDS:
+                        value = record.get(field)
+                        if isinstance(value, str):
+                            record[field] = interned.setdefault(value, value)
                     self.records.append(record)
         if not self.records:
             raise ValueError(f"No records found in {self.manifest_path}")

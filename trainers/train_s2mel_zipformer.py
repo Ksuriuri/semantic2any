@@ -254,13 +254,25 @@ def make_lr_scheduler(optimizer, cfg, num_training_steps: int):
     )
 
 
-def make_source_dataset(cfg, source: str, *, speechdata: bool = False) -> Dataset:
+def make_source_dataset(
+    cfg,
+    source: str,
+    *,
+    speechdata: bool = False,
+    rank: int | None = None,
+    world_size: int = 1,
+) -> Dataset:
     if speechdata:
         return S2MelSpeechDataDataset(
             source,
             cache_dir=_get(cfg.data, "speechdata_cache_dir", None),
         )
-    return S2MelJsonlDataset(source)
+    return S2MelJsonlDataset(
+        source,
+        rank=rank,
+        world_size=world_size,
+        drop_unused_fields=rank is not None,
+    )
 
 
 def _dataset_length_estimates(dataset: Dataset) -> list[float]:
@@ -1071,7 +1083,13 @@ def main() -> None:
         OmegaConf.save(cfg, output_dir / "config.resolved.yaml")
     accelerator.wait_for_everyone()
 
-    train_dataset = make_source_dataset(cfg, train_source, speechdata=train_is_speechdata)
+    train_dataset = make_source_dataset(
+        cfg,
+        train_source,
+        speechdata=train_is_speechdata,
+        rank=accelerator.process_index,
+        world_size=accelerator.num_processes,
+    )
     valid_dataset = (
         make_source_dataset(cfg, valid_source, speechdata=valid_is_speechdata) if valid_source else None
     )
@@ -1135,7 +1153,9 @@ def main() -> None:
         shuffle=True,
         speechdata=train_is_speechdata,
         dataset=train_dataset,
-        world_size=accelerator.num_processes,
+        # Each rank already holds a disjoint speaker-group shard of the data,
+        # so the local sampler must NOT be split across ranks again.
+        world_size=1,
     )
     valid_loader = (
         make_dataloader(
@@ -1231,11 +1251,14 @@ def main() -> None:
                 )
 
     if valid_loader is None:
-        model, optimizer, train_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, scheduler)
+        model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
     else:
-        model, optimizer, train_loader, valid_loader, scheduler = accelerator.prepare(
-            model, optimizer, train_loader, valid_loader, scheduler
-        )
+        model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+        valid_loader = accelerator.prepare(valid_loader)
+    # NOTE: train_loader is intentionally NOT passed to accelerator.prepare.
+    # Each rank owns a disjoint speaker-group shard of the manifest and must
+    # consume ALL of its local batches; cross-rank batch sharding would drop
+    # 7/8 of the data per epoch.
 
     if resume_path is not None and resume_path.is_dir():
         start_epoch, global_step, resume_epoch_step = load_training_resume_state(resume_path)
@@ -1344,30 +1367,70 @@ def main() -> None:
 
                     loss = forward_loss_with_aux(model, train_batch) if _AUX_LOSS_TYPE else forward_loss(model, train_batch)
                     _spike_track_loss(loss, train_batch, global_step, accelerator)
-                    accelerator.backward(loss)
-                    _gn = None
-                    _do_skip = False
-                    if accelerator.sync_gradients and float(cfg.train.grad_clip) > 0:
-                        _gn = accelerator.clip_grad_norm_(model.parameters(), float(cfg.train.grad_clip))
-                        _spike_track_gnorm(_gn, global_step, accelerator)
-                        _do_skip = _spike_should_skip_step(_gn)
-                    if _do_skip:
-                        # Grad explosion / NaN: skip the weight update so it cannot
-                        # corrupt the model; keep the LR schedule advancing.
-                        if accelerator.is_main_process:
-                            _gnv = float(_gn) if _gn is not None else float("nan")
+                    # The skip decision MUST be identical on every rank: a rank
+                    # that skips `backward` never joins the gradient all-reduce
+                    # the other ranks are blocked in, which deadlocks NCCL until
+                    # the 600 s watchdog kills the job.  Reduce a finiteness flag
+                    # so all ranks skip together or none do.
+                    _loss_finite = bool(torch.isfinite(loss))
+                    if accelerator.num_processes > 1:
+                        _flag = torch.tensor(
+                            [1.0 if _loss_finite else 0.0], device=accelerator.device
+                        )
+                        torch.distributed.all_reduce(
+                            _flag, op=torch.distributed.ReduceOp.MIN
+                        )
+                        _all_finite = bool(_flag.item() >= 1.0)
+                        if _loss_finite and not _all_finite and accelerator.is_main_process:
                             print(
-                                f"[SkipStep] step~{global_step} gnorm={_gnv:.3f} "
-                                f"exceeds SPIKE_SKIP_GNORM={_SPIKE_SKIP_GNORM} "
-                                f"— optimizer.step() skipped",
+                                f"[SkipStep] step~{global_step} another rank saw a "
+                                f"non-finite loss — all ranks skip together",
+                                flush=True,
+                            )
+                    else:
+                        _all_finite = _loss_finite
+                    if not _all_finite:
+                        # Skip BEFORE backward so no NaN gradients ever reach
+                        # the GradScaler / optimizer; keep LR and step counters
+                        # advancing.
+                        if accelerator.is_main_process:
+                            print(
+                                f"[SkipStep] step~{global_step} loss non-finite "
+                                f"— skipped before backward",
                                 flush=True,
                             )
                         scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
                     else:
-                        optimizer.step()
-                        scheduler.step()
-                        optimizer.zero_grad(set_to_none=True)
+                        accelerator.backward(loss)
+                        _gn = None
+                        _do_skip = False
+                        if accelerator.sync_gradients and float(cfg.train.grad_clip) > 0:
+                            _gn = accelerator.clip_grad_norm_(model.parameters(), float(cfg.train.grad_clip))
+                            _spike_track_gnorm(_gn, global_step, accelerator)
+                            _do_skip = _spike_should_skip_step(_gn)
+                        if _do_skip:
+                            # Grad explosion / NaN: skip the weight update so it
+                            # cannot corrupt the model; keep LR advancing.
+                            if accelerator.is_main_process:
+                                _gnv = float(_gn) if _gn is not None else float("nan")
+                                print(
+                                    f"[SkipStep] step~{global_step} gnorm={_gnv:.3f} "
+                                    f"exceeds SPIKE_SKIP_GNORM={_SPIKE_SKIP_GNORM} "
+                                    f"— optimizer.step() skipped",
+                                    flush=True,
+                                )
+                            scheduler.step()
+                            optimizer.zero_grad(set_to_none=True)
+                            # The GradScaler's unscale_ was already consumed by
+                            # clip_grad_norm_; take a no-op optimizer step so the
+                            # scaler state advances without applying bad grads.
+                            optimizer.step()
+                            optimizer.zero_grad(set_to_none=True)
+                        else:
+                            optimizer.step()
+                            scheduler.step()
+                            optimizer.zero_grad(set_to_none=True)
 
                 if validation_barrier and async_builder is not None:
                     # Validation workers are recreated on every pass. Tear down
@@ -1389,10 +1452,14 @@ def main() -> None:
                                 f"[Train] epoch={epoch + 1} step={global_step} "
                                 f"loss={reduced_loss:.5f} lr={lr:.3e}"
                             )
-                        accelerator.log(
-                            {"train/loss": reduced_loss, "train/lr": lr, "train/epoch": epoch_progress},
-                            step=global_step,
-                        )
+                        log_payload = {
+                            "train/loss": reduced_loss,
+                            "train/lr": lr,
+                            "train/epoch": epoch_progress,
+                        }
+                        # Collective (gather) — every rank must reach this.
+                        log_payload.update(_aux_metrics_for_log(accelerator))
+                        accelerator.log(log_payload, step=global_step)
 
                     if valid_loader is not None and global_step % int(cfg.train.valid_interval) == 0:
                         val_loss = validate(model, valid_loader, cfg, accelerator, feature_adapter_ref)
@@ -1476,10 +1543,18 @@ def main() -> None:
 # --- Auxiliary loss support (env-var gated) -----------------------------------
 import os as _aux_os
 
-_AUX_LOSS_TYPE = _aux_os.environ.get("AUX_LOSS_TYPE", "bigvgan_waveform")
+_AUX_LOSS_TYPE = _aux_os.environ.get("AUX_LOSS_TYPE", "bigvgan_mrstft")
 _AUX_LOSS_WEIGHT = float(_aux_os.environ.get("AUX_LOSS_WEIGHT", "0.1"))
 _FLOW_LOSS_WEIGHT = float(_aux_os.environ.get("FLOW_LOSS_WEIGHT", "1.0"))
+_AUX_MRSTFT_WAVEL1 = float(_aux_os.environ.get("AUX_MRSTFT_WAVEL1", "0.0"))
+# WaveFM keeps the phase term at 1.0.  Our phase comes from a frozen BigVGAN
+# driven by the predicted mel, so it can be downweighted/disabled without
+# touching the spectral terms (phase_l1 measured flat at the random-phase
+# bound pi/2, see notes/tts-s2mel-quality.md).
+_AUX_MRSTFT_PHASE_WEIGHT = float(_aux_os.environ.get("AUX_MRSTFT_PHASE_WEIGHT", "1.0"))
 _AUX_LOSS_MODULE = None
+# Last step's flow/aux loss terms, refreshed by _record_aux_metrics.
+_AUX_LAST_METRICS: dict = {}
 
 
 def _init_aux_loss(cfg, device, dtype):
@@ -1541,6 +1616,34 @@ def _init_aux_loss(cfg, device, dtype):
             sr=int(_get(_get(cfg, "preprocess_params"), "sr", 44100)),
         ).to(device)
         print(f"[AuxLoss] BigVGANWaveformLoss enabled, weight={_AUX_LOSS_WEIGHT}")
+    elif _AUX_LOSS_TYPE == "bigvgan_mrstft":
+        from semantic2any.losses.auxiliary_losses import BigVGANMRSTFTLoss
+        from semantic2any.third_party.indextts.bigvgan import BigVGAN
+        vocoder_cfg = _get(cfg, "vocoder", None)
+        model_id = (
+            "nvidia/bigvgan_v2_44khz_128band_512x"
+            if vocoder_cfg is None
+            else str(_get(vocoder_cfg, "model_id", "") or "nvidia/bigvgan_v2_44khz_128band_512x")
+        )
+        cache_dir = str(_get(vocoder_cfg, "cache_dir", "") or "") if vocoder_cfg else ""
+        load_kwargs = {}
+        if cache_dir:
+            load_kwargs["cache_dir"] = cache_dir
+        vocoder = BigVGAN.from_pretrained(model_id, **load_kwargs)
+        vocoder = vocoder.to(device=device)
+        vocoder.remove_weight_norm()
+        vocoder.eval()
+        _AUX_LOSS_MODULE = BigVGANMRSTFTLoss(
+            vocoder=vocoder,
+            sr=int(_get(_get(cfg, "preprocess_params"), "sr", 44100)),
+            wave_l1_weight=_AUX_MRSTFT_WAVEL1,
+            stft_kwargs={"phase_weight": _AUX_MRSTFT_PHASE_WEIGHT},
+        ).to(device)
+        print(
+            f"[AuxLoss] BigVGANMRSTFTLoss (WaveFM) enabled, weight={_AUX_LOSS_WEIGHT}, "
+            f"wave_l1_weight={_AUX_MRSTFT_WAVEL1}, "
+            f"phase_weight={_AUX_MRSTFT_PHASE_WEIGHT}"
+        )
 
 
 def forward_loss_with_aux(model, batch):
@@ -1559,9 +1662,44 @@ def forward_loss_with_aux(model, batch):
         aux_loss = _AUX_LOSS_MODULE(
             x1_hat, batch["mel"], batch["mel_lens"], batch["prompt_lens"]
         )
+        _record_aux_metrics(loss, aux_loss)
         loss = _FLOW_LOSS_WEIGHT * loss + _AUX_LOSS_WEIGHT * aux_loss
     return loss
+
+
+def _record_aux_metrics(flow_loss, aux_loss):
+    """Stash this step's flow/aux loss terms for the next wandb log."""
+    metrics = {"flow": flow_loss.detach(), "aux": aux_loss.detach()}
+    for name, value in getattr(_AUX_LOSS_MODULE, "last_components", {}).items():
+        metrics[f"aux/{name}"] = value
+    _AUX_LAST_METRICS.clear()
+    _AUX_LAST_METRICS.update(metrics)
+
+
+def _aux_log_keys():
+    """Stable key order, identical on every rank (needed for the gather)."""
+    keys = ["flow", "aux"]
+    keys.extend(
+        f"aux/{name}"
+        for name in getattr(_AUX_LOSS_MODULE, "component_keys", ())
+    )
+    return keys
+
+
+def _aux_metrics_for_log(accelerator):
+    """Cross-rank mean of every aux loss component, as wandb metrics.
+
+    Collective: must be called by all ranks at the same step.
+    """
+    if _AUX_LOSS_MODULE is None or not _AUX_LAST_METRICS:
+        return {}
+    keys = _aux_log_keys()
+    zero = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+    values = torch.stack(
+        [_AUX_LAST_METRICS.get(key, zero).detach().float().reshape(()) for key in keys]
+    )
+    gathered = accelerator.gather(values.unsqueeze(0)).reshape(-1, len(keys)).mean(dim=0)
+    return {f"train/{key}": float(value) for key, value in zip(keys, gathered)}
 # --- end auxiliary loss support ------------------------------------------------
 if __name__ == "__main__":
     main()
-
