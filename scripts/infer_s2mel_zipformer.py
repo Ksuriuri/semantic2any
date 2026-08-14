@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import sys
 from pathlib import Path
@@ -84,6 +85,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--show-progress", action="store_true")
+    parser.add_argument(
+        "--hf-gate-band",
+        type=int,
+        default=-1,
+        help=(
+            "Clamp predicted mel bands at or above this index to the training "
+            "clamp floor log(1e-5) before the vocoder.  Negative disables it."
+        ),
+    )
+    parser.add_argument(
+        "--mel-stats-csv",
+        default=None,
+        help=(
+            "Append one row per clip: the render settings plus the top-band "
+            "level and jitter of the prediction and of the ground-truth mel."
+        ),
+    )
     parser.add_argument(
         "--hf-suppress-khz",
         type=float,
@@ -194,6 +212,35 @@ def save_wav(path: Path, wav: torch.Tensor, sample_rate: int) -> None:
     torchaudio.save(str(path), wav, sample_rate, encoding="PCM_S", bits_per_sample=16)
 
 
+HF_STATS_BANDS = slice(107, 128)  # 11.025 kHz upward on a 128-band / 22.05 kHz mel
+MEL_CLAMP_FLOOR = math.log(1e-5)  # dynamic_range_compression_torch(clip_val=1e-5)
+
+
+def top_band_stats(mel: torch.Tensor) -> tuple[float, float]:
+    """Level and frame-to-frame jitter of the top mel bands.
+
+    The two suspects move these in opposite directions -- CFG overshoot raises
+    both, temperature below 1 lowers the jitter -- so the pair separates them
+    where a single number cannot.
+    """
+    band = mel[:, HF_STATS_BANDS, :].to(dtype=torch.float32)
+    level = float(band.mean().item())
+    if band.shape[-1] < 2:
+        return level, float("nan")
+    delta = band[:, :, 1:] - band[:, :, :-1]
+    return level, float(delta.std().item())
+
+
+def append_mel_stats(path: Path, row: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with path.open("a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 @torch.inference_mode()
 def infer_one(
     *,
@@ -213,6 +260,9 @@ def infer_one(
     show_progress: bool,
     style_mode: str,
     hf_suppress_khz: float,
+    hf_gate_band: int = -1,
+    mel_stats_csv: Path | None = None,
+    stats_extra: dict | None = None,
 ) -> None:
     batch = feature_adapter.extract_from_audio_paths([str(audio_path)])
     mel = batch["mel"].to(device=device, dtype=dtype)
@@ -241,6 +291,31 @@ def infer_one(
         drop_style=style_mode == "none",
     )
     generated = generated[:, :, prompt_len:mel_len]
+
+    pre_gate_level, pre_gate_jitter = top_band_stats(generated)
+    if hf_gate_band >= 0:
+        generated = generated.clone()
+        generated[:, hf_gate_band:, :] = MEL_CLAMP_FLOOR
+    if mel_stats_csv is not None:
+        gated_level, gated_jitter = top_band_stats(generated)
+        truth_level, truth_jitter = top_band_stats(mel[:, :, prompt_len:mel_len])
+        row = {
+            "clip": audio_path.stem,
+            "script": Path(__file__).name,
+            "cfg": inference_cfg_rate,
+            "temperature": temperature,
+            "steps": inference_steps,
+            "style_mode": style_mode,
+            "hf_gate_band": hf_gate_band,
+            "hf_mean_pred": round(gated_level, 4),
+            "hf_dstd_pred": round(gated_jitter, 4),
+            "hf_mean_pred_pregate": round(pre_gate_level, 4),
+            "hf_dstd_pred_pregate": round(pre_gate_jitter, 4),
+            "hf_mean_gt": round(truth_level, 4),
+            "hf_dstd_gt": round(truth_jitter, 4),
+        }
+        row.update(stats_extra or {})
+        append_mel_stats(Path(mel_stats_csv), row)
 
     sample_rate = int(
         _get(_get(cfg, "preprocess_params"), "sr", DEFAULT_MEL_SAMPLE_RATE)
@@ -334,6 +409,9 @@ def main() -> None:
             show_progress=args.show_progress,
             style_mode=args.style_mode,
             hf_suppress_khz=args.hf_suppress_khz,
+            hf_gate_band=args.hf_gate_band,
+            mel_stats_csv=args.mel_stats_csv,
+            stats_extra={"checkpoint": args.checkpoint, "seed": args.seed},
         )
 
 

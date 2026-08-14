@@ -271,13 +271,46 @@ def restrict_to_code_shards(
     return kept_metadata, kept_audio
 
 
+# Set from --code-ids-dir: when present, the id gate reads local code shards
+# instead of the GCS maskGCT prefix (the IndexTTS-2.5 shards have a different
+# id set, and they are already on disk).
+LOCAL_CODE_IDS_DIR: Path | None = None
+
+
+def load_local_code_ids(code_ids_dir: Path, dataset: str) -> set[str]:
+    """Load record IDs from local `<dir>/<dataset>/<dataset>-*.jsonl` shards."""
+    shard_dir = code_ids_dir / dataset
+    shards = sorted(shard_dir.glob(f"{dataset}-*.jsonl"))
+    if not shards:
+        shards = sorted(shard_dir.glob("*.jsonl"))
+    ids: set[str] = set()
+    for shard in shards:
+        with shard.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                record_id = json.loads(line).get("id")
+                if isinstance(record_id, str) and record_id:
+                    ids.add(record_id)
+    log(
+        "local_code_ids_loaded",
+        dataset=dataset,
+        shards=len(shards),
+        ids_count=len(ids),
+        source=str(shard_dir),
+    )
+    return ids
+
+
 def load_maskgct_code_ids(
     fs: gcsfs.GCSFileSystem,
     dataset_prefix: str,
     attempts: int,
     workers: int = 16,
 ) -> set[str]:
-    """Load the set of record IDs that have maskGCT codes on GCS."""
+    """Load the set of record IDs that have codes (local dir wins over GCS)."""
+    if LOCAL_CODE_IDS_DIR is not None:
+        return load_local_code_ids(LOCAL_CODE_IDS_DIR, dataset_prefix.rstrip("/").rsplit("/", 1)[-1])
     codes_prefix = f"{dataset_prefix}/features/maskGCT_codes"
     try:
         all_files = retry(
@@ -350,6 +383,7 @@ def _filter_params_key(args: argparse.Namespace) -> str:
         "languages": sorted(args.languages.split(",")) if args.languages else None,
         "max_hours_per_lang": args.max_hours_per_lang if args.max_hours_per_lang > 0 else None,
         "codes_shards_only": args.codes_shards_only and not args.no_require_maskgct_codes,
+        "code_ids_dir": str(args.code_ids_dir) if args.code_ids_dir else None,
     }
     return hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -1616,6 +1650,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-cer-filter", action="store_true", help="Skip CER filtering.")
     parser.add_argument("--no-speaker-filter", action="store_true", help="Skip speaker count filtering.")
+    parser.add_argument("--code-ids-dir", type=Path, default=None,
+                        help=(
+                            "Gate records on ids found in local code shards under "
+                            "<dir>/<dataset>/*.jsonl instead of the GCS maskGCT "
+                            "prefix (e.g. .../indextts25-codes)."
+                        ))
     parser.add_argument("--no-require-maskgct-codes", action="store_true",
                         help="Disable filtering records by maskGCT codes availability.")
     parser.add_argument("--languages", type=str, default="",
@@ -1933,6 +1973,12 @@ def main() -> None:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(key_file)
     os.environ["GOOGLE_CLOUD_PROJECT"] = PROJECT
     fs = gcsfs.GCSFileSystem(project=PROJECT, token=str(key_file))
+
+    if args.code_ids_dir is not None:
+        global LOCAL_CODE_IDS_DIR
+        LOCAL_CODE_IDS_DIR = args.code_ids_dir.expanduser().resolve()
+        if not LOCAL_CODE_IDS_DIR.is_dir():
+            raise SystemExit(f"--code-ids-dir does not exist: {LOCAL_CODE_IDS_DIR}")
 
     filter_key = _filter_params_key(args)
     sync_state = load_sync_state(output_root) if not args.force_rescan else {}

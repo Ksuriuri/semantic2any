@@ -513,6 +513,9 @@ def make_speaker_paired_dataset(
         hop_length=int(spect.hop_length),
         sample_rate=int(cfg.preprocess_params.sr),
         seed=int(cfg.seed),
+        allow_singleton_split=bool(
+            _get(cfg.data, "allow_singleton_split", True)
+        ),
     )
 
 
@@ -1135,6 +1138,7 @@ def main() -> None:
                 f"skipped target too-short={train_dataset.too_short_target_count}, "
                 f"overlong={train_dataset.overlong_target_count}, "
                 f"unusable={train_dataset.unusable_target_count}, "
+                f"no-reference={train_dataset.singleton_dropped_count}, "
                 f"missing-speaker={train_dataset.missing_speaker_count}, "
                 f"missing-duration={train_dataset.missing_duration_count}"
             )
@@ -1143,6 +1147,7 @@ def main() -> None:
                     f"[Pairing] valid: {len(valid_dataset)} samples "
                     f"({valid_dataset.paired_target_count} paired, "
                     f"{valid_dataset.singleton_target_count} singleton); "
+                    f"no-reference={valid_dataset.singleton_dropped_count}, "
                     f"missing-speaker={valid_dataset.missing_speaker_count}, "
                     f"missing-duration={valid_dataset.missing_duration_count}"
                 )
@@ -1552,6 +1557,16 @@ _AUX_MRSTFT_WAVEL1 = float(_aux_os.environ.get("AUX_MRSTFT_WAVEL1", "0.0"))
 # touching the spectral terms (phase_l1 measured flat at the random-phase
 # bound pi/2, see notes/tts-s2mel-quality.md).
 _AUX_MRSTFT_PHASE_WEIGHT = float(_aux_os.environ.get("AUX_MRSTFT_PHASE_WEIGHT", "1.0"))
+# Mel frames after the prompt that the frozen vocoder actually runs on.  128
+# frames = 1.49 s at hop 512 / 44.1 kHz; raising it covers more of the target
+# segment at a proportional cost in vocoder time and activation memory.
+_AUX_MAX_CHUNK_FRAMES = int(_aux_os.environ.get("AUX_MAX_CHUNK_FRAMES", "128"))
+# Draw the aux chunk start uniformly inside the target segment instead of always
+# supervising its first _AUX_MAX_CHUNK_FRAMES frames.  Same cost, full coverage.
+_AUX_CHUNK_RANDOM_OFFSET = _aux_os.environ.get("AUX_CHUNK_RANDOM_OFFSET", "0") == "1"
+# Recompute the frozen vocoder's activations in the backward instead of storing
+# them: 5.3x less aux-loss peak memory, bitwise-identical gradients.
+_AUX_VOCODER_CKPT = _aux_os.environ.get("AUX_VOCODER_CKPT", "0") == "1"
 _AUX_LOSS_MODULE = None
 # Last step's flow/aux loss terms, refreshed by _record_aux_metrics.
 _AUX_LAST_METRICS: dict = {}
@@ -1638,11 +1653,17 @@ def _init_aux_loss(cfg, device, dtype):
             sr=int(_get(_get(cfg, "preprocess_params"), "sr", 44100)),
             wave_l1_weight=_AUX_MRSTFT_WAVEL1,
             stft_kwargs={"phase_weight": _AUX_MRSTFT_PHASE_WEIGHT},
+            max_chunk_frames=_AUX_MAX_CHUNK_FRAMES,
+            random_chunk_offset=_AUX_CHUNK_RANDOM_OFFSET,
+            checkpoint_vocoder=_AUX_VOCODER_CKPT,
         ).to(device)
         print(
             f"[AuxLoss] BigVGANMRSTFTLoss (WaveFM) enabled, weight={_AUX_LOSS_WEIGHT}, "
             f"wave_l1_weight={_AUX_MRSTFT_WAVEL1}, "
-            f"phase_weight={_AUX_MRSTFT_PHASE_WEIGHT}"
+            f"phase_weight={_AUX_MRSTFT_PHASE_WEIGHT}, "
+            f"max_chunk_frames={_AUX_MAX_CHUNK_FRAMES}, "
+            f"random_chunk_offset={_AUX_CHUNK_RANDOM_OFFSET}, "
+            f"checkpoint_vocoder={_AUX_VOCODER_CKPT}"
         )
 
 

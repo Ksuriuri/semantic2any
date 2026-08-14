@@ -6,6 +6,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _checkpoint
 
 
 class MultiResolutionMelLoss(nn.Module):
@@ -538,6 +539,8 @@ class BigVGANMRSTFTLoss(nn.Module):
         max_chunk_frames: int = 128,
         wave_l1_weight: float = 0.0,
         stft_kwargs: dict | None = None,
+        random_chunk_offset: bool = False,
+        checkpoint_vocoder: bool = False,
     ):
         super().__init__()
         self.vocoder = vocoder
@@ -546,12 +549,42 @@ class BigVGANMRSTFTLoss(nn.Module):
         self.sr = sr
         self.max_chunk_frames = max_chunk_frames
         self.wave_l1_weight = wave_l1_weight
+        # A fixed start supervises only the first max_chunk_frames of every
+        # target for the whole run; a random start covers the segment in
+        # expectation at identical cost.
+        self.random_chunk_offset = bool(random_chunk_offset)
+        # Trade vocoder recompute for its retained activations (5.3x less peak).
+        self.checkpoint_vocoder = bool(checkpoint_vocoder)
         self.stft_loss = MultiResolutionSTFTLoss(**(stft_kwargs or {}))
         self.component_keys = tuple(
             ["total", "mrstft", "wave_l1"]
             + [f"mrstft/{key}" for key in self.stft_loss.component_keys]
         )
         self.last_components: dict[str, torch.Tensor] = {}
+
+    def _sample_chunk_starts(
+        self, mel_lens: torch.Tensor, prompt_lens: torch.Tensor
+    ) -> tuple[list[int], int]:
+        """Draw one chunk start per sample, each bounded by its own lengths.
+
+        A single batch-wide window is clamped to
+        ``[prompt_lens.max(), mel_lens.min() - chunk)``, which leaves part of
+        every shorter-prompt / longer-target sample permanently unsupervised.
+        Here sample i draws from ``[prompt_lens[i], mel_lens[i] - chunk_len]``,
+        so its whole target segment is reachable.  ``chunk_len`` is shared
+        because the slices are stacked into one tensor.
+        """
+        mel = [int(v) for v in mel_lens.tolist()]
+        prompt = [int(v) for v in prompt_lens.tolist()]
+        chunk_len = min([self.max_chunk_frames] + [m - p for m, p in zip(mel, prompt)])
+        if chunk_len <= 0:
+            return [], 0
+        starts: list[int] = []
+        for m, p in zip(mel, prompt):
+            span = m - chunk_len - p
+            offset = int(torch.randint(0, span + 1, (1,)).item()) if span > 0 else 0
+            starts.append(p + offset)
+        return starts, chunk_len
 
     def zero_components(self, device, dtype) -> None:
         """Fill ``last_components`` with zeros (early-return paths)."""
@@ -576,8 +609,34 @@ class BigVGANMRSTFTLoss(nn.Module):
         components["total"] = total.detach()
         self.last_components = components
 
+    def _vocoder_stage(self, index: int, x: torch.Tensor) -> torch.Tensor:
+        """One upsample stage of BigVGAN: ups[index] then its resblocks, averaged."""
+        voc = self.vocoder
+        for upsampler in voc.ups[index]:
+            x = upsampler(x)
+        summed = None
+        for kernel_index in range(voc.num_kernels):
+            value = voc.resblocks[index * voc.num_kernels + kernel_index](x)
+            summed = value if summed is None else summed + value
+        return summed / voc.num_kernels
+
+    def _vocoder_post(self, x: torch.Tensor) -> torch.Tensor:
+        voc = self.vocoder
+        x = voc.conv_post(voc.activation_post(x))
+        return torch.tanh(x) if voc.use_tanh_at_final else torch.clamp(x, -1, 1)
+
     def _vocoder_forward(self, mel: torch.Tensor) -> torch.Tensor:
-        return self.vocoder(mel).squeeze(1)
+        if not (self.checkpoint_vocoder and torch.is_grad_enabled() and mel.requires_grad):
+            return self.vocoder(mel).squeeze(1)
+        # Mirror of BigVGAN.forward with one checkpoint segment per upsample
+        # stage, plus the post block (which runs at the full 44.1 kHz rate).
+        # Freezing the vocoder saves only its 0.46 GiB of weights; what costs
+        # 19-26 GiB is the activations kept for the backward into the predicted
+        # mel, and those are exactly what recompute drops.
+        x = self.vocoder.conv_pre(mel)
+        for index in range(self.vocoder.num_upsamples):
+            x = _checkpoint(self._vocoder_stage, index, x, use_reentrant=False)
+        return _checkpoint(self._vocoder_post, x, use_reentrant=False).squeeze(1)
 
     def forward(
         self,
@@ -591,20 +650,37 @@ class BigVGANMRSTFTLoss(nn.Module):
         prompt_frames = prompt_lens[0].item() if B == 1 else int(prompt_lens.max().item())
         mel_end = mel_lens[0].item() if B == 1 else int(mel_lens.max().item())
 
-        gen_start = prompt_frames
-        gen_end = min(mel_end, gen_start + self.max_chunk_frames)
-        if gen_end <= gen_start:
-            self.zero_components(x1_hat.device, x1_hat.dtype)
-            return torch.zeros((), device=x1_hat.device, dtype=x1_hat.dtype)
+        if self.random_chunk_offset:
+            # One start per sample: the batch-wide window can never cover the
+            # part of a target that lies before prompt_lens.max() or after
+            # mel_lens.min().
+            starts, chunk_len = self._sample_chunk_starts(mel_lens, prompt_lens)
+            if chunk_len <= 0:
+                self.zero_components(x1_hat.device, x1_hat.dtype)
+                return torch.zeros((), device=x1_hat.device, dtype=x1_hat.dtype)
+            x1_hat_chunk = torch.stack(
+                [x1_hat[i, :, s : s + chunk_len] for i, s in enumerate(starts)]
+            ).float()
+            gt_chunk = torch.stack(
+                [x1[i, :, s : s + chunk_len] for i, s in enumerate(starts)]
+            ).float()
+        else:
+            gen_start = prompt_frames
+            gen_end = min(mel_end, gen_start + self.max_chunk_frames)
+            if gen_end <= gen_start:
+                self.zero_components(x1_hat.device, x1_hat.dtype)
+                return torch.zeros((), device=x1_hat.device, dtype=x1_hat.dtype)
+            x1_hat_chunk = x1_hat[:, :, gen_start:gen_end].float()
+            gt_chunk = x1[:, :, gen_start:gen_end].float()
 
-        x1_hat_chunk = x1_hat[:, :, gen_start:gen_end].float()
         if gt_wav is None:
             # Vocode only the generated chunk of the ground-truth mel, per
             # batch.  Caching the first batch's full waveform was both wrong
             # (compared every batch against batch #1) and fragile (a NaN batch
-            # poisoned the cache forever).
+            # poisoned the cache forever).  pred and GT use the same slices, so
+            # they cannot drift apart.
             with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=False):
-                gt_wav = self.vocoder(x1[:, :, gen_start:gen_end].float()).squeeze(1)
+                gt_wav = self.vocoder(gt_chunk).squeeze(1)
             gt_wav = gt_wav.detach()
 
         # Never let a single corrupt (NaN) sample poison the loss: return a

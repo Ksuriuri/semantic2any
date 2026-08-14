@@ -615,8 +615,11 @@ class S2MelSpeakerPairedDataset(Dataset):
         hop_length: int,
         sample_rate: int,
         seed: int = 0,
+        allow_singleton_split: bool = True,
     ) -> None:
         self.target_dataset = target_dataset
+        self.allow_singleton_split = bool(allow_singleton_split)
+        self.singleton_dropped_count = 0
         target_records = _dataset_records(target_dataset)
         if min_prompt_seconds <= 0 or min_target_seconds <= 0:
             raise ValueError("Minimum prompt and target durations must be positive")
@@ -638,7 +641,9 @@ class S2MelSpeakerPairedDataset(Dataset):
             if not isinstance(duration, (int, float)) or not math.isfinite(float(duration)):
                 self.missing_duration_count += 1
                 continue
-            if float(duration) >= min_prompt_seconds:
+            # Upper bound too: a prompt longer than max_prompt_seconds would have
+            # to be truncated, and the reference must be used whole.
+            if min_prompt_seconds <= float(duration) <= max_prompt_seconds:
                 identity = _record_identity(record, index)
                 pairing_key = _record_pairing_key(record, speaker_id)
                 prompt_groups[pairing_key].append(index)
@@ -671,6 +676,11 @@ class S2MelSpeakerPairedDataset(Dataset):
             identities = prompt_identities.get(pairing_key, set())
             singleton_split = not identities or identities == {target_identity}
             if singleton_split:
+                if not self.allow_singleton_split:
+                    # No distinct same-speaker reference, and cutting this clip in
+                    # two is not allowed, so the target is unusable.
+                    self.singleton_dropped_count += 1
+                    continue
                 if duration < min_prompt_seconds + min_target_seconds:
                     self.unusable_target_count += 1
                     continue
