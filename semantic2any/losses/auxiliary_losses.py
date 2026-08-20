@@ -204,9 +204,23 @@ class MultiResolutionSTFTLoss(nn.Module):
         return F.conv2d(x, kernel).squeeze(1)
 
     def forward(
-        self, wav_pred: torch.Tensor, wav_gt: torch.Tensor
+        self,
+        wav_pred: torch.Tensor,
+        wav_gt: torch.Tensor,
+        sample_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """WaveFM MR-STFT loss between predicted and GT waveforms (B, T)."""
+        """WaveFM MR-STFT loss between predicted and GT waveforms (B, T).
+
+        `sample_weights` (B,) turns every elementwise term into the per-sample
+        weighted mean `sum_i w_i * mean_bins(e_i) / sum_i w_i`.  The phase term
+        is excluded: its significant-bin masking flattens the batch axis, so it
+        has no per-sample axis to weight.
+        """
+        if sample_weights is not None and self.phase_weight != 0:
+            raise ValueError(
+                "sample_weights cannot be combined with phase_weight != 0: the "
+                "phase term's masked indexing has no per-sample axis"
+            )
         if wav_pred.shape != wav_gt.shape:
             min_len = min(wav_pred.size(-1), wav_gt.size(-1))
             if min_len < 256:
@@ -216,6 +230,19 @@ class MultiResolutionSTFTLoss(nn.Module):
             wav_gt = wav_gt[..., :min_len]
 
         device, dtype = wav_pred.device, wav_pred.dtype
+        _w = (
+            None
+            if sample_weights is None
+            else sample_weights.to(device=device, dtype=dtype).reshape(-1)
+        )
+        _w_sum = None if _w is None else _w.sum().clamp_min(1e-8)
+
+        def _reduce(err: torch.Tensor) -> torch.Tensor:
+            """Plain mean, or the per-sample weighted mean over dim 0."""
+            if _w is None:
+                return err.mean()
+            return (err.flatten(1).mean(dim=1) * _w).sum() / _w_sum
+
         components: dict[str, torch.Tensor] = {}
         term_sums = {
             name: torch.zeros((), device=device, dtype=dtype)
@@ -232,7 +259,7 @@ class MultiResolutionSTFTLoss(nn.Module):
             mag_gt = torch.sqrt(sq_gt + self.mag_min)
 
             # Log-magnitude L1 over all bins.
-            mag_loss = (mag_gt.log() - mag_pred.log()).abs().mean()
+            mag_loss = _reduce((mag_gt.log() - mag_pred.log()).abs())
 
             # Anti-wrapped phase-angle L1 on significant bins.
             if mask.any():
@@ -252,9 +279,9 @@ class MultiResolutionSTFTLoss(nn.Module):
             dt_pred = self._filter2d(mag_pred, self.time_kernel, (1, 0, 1, 1))
             lap_gt = self._filter2d(mag_gt, self.lap_kernel, (1, 1, 1, 1))
             lap_pred = self._filter2d(mag_pred, self.lap_kernel, (1, 1, 1, 1))
-            df_loss = (df_gt - df_pred).pow(2).mean()
-            dt_loss = (dt_gt - dt_pred).pow(2).mean()
-            lap_loss = (lap_gt - lap_pred).pow(2).mean()
+            df_loss = _reduce((df_gt - df_pred).pow(2))
+            dt_loss = _reduce((dt_gt - dt_pred).pow(2))
+            lap_loss = _reduce((lap_gt - lap_pred).pow(2))
 
             res_total = (
                 self.phase_weight * phase_loss
@@ -645,6 +672,7 @@ class BigVGANMRSTFTLoss(nn.Module):
         mel_lens: torch.Tensor,
         prompt_lens: torch.Tensor,
         gt_wav: torch.Tensor | None = None,
+        sample_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B = x1_hat.size(0)
         prompt_frames = prompt_lens[0].item() if B == 1 else int(prompt_lens.max().item())
@@ -701,14 +729,24 @@ class BigVGANMRSTFTLoss(nn.Module):
         wav_pred = wav_pred[..., :min_len]
         gt_wav_chunk = gt_wav[..., :min_len]
 
-        mrstft = self.stft_loss(wav_pred, gt_wav_chunk)
+        mrstft = self.stft_loss(
+            wav_pred, gt_wav_chunk, sample_weights=sample_weights
+        )
+
+        def _wave_l1() -> torch.Tensor:
+            err = (wav_pred - gt_wav_chunk).abs()
+            if sample_weights is None:
+                return err.mean()
+            w = sample_weights.to(device=err.device, dtype=err.dtype).reshape(-1)
+            return (err.flatten(1).mean(dim=1) * w).sum() / w.sum().clamp_min(1e-8)
+
         if self.wave_l1_weight > 0:
-            wave_l1 = (wav_pred - gt_wav_chunk).abs().mean()
+            wave_l1 = _wave_l1()
             loss = mrstft + self.wave_l1_weight * wave_l1
         else:
             # Still reported for monitoring, but kept out of the graph.
             with torch.no_grad():
-                wave_l1 = (wav_pred - gt_wav_chunk).abs().mean()
+                wave_l1 = _wave_l1()
             loss = mrstft
         self._record_components(mrstft, wave_l1, loss)
         return loss

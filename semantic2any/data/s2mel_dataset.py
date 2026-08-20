@@ -1044,6 +1044,7 @@ class S2MelCollator:
         mel_fmax: float | None = None,
         prompt_bandwidth_aug_prob: float = DEFAULT_PROMPT_BANDWIDTH_AUG_PROB,
         prompt_bandwidth_aug_rates: tuple[int, ...] = DEFAULT_PROMPT_BANDWIDTH_AUG_RATES,
+        force_bandwidth_hz: int = 0,
     ) -> None:
         self.hop_length = hop_length
         self.sample_rate = sample_rate
@@ -1072,6 +1073,7 @@ class S2MelCollator:
         }
         self.prompt_bandwidth_aug_prob = float(prompt_bandwidth_aug_prob)
         self.prompt_bandwidth_aug_rates = tuple(int(rate) for rate in prompt_bandwidth_aug_rates)
+        self.force_bandwidth_hz = int(force_bandwidth_hz or 0)
 
     def _validate_precomputed_metadata(self, records: list[dict[str, Any]]) -> None:
         if self.expected_semantic_codec is None:
@@ -1155,6 +1157,12 @@ class S2MelCollator:
         if random.random() >= self.prompt_bandwidth_aug_prob:
             return waveform
         rate = random.choice(self.prompt_bandwidth_aug_rates)
+        return simulate_lower_sample_rate(waveform, self.sample_rate, rate)
+
+    def _apply_force_bandwidth(self, waveform: torch.Tensor) -> torch.Tensor:
+        rate = int(getattr(self, "force_bandwidth_hz", 0) or 0)
+        if rate <= 0 or rate >= int(self.sample_rate):
+            return waveform
         return simulate_lower_sample_rate(waveform, self.sample_rate, rate)
 
     def _mel_from_waveform(self, waveform: torch.Tensor) -> torch.Tensor:
@@ -1251,9 +1259,13 @@ class S2MelCollator:
                 prompt_code_ids = prompt_codes[index, :prompt_keep]
                 target_code_ids = target_codes[index, : int(target_code_lens[index])]
 
-            prompt_mel_waveform = self._resample_to_mel_rate(prompt_segment, prompt_rate)
+            prompt_mel_waveform = self._apply_force_bandwidth(
+                self._resample_to_mel_rate(prompt_segment, prompt_rate)
+            )
             prompt_mel_waveform = self._maybe_limit_prompt_bandwidth(prompt_mel_waveform)
-            target_mel_waveform = self._resample_to_mel_rate(target_segment, target_rate)
+            target_mel_waveform = self._apply_force_bandwidth(
+                self._resample_to_mel_rate(target_segment, target_rate)
+            )
             prompt_features.append(
                 {
                     "mel": self._mel_from_waveform(prompt_mel_waveform),

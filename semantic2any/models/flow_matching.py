@@ -33,6 +33,13 @@ class BASECFM(nn.Module, ABC):
         reg_loss_type = _get(args, "reg_loss_type", "l1")
         self.criterion = nn.MSELoss() if reg_loss_type == "l2" else nn.L1Loss()
         self.zero_prompt_speech_token = bool(_get(dit_cfg, "zero_prompt_speech_token", False))
+        # ZipVoice-style: scale log-mel into the same ballpark as N(0,1).
+        # 1.0 = current recipe. Inference divides the ODE output back.
+        self.feat_scale = float(_get(args, "feat_scale", 1.0) or 1.0)
+        if self.feat_scale <= 0.0:
+            raise ValueError(f"feat_scale must be positive, got {self.feat_scale}")
+        # Extra weight on the highest mel band (lowest stays 1). 0 = off.
+        self.high_band_mse_extra = float(_get(args, "high_band_mse_extra", 0.0) or 0.0)
 
     @torch.inference_mode()
     def inference(
@@ -52,8 +59,10 @@ class BASECFM(nn.Module, ABC):
         batch, total_frames = mu.shape[:2]
         z = torch.randn(batch, self.in_channels, total_frames, device=mu.device, dtype=mu.dtype)
         z = z * temperature
+        if self.feat_scale != 1.0:
+            prompt = prompt * self.feat_scale
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
-        return self.solve_euler(
+        x = self.solve_euler(
             z,
             x_lens,
             prompt,
@@ -64,6 +73,9 @@ class BASECFM(nn.Module, ABC):
             show_progress,
             drop_style=drop_style,
         )
+        if self.feat_scale != 1.0:
+            x = x / self.feat_scale
+        return x
 
     def setup_estimator_caches(self, max_batch_size: int, max_seq_length: int) -> None:
         """Initialize estimator caches when the selected backbone requires them."""
@@ -149,8 +161,16 @@ class BASECFM(nn.Module, ABC):
         if self.estimator is None:
             raise RuntimeError("CFM estimator has not been initialized")
 
+        if self.feat_scale != 1.0:
+            x1 = x1 * self.feat_scale
         batch = x1.shape[0]
         time = torch.rand(batch, 1, 1, device=x1.device, dtype=x1.dtype)
+        # Stashed for the auxiliary loss.  x1_hat's error is
+        # (1-t)*(v_pred - velocity), so at small t it is noise dominated and the
+        # vocoder-space target is unreachable; AUX_T_MIN / AUX_T_POW gate and
+        # weight on this.  Kept on the module rather than widening the return
+        # tuple, which every caller unpacks as (loss, x1_hat).
+        self.last_time = time.detach().reshape(-1)
         noise = torch.randn_like(x1)
         y = (1 - (1 - self.sigma_min) * time) * noise + time * x1
         velocity = x1 - (1 - self.sigma_min) * noise
@@ -191,6 +211,13 @@ class BASECFM(nn.Module, ABC):
             if isinstance(self.criterion, nn.MSELoss)
             else difference.abs()
         )
+        if self.high_band_mse_extra != 0.0:
+            n_mels = element_loss.size(1)
+            ramp = torch.linspace(
+                0.0, 1.0, n_mels, device=element_loss.device, dtype=element_loss.dtype
+            )
+            band_w = 1.0 + self.high_band_mse_extra * ramp.square()
+            element_loss = element_loss * band_w.view(1, n_mels, 1)
         # Select, do not multiply: under fp16 `element_loss` can be inf in a
         # region this mask excludes (the unconstrained prompt segment, or the
         # padding tail), and `inf * 0 = nan` would poison the whole batch.
@@ -219,6 +246,8 @@ class BASECFM(nn.Module, ABC):
             x1_hat = y_unmasked + (1 - time) * estimator_out
         else:
             x1_hat = estimator_out + (1 - self.sigma_min) * noise
+        if self.feat_scale != 1.0:
+            x1_hat = x1_hat / self.feat_scale
         return loss, x1_hat
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+import re
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +65,52 @@ def _load_audio(path: str | Path, max_audio_seconds: float | None = None) -> tup
         max_samples = int(max_audio_seconds * sr)
         audio = audio[:, :max_samples]
     return audio, sr
+
+
+# BigVGAN ids encode the mel contract they were trained on, e.g.
+# nvidia/bigvgan_v2_44khz_128band_512x -> 44.1 kHz, 128 bands, hop 512.
+_VOCODER_ID_RE = re.compile(r"_(\d+)khz_(\d+)band_(\d+)x")
+# The name says "44khz"; the checkpoint says 44100.
+_VOCODER_KHZ_TO_SR = {22: 22050, 24: 24000, 44: 44100}
+
+
+def _check_vocoder_matches_mel(vocoder_cfg, mel_args: dict) -> None:
+    """Refuse a vocoder whose mel contract differs from preprocess_params.
+
+    Nothing downstream can catch this: BigVGAN accepts any (B, n_mels, T)
+    tensor with the right channel count, so a rate/hop mismatch produces
+    plausible audio at the wrong speed instead of an error, and with the aux
+    loss on the trainer optimises towards it.
+    """
+    model_id = str(_get(vocoder_cfg, "model_id", "") or "")
+    match = _VOCODER_ID_RE.search(model_id)
+    if match is None:
+        # A custom id carries no contract in its name; nothing to check.
+        return
+    khz, bands, upsample = (int(g) for g in match.groups())
+    expected_sr = _VOCODER_KHZ_TO_SR.get(khz, khz * 1000)
+    problems = []
+    if mel_args["sampling_rate"] != expected_sr:
+        problems.append(
+            f"preprocess_params.sr={mel_args['sampling_rate']} but the vocoder "
+            f"is {expected_sr} Hz"
+        )
+    if mel_args["num_mels"] != bands:
+        problems.append(
+            f"spect_params.n_mels={mel_args['num_mels']} but the vocoder wants "
+            f"{bands}"
+        )
+    if mel_args["hop_size"] != upsample:
+        problems.append(
+            f"spect_params.hop_length={mel_args['hop_size']} but the vocoder "
+            f"upsamples {upsample}x"
+        )
+    if problems:
+        raise ValueError(
+            f"vocoder.model_id {model_id!r} does not match the mel config: "
+            + "; ".join(problems)
+            + ". A mismatch here is silent, so it is refused at startup."
+        )
 
 
 class S2MelFeatureAdapter(nn.Module):
@@ -183,6 +230,11 @@ class S2MelFeatureAdapter(nn.Module):
         self.sample_rate_mel = int(_get(data_cfg, "sample_rate_mel", self.mel_args["sampling_rate"]))
         self.feature_batch_size = max(1, int(_get(data_cfg, "feature_batch_size", 16)))
         self.mel_batch_size = max(1, int(_get(data_cfg, "mel_batch_size", 2)))
+        self.force_bandwidth_hz = int(_get(data_cfg, "force_bandwidth_hz", 0) or 0)
+        if self.force_bandwidth_hz < 0:
+            raise ValueError(
+                f"data.force_bandwidth_hz must be >= 0, got {self.force_bandwidth_hz}"
+            )
         self.prompt_bandwidth_aug_prob = float(
             _get(data_cfg, "prompt_bandwidth_aug_prob", DEFAULT_PROMPT_BANDWIDTH_AUG_PROB)
         )
@@ -218,6 +270,7 @@ class S2MelFeatureAdapter(nn.Module):
                 "s2mel.DiT.in_channels must match preprocess mel bands "
                 f"({model_mel_channels} != {self.mel_args['num_mels']})"
             )
+        _check_vocoder_matches_mel(_get(cfg, "vocoder"), self.mel_args)
 
         for module in (self.semantic_backend, self.semantic_decoder, self.campplus_model):
             if module is None:
@@ -487,6 +540,14 @@ class S2MelFeatureAdapter(nn.Module):
         simulate_rate = candidates[0] if len(candidates) == 1 else random.choice(candidates)
         return simulate_lower_sample_rate(waveform, sample_rate, simulate_rate)
 
+    def _apply_force_bandwidth(
+        self, waveform: torch.Tensor, sample_rate: int
+    ) -> torch.Tensor:
+        rate = int(getattr(self, "force_bandwidth_hz", 0) or 0)
+        if rate <= 0 or rate >= int(sample_rate):
+            return waveform
+        return simulate_lower_sample_rate(waveform, sample_rate, rate)
+
     @torch.no_grad()
     def extract_utterance_features(
         self,
@@ -626,12 +687,17 @@ class S2MelFeatureAdapter(nn.Module):
             resampled[self.sample_rate_16k] if need_16k else []
         )
         for index in range(len(audio_paths)):
+            prompt_audio_mel = self._apply_force_bandwidth(
+                segment_waveforms_mel[2 * index], self.sample_rate_mel
+            )
+            target_audio_mel = self._apply_force_bandwidth(
+                segment_waveforms_mel[2 * index + 1], self.sample_rate_mel
+            )
             prompt_audio_mel = self._maybe_limit_prompt_bandwidth(
-                segment_waveforms_mel[2 * index],
+                prompt_audio_mel,
                 self.sample_rate_mel,
                 enabled=apply_prompt_bandwidth_aug,
             )
-            target_audio_mel = segment_waveforms_mel[2 * index + 1]
             prompt_mels.append(
                 self.mel_spectrogram(prompt_audio_mel.float(), **self.mel_args).squeeze(0)
             )
@@ -969,12 +1035,18 @@ class S2MelFeatureAdapter(nn.Module):
         device = self._module_device()
         mel_inputs: list[torch.Tensor] = []
         for index in range(batch_size):
+            prompt_mel_waveform = self._apply_force_bandwidth(
+                mel_waveforms[2 * index], self.sample_rate_mel
+            )
+            target_mel_waveform = self._apply_force_bandwidth(
+                mel_waveforms[2 * index + 1], self.sample_rate_mel
+            )
             prompt_mel_waveform = self._maybe_limit_prompt_bandwidth(
-                mel_waveforms[2 * index],
+                prompt_mel_waveform,
                 self.sample_rate_mel,
                 enabled=apply_prompt_bandwidth_aug,
             )
-            mel_inputs.extend([prompt_mel_waveform, mel_waveforms[2 * index + 1]])
+            mel_inputs.extend([prompt_mel_waveform, target_mel_waveform])
         if self.mel_spectrogram is mel_spectrogram:
             batched_mels = mel_spectrogram_batch(
                 mel_inputs,

@@ -27,6 +27,7 @@ def save_compatible_checkpoint(
     *,
     epoch: int = 0,
     step: int = 0,
+    epoch_step: int | None = None,
     config: Any | None = None,
     extra: dict[str, Any] | None = None,
 ) -> None:
@@ -37,6 +38,8 @@ def save_compatible_checkpoint(
         "epoch": epoch,
         "iters": step,
     }
+    if epoch_step is not None:
+        payload["epoch_step"] = int(epoch_step)
     if config is not None:
         payload["config"] = config
     if extra:
@@ -50,7 +53,8 @@ def load_compatible_checkpoint(
     *,
     strict: bool = False,
     ignore_modules: tuple[str, ...] = (),
-) -> tuple[int, int]:
+    return_meta: bool = False,
+) -> tuple[int, int] | tuple[int, int, dict[str, Any]]:
     state = torch.load(path, map_location="cpu")
     params = state.get("net", state)
     for name, module in model.models.items():
@@ -68,4 +72,12 @@ def load_compatible_checkpoint(
                     "MaskGCT uses 1024 dims and SAC raw semantic embeddings use 1280 dims."
                 )
         module.load_state_dict(module_state, strict=strict)
-    return int(state.get("epoch", 0)), int(state.get("iters", state.get("step", 0)))
+    epoch = int(state.get("epoch", 0))
+    iters = int(state.get("iters", state.get("step", 0)))
+    if not return_meta:
+        return epoch, iters
+    stored_epoch_step = state.get("epoch_step")
+    return epoch, iters, {
+        "epoch_step": None if stored_epoch_step is None else int(stored_epoch_step),
+        "config": state.get("config"),
+    }

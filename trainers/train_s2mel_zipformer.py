@@ -8,7 +8,7 @@ import random
 import shutil
 import sys
 from collections.abc import Callable, Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Any
 
@@ -375,6 +375,7 @@ def make_dataloader(
             int(rate)
             for rate in _get(cfg.data, "prompt_bandwidth_aug_rates", (16000, 22050))
         ),
+        force_bandwidth_hz=int(_get(cfg.data, "force_bandwidth_hz", 0) or 0),
     )
     kwargs: dict[str, Any] = {}
     if int(cfg.data.num_workers) > 0:
@@ -382,6 +383,9 @@ def make_dataloader(
         # Validation loaders re-create workers per pass so that the seeded RNG
         # fork in validate() also controls worker seeding (deterministic prompts).
         kwargs["persistent_workers"] = persistent_workers
+        # If a worker wedges on a bad tar/flac, fail this rank in 180s so it
+        # can still join the finite-loss allreduce instead of dying at NCCL 600s.
+        kwargs["timeout"] = 180.0
     use_buckets = bool(_get(cfg.data, "length_bucketed_batches", False)) and shuffle
     if use_buckets:
         boundaries = [
@@ -418,6 +422,62 @@ def make_dataloader(
         drop_last=shuffle,
         **kwargs,
     )
+
+
+def _sync_has_batch(accelerator: Accelerator, has_batch: bool) -> bool:
+    """Agree across ranks on whether the epoch continues.
+
+    Shards are split by speaker hash, so they are not exactly equal: the
+    smallest runs out ~1.6% of an epoch before the largest.  A rank that leaves
+    the epoch loop on its own never joins the next step's collectives, and the
+    others block in the numel=1 finite-loss all-reduce until the 600 s NCCL
+    watchdog aborts the job.  Reducing with MIN ends the epoch for everyone as
+    soon as any rank is out, at the cost of the largest shard's tail.
+    """
+    if accelerator.num_processes <= 1:
+        return has_batch
+    flag = torch.tensor([1.0 if has_batch else 0.0], device=accelerator.device)
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+    out_of_data = flag.item() < 1.0
+    if has_batch and out_of_data and accelerator.is_main_process:
+        print(
+            "[EpochEnd] another rank ran out of data - all ranks end the epoch "
+            "together",
+            flush=True,
+        )
+    return not out_of_data
+
+
+def _next_raw_batch(iterator):
+    # Return (batch, exhausted). Fetch errors return (None, False).
+    try:
+        return next(iterator), False
+    except StopIteration:
+        return None, True
+    except Exception as exc:
+        print(f"[DataLoader] fetch failed: {type(exc).__name__}: {exc}", flush=True)
+        return None, False
+
+
+_BUILD_POOL: ThreadPoolExecutor | None = None
+
+
+def _build_batch_or_none(build_fn, raw_batch):
+    # Same 180s budget as DataLoader timeout. A wedged build must still
+    # reach the finite-loss allreduce instead of dying at NCCL 600s.
+    global _BUILD_POOL
+    if raw_batch is None:
+        return None
+    if _BUILD_POOL is None:
+        _BUILD_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="s2mel-build")
+    fut = _BUILD_POOL.submit(build_fn, raw_batch)
+    try:
+        return fut.result(timeout=180.0)
+    except Exception as exc:
+        print(f"[DataLoader] build failed: {type(exc).__name__}: {exc}", flush=True)
+        _BUILD_POOL.shutdown(wait=False, cancel_futures=True)
+        _BUILD_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="s2mel-build")
+        return None
 
 
 def _split_source(cfg, split: str) -> tuple[str, bool]:
@@ -809,8 +869,16 @@ class AsyncFeatureBatchBuilder:
                 _record_tensors_on_stream(batch, consumer_stream)
         return batch
 
-    def get(self) -> dict[str, torch.Tensor]:
-        return self._prepare_for_consumer(self._take_result())
+    def get(self, timeout: float = 180.0) -> dict[str, torch.Tensor]:
+        if self.future is None:
+            raise RuntimeError("No feature batch is pending")
+        future = self.future
+        self.future = None
+        try:
+            result = future.result(timeout=timeout)
+        except FuturesTimeoutError as exc:
+            raise TimeoutError("feature batch build timed out") from exc
+        return self._prepare_for_consumer(result)
 
     def close(self) -> None:
         if self.closed:
@@ -1026,6 +1094,7 @@ def save_training_checkpoint(
             unwrapped,
             epoch=epoch,
             step=global_step,
+            epoch_step=epoch_step,
             config=OmegaConf.to_container(cfg, resolve=True),
         )
         rotate_checkpoints(
@@ -1205,54 +1274,82 @@ def main() -> None:
     start_epoch = 0
     global_step = 0
     resume_epoch_step = 0
+    resume_meta = None
     if resume_path is not None and resume_path.is_file():
-        start_epoch, global_step = load_compatible_checkpoint(model, resume_path, strict=False)
+        start_epoch, global_step, resume_meta = load_compatible_checkpoint(
+            model, resume_path, strict=False, return_meta=True
+        )
+        stored_epoch_step = resume_meta.get("epoch_step")
+        if stored_epoch_step is not None:
+            resume_epoch_step = int(stored_epoch_step)
+        if args.resume_epoch_step is not None:
+            resume_epoch_step = args.resume_epoch_step
         if accelerator.is_main_process:
             print(f"[Resume] Loaded compatible checkpoint {resume_path} at step={global_step}")
 
+    _fresh_lr = bool(_get(cfg.train, "fresh_lr_schedule", False))
+    _sched_src = cfg
+    if (
+        resume_path is not None
+        and resume_path.is_file()
+        and not _fresh_lr
+        and resume_meta is not None
+        and resume_meta.get("config") is not None
+    ):
+        _sched_src = resume_meta["config"]
+    _sched_train = _get(_sched_src, "train", _sched_src)
+    _base_lr = float(_get(_sched_train, "learning_rate", cfg.train.learning_rate))
+    _min_lr = float(_get(_sched_train, "min_learning_rate", _get(cfg.train, "min_learning_rate", 1.0e-5)))
+    _warmup_steps = int(_get(_sched_train, "warmup_steps", cfg.train.warmup_steps))
+    _max_steps_sched = int(_get(_sched_train, "max_steps", cfg.train.max_steps))
+    if _base_lr <= 0.0:
+        raise ValueError(f"learning_rate must be positive, got {_base_lr}")
+    if not 0.0 <= _min_lr <= _base_lr:
+        raise ValueError(
+            f"min_learning_rate must be between 0 and learning_rate; got {_min_lr} and {_base_lr}"
+        )
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=float(cfg.train.learning_rate),
+        lr=_base_lr,
         weight_decay=float(cfg.train.weight_decay),
     )
     updates_per_epoch = math.ceil(len(train_loader) / int(cfg.train.grad_accumulation))
-    total_steps = int(cfg.train.max_steps) if int(cfg.train.max_steps) > 0 else int(cfg.train.epochs) * updates_per_epoch
+    total_steps = int(_max_steps_sched) if int(_max_steps_sched) > 0 else int(cfg.train.epochs) * updates_per_epoch
     # AcceleratedScheduler ticks the LR schedule num_processes times per optimizer step
     # (when split_batches=False, which is the default). Scale num_training_steps and
     # warmup_steps accordingly so the cosine period matches the intended optimizer steps.
     _dl_cfg = getattr(accelerator, "dataloader_config", None)
     _split = getattr(_dl_cfg, "split_batches", False) or getattr(accelerator, "split_batches", False)
     _sched_scale = 1 if _split else accelerator.num_processes
-    _warmup_scaled = int(cfg.train.warmup_steps) * _sched_scale
+    _warmup_scaled = int(_warmup_steps) * _sched_scale
     _total_scaled = max(1, total_steps * _sched_scale)
     scheduler = cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=_warmup_scaled,
         num_training_steps=_total_scaled,
-        min_lr_ratio=float(_get(cfg.train, "min_learning_rate", 1.0e-5)) / float(cfg.train.learning_rate),
+        min_lr_ratio=_min_lr / _base_lr,
     )
-    _fresh_lr = bool(_get(cfg.train, "fresh_lr_schedule", False))
     if resume_path is not None and resume_path.is_file() and global_step > 0:
         if _fresh_lr:
-            # fresh_lr_schedule=True: start a new cosine schedule from scratch.
-            # Reset epoch counter so range(0, epochs) gives the full new training.
-            start_epoch = 0
+            # New schedule from the live yaml. Keep epoch / epoch_step so already-seen
+            # samples are still skipped; pass --resume-epoch-step 0 to replay them.
             if accelerator.is_main_process:
                 print(
                     f"[Resume] fresh_lr_schedule=True: LR starts at {float(cfg.train.learning_rate):.2e}, "
-                    f"epoch counter reset to 0, training for {int(cfg.train.epochs)} new epochs"
+                    f"epoch_step={resume_epoch_step} kept"
                 )
         else:
-            # Weights-only checkpoints carry no scheduler state. Fast-forward the LR
-            # schedule so training does not restart warmup at full LR. The prepared
-            # scheduler ticks num_processes times per optimizer step, so replay the
-            # equivalent number of raw ticks here (before accelerator.prepare).
-            for _ in range(global_step * accelerator.num_processes):
+            # Weights-only checkpoints carry no scheduler state. Rebuild from the
+            # checkpoint's own train hparams (not a later yaml edit) and fast-forward.
+            for _ in range(global_step * _sched_scale):
                 scheduler.step()
             if accelerator.is_main_process:
                 print(
-                    f"[Resume] Fast-forwarded LR scheduler by {global_step} steps "
-                    f"(lr={scheduler.get_last_lr()[0]:.3e}); optimizer moments start fresh"
+                    f"[Resume] Restored LR from checkpoint schedule "
+                    f"(base={_base_lr:.3e}, min={_min_lr:.3e}, warmup={_warmup_steps}) "
+                    f"fast-forward {global_step} steps -> lr={scheduler.get_last_lr()[0]:.3e}; "
+                    "optimizer moments start fresh"
                 )
 
     if valid_loader is None:
@@ -1292,6 +1389,22 @@ def main() -> None:
         _init_aux_loss(cfg, accelerator.device, torch.bfloat16)
     # Per-rank optimizer steps per epoch (prepared loader is already sharded).
     steps_per_epoch = max(1, math.ceil(len(train_loader) / int(cfg.train.grad_accumulation)))
+    if (
+        resume_path is not None
+        and resume_path.is_file()
+        and args.resume_epoch_step is None
+        and resume_meta is not None
+        and resume_meta.get("epoch_step") is None
+        and global_step > 0
+    ):
+        start_epoch = int(global_step) // int(steps_per_epoch)
+        resume_epoch_step = int(global_step) % int(steps_per_epoch)
+        if accelerator.is_main_process:
+            print(
+                f"[Resume] Inferred epoch={start_epoch + 1} epoch_step={resume_epoch_step} "
+                f"from step={global_step} / steps_per_epoch={steps_per_epoch} "
+                "(old .pth had no epoch_step)"
+            )
 
     for epoch in range(start_epoch, int(cfg.train.epochs)):
         if int(cfg.train.max_steps) > 0 and global_step >= int(cfg.train.max_steps):
@@ -1320,18 +1433,17 @@ def main() -> None:
                 async_build_fn,
                 device=accelerator.device,
             )
+        async_skip_next = False
 
         try:
-            try:
-                current_raw_batch = next(raw_iterator)
-            except StopIteration:
-                has_batch = False
-                current_raw_batch = None
-            else:
-                has_batch = True
-                if async_builder is not None:
+            current_raw_batch, exhausted = _next_raw_batch(raw_iterator)
+            has_batch = _sync_has_batch(accelerator, not exhausted)
+            if has_batch and async_builder is not None:
+                if current_raw_batch is not None:
                     async_builder.submit(current_raw_batch)
                     current_raw_batch = None
+                else:
+                    async_skip_next = True
 
             while has_batch and not (
                 int(cfg.train.max_steps) > 0
@@ -1343,7 +1455,19 @@ def main() -> None:
                 validation_barrier = False
                 with accelerator.accumulate(model):
                     if async_builder is not None:
-                        train_batch = async_builder.get()
+                        if async_skip_next:
+                            train_batch = None
+                            async_skip_next = False
+                        else:
+                            try:
+                                train_batch = async_builder.get(timeout=180.0)
+                            except Exception as exc:
+                                print(
+                                    f"[DataLoader] feature get failed: "
+                                    f"{type(exc).__name__}: {exc}",
+                                    flush=True,
+                                )
+                                train_batch = None
                         next_global_step = global_step + int(accelerator.sync_gradients)
                         prefetch_barrier = step_requires_async_prefetch_barrier(
                             cfg,
@@ -1359,19 +1483,28 @@ def main() -> None:
                             and next_global_step % valid_interval == 0
                         )
                         if not prefetch_barrier:
-                            try:
-                                next_raw_batch = next(raw_iterator)
-                            except StopIteration:
-                                pass
-                            else:
+                            next_raw_batch, next_exhausted = _next_raw_batch(raw_iterator)
+                            if next_raw_batch is not None:
                                 has_next_batch = True
                                 async_builder.submit(next_raw_batch)
+                            else:
+                                has_next_batch = not next_exhausted
+                                if has_next_batch:
+                                    async_skip_next = True
                     else:
-                        assert current_raw_batch is not None
-                        train_batch = async_build_fn(current_raw_batch)
+                        if current_raw_batch is None:
+                            train_batch = None
+                        else:
+                            train_batch = _build_batch_or_none(async_build_fn, current_raw_batch)
 
-                    loss = forward_loss_with_aux(model, train_batch) if _AUX_LOSS_TYPE else forward_loss(model, train_batch)
-                    _spike_track_loss(loss, train_batch, global_step, accelerator)
+                    if train_batch is None:
+                        loss = torch.tensor(float("nan"), device=accelerator.device)
+                    elif _AUX_LOSS_TYPE:
+                        loss = forward_loss_with_aux(model, train_batch)
+                    else:
+                        loss = forward_loss(model, train_batch)
+                    if train_batch is not None:
+                        _spike_track_loss(loss, train_batch, global_step, accelerator)
                     # The skip decision MUST be identical on every rank: a rank
                     # that skips `backward` never joins the gradient all-reduce
                     # the other ranks are blocked in, which deadlocks NCCL until
@@ -1419,10 +1552,12 @@ def main() -> None:
                             # cannot corrupt the model; keep LR advancing.
                             if accelerator.is_main_process:
                                 _gnv = float(_gn) if _gn is not None else float("nan")
+                                _ids = _spike_ids_from_batch(train_batch)
                                 print(
                                     f"[SkipStep] step~{global_step} gnorm={_gnv:.3f} "
                                     f"exceeds SPIKE_SKIP_GNORM={_SPIKE_SKIP_GNORM} "
-                                    f"— optimizer.step() skipped",
+                                    f"— optimizer.step() skipped "
+                                    f"n={len(_ids)} ids={_ids[:8]}",
                                     flush=True,
                                 )
                             scheduler.step()
@@ -1495,11 +1630,8 @@ def main() -> None:
                         ):
                             has_next_batch = False
                         else:
-                            try:
-                                next_raw_batch = next(raw_iterator)
-                            except StopIteration:
-                                has_next_batch = False
-                            else:
+                            next_raw_batch, next_exhausted = _next_raw_batch(raw_iterator)
+                            if next_raw_batch is not None:
                                 has_next_batch = True
                                 if async_builder is None:
                                     async_builder = AsyncFeatureBatchBuilder(
@@ -1507,14 +1639,14 @@ def main() -> None:
                                         device=accelerator.device,
                                     )
                                 async_builder.submit(next_raw_batch)
-                    has_batch = has_next_batch
+                            else:
+                                has_next_batch = not next_exhausted
+                                if has_next_batch:
+                                    async_skip_next = True
+                    has_batch = _sync_has_batch(accelerator, has_next_batch)
                 else:
-                    try:
-                        current_raw_batch = next(raw_iterator)
-                    except StopIteration:
-                        has_batch = False
-                    else:
-                        has_batch = True
+                    current_raw_batch, exhausted = _next_raw_batch(raw_iterator)
+                    has_batch = _sync_has_batch(accelerator, not exhausted)
         finally:
             if async_builder is not None:
                 async_builder.close()
@@ -1567,6 +1699,30 @@ _AUX_CHUNK_RANDOM_OFFSET = _aux_os.environ.get("AUX_CHUNK_RANDOM_OFFSET", "0") =
 # Recompute the frozen vocoder's activations in the backward instead of storing
 # them: 5.3x less aux-loss peak memory, bitwise-identical gradients.
 _AUX_VOCODER_CKPT = _aux_os.environ.get("AUX_VOCODER_CKPT", "0") == "1"
+# The aux loss is computed on `x1_hat`, whose error is (1-t)*(v_pred - velocity).
+# t is uniform, so at small t the one-step estimate is noise dominated and the
+# vocoder-space target is unreachable -- an unlearnable fraction of every batch
+# whose gradient still pushes the DiT.  Symptom in run as4v022n: over 32k steps
+# neither term improved (flow valid 0.608 -> 0.658, aux mrstft 1.889 -> 1.938).
+# Two independent knobs, usable together; both off by default.
+#   AUX_T_MIN  drop samples with t <= AUX_T_MIN (also cheaper: the frozen
+#              vocoder then runs on fewer samples)
+#   AUX_T_POW  weight each surviving sample by t**AUX_T_POW (2 => t^2)
+# Note AUX_T_POW only reaches the bigvgan_mrstft aux; the other aux types have
+# no per-sample weighting and will raise if it is set.
+# Default ON (kusuriuri, msg 935f815a): if the aux loss is on, the t gating goes
+# with it, because at small t the vocoder-space target is unreachable.  Setting
+# either variable to 0 explicitly still turns that half off.
+_AUX_T_MIN = float(_aux_os.environ.get("AUX_T_MIN", "0.5"))
+# t^p defaults on only for bigvgan_mrstft: it needs per-sample weighting, which
+# no other aux type supports, and _init_aux_loss raises on that combination -- so
+# a blanket default of 2 would make every other aux type fail at startup.  An
+# explicit AUX_T_POW is still honoured, and still rejected where it cannot work.
+_AUX_T_POW = float(
+    _aux_os.environ.get(
+        "AUX_T_POW", "2.0" if _AUX_LOSS_TYPE == "bigvgan_mrstft" else "0.0"
+    )
+)
 _AUX_LOSS_MODULE = None
 # Last step's flow/aux loss terms, refreshed by _record_aux_metrics.
 _AUX_LAST_METRICS: dict = {}
@@ -1576,6 +1732,22 @@ def _init_aux_loss(cfg, device, dtype):
     global _AUX_LOSS_MODULE
     if _AUX_LOSS_MODULE is not None:
         return
+    if _AUX_T_POW != 0.0 and _AUX_LOSS_TYPE != "bigvgan_mrstft":
+        # Fail at startup rather than with a TypeError 100 steps in: the other
+        # aux types reduce over the batch with no per-sample axis to weight.
+        raise RuntimeError(
+            f"AUX_T_POW={_AUX_T_POW} needs per-sample weighting, which only "
+            f"aux type 'bigvgan_mrstft' supports (got {_AUX_LOSS_TYPE!r}). "
+            "AUX_T_MIN works with any type."
+        )
+    if _AUX_T_MIN > 0.0 or _AUX_T_POW != 0.0:
+        print(
+            f"[AuxLoss] t gating: AUX_T_MIN={_AUX_T_MIN} AUX_T_POW={_AUX_T_POW} "
+            f"(aux supervises t>{_AUX_T_MIN}"
+            + (f", weighted by t^{_AUX_T_POW}" if _AUX_T_POW else "")
+            + ")",
+            flush=True,
+        )
     if _AUX_LOSS_TYPE == "mr_stft":
         from semantic2any.losses.auxiliary_losses import MultiResolutionMelLoss
         _AUX_LOSS_MODULE = MultiResolutionMelLoss(
@@ -1680,12 +1852,77 @@ def forward_loss_with_aux(model, batch):
         prompt_semantic_lens=batch.get("prompt_semantic_lens"),
     )
     if _AUX_LOSS_MODULE is not None and x1_hat is not None:
-        aux_loss = _AUX_LOSS_MODULE(
-            x1_hat, batch["mel"], batch["mel_lens"], batch["prompt_lens"]
-        )
+        selection = _aux_t_selection(model, x1_hat.size(0), x1_hat.device)
+        if selection is None:
+            # Every sample in this batch drew t <= AUX_T_MIN, so there is no
+            # trustworthy aux signal.  Report aux as zero and keep the flow
+            # term: the step still trains, and skipping it would make the
+            # skip decision rank-local (see _sync_has_batch).
+            aux_loss = x1_hat.new_zeros(())
+            if hasattr(_AUX_LOSS_MODULE, "zero_components"):
+                _AUX_LOSS_MODULE.zero_components(x1_hat.device, x1_hat.dtype)
+        else:
+            keep, weights = selection
+            extra = {} if weights is None else {"sample_weights": weights}
+            aux_loss = _AUX_LOSS_MODULE(
+                x1_hat[keep],
+                batch["mel"][keep],
+                batch["mel_lens"][keep],
+                batch["prompt_lens"][keep],
+                **extra,
+            )
         _record_aux_metrics(loss, aux_loss)
         loss = _FLOW_LOSS_WEIGHT * loss + _AUX_LOSS_WEIGHT * aux_loss
     return loss
+
+
+def _cfm_module(model):
+    """Reach the CFM through the accelerate / DDP wrappers."""
+    inner = model
+    for _ in range(4):
+        nxt = getattr(inner, "module", None)
+        if nxt is None:
+            break
+        inner = nxt
+    # model.models is an nn.ModuleDict, which supports `in` and [] but not .get.
+    models = getattr(inner, "models", None)
+    cfm = models["cfm"] if models is not None and "cfm" in models else None
+    if cfm is None:
+        raise RuntimeError(
+            "AUX_T_MIN/AUX_T_POW are set but the CFM module could not be reached "
+            f"through {type(model).__name__} to read its sampled t"
+        )
+    return cfm
+
+
+def _aux_t_selection(model, batch_size: int, device):
+    """Which samples the aux term supervises, and their per-sample weights.
+
+    Returns (index, weights) or None when nothing survives the AUX_T_MIN gate.
+    `index` is `slice(None)` when the gate is off, so there is one code path.
+    """
+    if _AUX_T_MIN <= 0.0 and _AUX_T_POW == 0.0:
+        return (slice(None), None)
+    t = getattr(_cfm_module(model), "last_time", None)
+    if t is None:
+        raise RuntimeError(
+            "AUX_T_MIN/AUX_T_POW are set but the CFM did not stash `last_time`; "
+            "the flow_matching.py half of the t-gating patch is missing"
+        )
+    t = t.detach().reshape(-1).to(device=device, dtype=torch.float32)
+    if t.numel() != batch_size:
+        raise RuntimeError(
+            f"CFM stashed {t.numel()} timesteps but the batch has {batch_size}; "
+            "last_time is stale, so the aux weighting would be misaligned"
+        )
+    if _AUX_T_MIN > 0.0:
+        keep = t > _AUX_T_MIN
+        if not bool(keep.any()):
+            return None
+    else:
+        keep = slice(None)
+    weights = None if _AUX_T_POW == 0.0 else t[keep].clamp_min(0.0) ** _AUX_T_POW
+    return (keep, weights)
 
 
 def _record_aux_metrics(flow_loss, aux_loss):

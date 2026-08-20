@@ -204,7 +204,45 @@ def prompt_frames_from_seconds(cfg, mel_len: int, prompt_seconds: float, min_gen
     return requested
 
 
+def _peak_guard(wav: torch.Tensor, path: Path) -> torch.Tensor:
+    """# --- peak guard (algo-dev) ---
+
+    Report tanh saturation and optionally rescale for equal-loudness A/B.
+
+    BigVGAN ends in tanh (use_tanh_at_final defaults True), so the output can
+    never exceed 1.0 and `peak > 1.0` would never fire -- the distortion shows
+    up as samples pinned AT full scale (flat tops), not as overshoot.  Measured
+    2026-08-17: copy-synthesis saturates 0.0000%, model output 0.008-0.051%.
+
+    Rescaling equalizes loudness but does NOT undo saturation: the flat tops
+    are already in the waveform.  Do not read a post-scale clip% as "fixed".
+    """
+    import os as _os
+
+    detached = wav.detach()
+    peak = detached.abs().max().item()
+    sat = (detached.abs() >= 0.999).float().mean().item()
+    print(f">> raw_peak {path.name}: {peak:.6f} saturated={sat * 100:.4f}%", flush=True)
+    if sat > 0.0:
+        print(
+            f">> WARN {path.name}: vocoder output is in tanh saturation "
+            f"({sat * 100:.4f}% of samples at full scale) -- audible as crackle; "
+            "rescaling will NOT remove it",
+            flush=True,
+        )
+    if _os.environ.get("S2MEL_PEAK_NORMALIZE", "0") == "1" and peak > 0.0:
+        target = float(_os.environ.get("S2MEL_PEAK_TARGET", "0.95"))
+        if peak > target:
+            wav = wav * (target / peak)
+            print(
+                f">> peak-normalized {path.name}: {peak:.4f} -> {target:.4f}",
+                flush=True,
+            )
+    return wav
+
+
 def save_wav(path: Path, wav: torch.Tensor, sample_rate: int) -> None:
+    wav = _peak_guard(wav, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     wav = torch.clamp(wav, -1.0, 1.0).detach().cpu()
     if wav.ndim == 1:
