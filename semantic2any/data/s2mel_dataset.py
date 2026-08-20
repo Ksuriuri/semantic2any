@@ -29,6 +29,10 @@ DEFAULT_MAX_PROMPT_SECONDS = 20.0
 DEFAULT_PROMPT_BANDWIDTH_AUG_PROB = 0.3
 DEFAULT_PROMPT_BANDWIDTH_AUG_RATES = (16000, 22050)
 _SEMANTIC_CODE_MEMMAPS: dict[str, np.memmap] = {}
+# Joint BigVGAN training needs the real target audio, not just its mel.  Read
+# from the environment rather than the config because dataloader workers are
+# forked before any config is handed to them, and inherit the environment.
+_RETURN_TARGET_WAVEFORM = os.environ.get("VOCODER_TRAIN", "0") == "1"
 
 
 def _load_tensor(path: str | Path) -> torch.Tensor:
@@ -928,6 +932,7 @@ def collate_paired_features(
     styles = []
     prompt_lens = []
     prompt_semantic_lens = []
+    target_wavs: list[torch.Tensor] = []
     for prompt_item, target_item in zip(prompt_features, target_features, strict=True):
         prompt_mel = _normalize_mel(prompt_item["mel"])
         target_mel = _normalize_mel(target_item["mel"])
@@ -979,6 +984,11 @@ def collate_paired_features(
         styles.append(style)
         prompt_lens.append(prompt_keep)
         prompt_semantic_lens.append(prompt_semantic_keep)
+        target_wav = target_item.get("wav")
+        if target_wav is not None:
+            # Trim to the frames that survived, so sample i*hop still belongs to
+            # target mel frame i (the vocoder's own frame/sample mapping).
+            target_wavs.append(target_wav.reshape(-1)[: target_keep * hop_length])
 
     device = mels[0].device
     mel_lens = torch.tensor([x.size(0) for x in mels], dtype=torch.long, device=device)
@@ -1013,6 +1023,17 @@ def collate_paired_features(
         "is_precomputed": is_precomputed,
         "is_paired": True,
     }
+    if target_wavs:
+        if len(target_wavs) != len(mels):
+            raise ValueError(
+                "Either every paired sample carries its target waveform or none do"
+            )
+        batch["target_wav_lens"] = torch.tensor(
+            [wav.numel() for wav in target_wavs], dtype=torch.long, device=device
+        )
+        batch["target_wav"] = pad_sequence(
+            target_wavs, batch_first=True, padding_value=0.0
+        )
     if records is not None:
         batch["records"] = records
     return batch
@@ -1273,13 +1294,17 @@ class S2MelCollator:
                     "style": style,
                 }
             )
-            target_features.append(
-                {
-                    "mel": self._mel_from_waveform(target_mel_waveform),
-                    "semantic": target_code_ids.long(),
-                    "style": style,
-                }
-            )
+            target_feature = {
+                "mel": self._mel_from_waveform(target_mel_waveform),
+                "semantic": target_code_ids.long(),
+                "style": style,
+            }
+            if _RETURN_TARGET_WAVEFORM:
+                # Joint vocoder training needs the real audio the target mel came
+                # from: its own output is not a usable target once it is being
+                # trained.  ~5 MiB per 30 s sample, so this stays opt-in.
+                target_feature["wav"] = target_mel_waveform.reshape(-1).contiguous()
+            target_features.append(target_feature)
 
         worker_batch = collate_paired_features(
             prompt_features,

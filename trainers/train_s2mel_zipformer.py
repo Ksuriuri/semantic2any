@@ -579,12 +579,14 @@ def make_speaker_paired_dataset(
     )
 
 
-def _weight_checkpoint_step(path: Path) -> int | None:
+def _weight_checkpoint_step(
+    path: Path, prefix: str = "s2mel_step", suffix: str = ".pth"
+) -> int | None:
     name = path.name
-    if not name.startswith("s2mel_step") or not name.endswith(".pth"):
+    if not name.startswith(prefix) or not name.endswith(suffix):
         return None
     try:
-        return int(name.removeprefix("s2mel_step").removesuffix(".pth"))
+        return int(name.removeprefix(prefix).removesuffix(suffix))
     except ValueError:
         return None
 
@@ -623,6 +625,21 @@ def rotate_checkpoints(
         key=lambda item: item[0],
     )
     for _, path in regular_weights[: max(0, len(regular_weights) - keep_last)]:
+        path.unlink(missing_ok=True)
+
+    # Joint training writes a 489 MiB vocoder beside every s2mel_step*.pth; left
+    # unrotated that fills the disk faster than the model weights do.  Same
+    # keep_last / archive policy so a step that keeps its model keeps its vocoder.
+    regular_vocoders = sorted(
+        (
+            (step, path)
+            for path in output_dir.glob("bigvgan_step*.pt")
+            if (step := _weight_checkpoint_step(path, "bigvgan_step", ".pt")) is not None
+            and not is_archived(step)
+        ),
+        key=lambda item: item[0],
+    )
+    for _, path in regular_vocoders[: max(0, len(regular_vocoders) - keep_last)]:
         path.unlink(missing_ok=True)
 
 
@@ -1078,6 +1095,20 @@ def save_training_checkpoint(
     save_dir = output_dir / f"checkpoint-{global_step}"
     accelerator.save_state(str(save_dir))
     if accelerator.is_main_process:
+        if _VOCODER_GAN is not None:
+            # accelerator.save_state only writes what was passed to prepare(),
+            # and the vocoder deliberately is not.  Without this the resumed run
+            # would pair an adapted flow model with a pristine HF vocoder, and
+            # every listening pack would be rendered with the wrong vocoder.
+            torch.save(_VOCODER_GAN.training_state(), save_dir / "vocoder_gan.pt")
+            torch.save(
+                {
+                    "vocoder": _VOCODER_GAN.vocoder.state_dict(),
+                    "step": int(global_step),
+                    "weight_norm": True,
+                },
+                output_dir / f"bigvgan_step{global_step}.pt",
+            )
         with (save_dir / "trainer_state.json").open("w", encoding="utf-8") as f:
             json.dump(
                 {
@@ -1386,7 +1417,14 @@ def main() -> None:
     model.train()
     last_saved_step = global_step
     if _AUX_LOSS_TYPE:
-        _init_aux_loss(cfg, accelerator.device, torch.bfloat16)
+        _init_aux_loss(
+            cfg,
+            accelerator.device,
+            torch.bfloat16,
+            world_size=accelerator.num_processes,
+        )
+    if _VOCODER_GAN is not None and resume_path is not None:
+        _resume_vocoder_gan(resume_path, accelerator)
     # Per-rank optimizer steps per epoch (prepared loader is already sharded).
     steps_per_epoch = max(1, math.ceil(len(train_loader) / int(cfg.train.grad_accumulation)))
     if (
@@ -1497,6 +1535,7 @@ def main() -> None:
                         else:
                             train_batch = _build_batch_or_none(async_build_fn, current_raw_batch)
 
+                    _set_global_step(global_step)
                     if train_batch is None:
                         loss = torch.tensor(float("nan"), device=accelerator.device)
                     elif _AUX_LOSS_TYPE:
@@ -1539,8 +1578,16 @@ def main() -> None:
                             )
                         scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
+                        if _VOCODER_GAN is not None:
+                            _VOCODER_GAN.zero_grad_all()
                     else:
                         accelerator.backward(loss)
+                        if _VOCODER_GAN is not None:
+                            # Own graph on detached audio, so it can run after the
+                            # main backward has freed its own.
+                            _VOCODER_GAN.discriminator_backward(
+                                scale=1.0 / float(cfg.train.grad_accumulation)
+                            )
                         _gn = None
                         _do_skip = False
                         if accelerator.sync_gradients and float(cfg.train.grad_clip) > 0:
@@ -1567,10 +1614,18 @@ def main() -> None:
                             # scaler state advances without applying bad grads.
                             optimizer.step()
                             optimizer.zero_grad(set_to_none=True)
+                            if _VOCODER_GAN is not None:
+                                # The flow model's gradients exploded; do not feed
+                                # the same step to the vocoder either.
+                                _VOCODER_GAN.zero_grad_all()
                         else:
                             optimizer.step()
                             scheduler.step()
                             optimizer.zero_grad(set_to_none=True)
+                            if _VOCODER_GAN is not None and accelerator.sync_gradients:
+                                # Collective: every rank must reach this, since it
+                                # all-reduces the vocoder and discriminator grads.
+                                _VOCODER_GAN.clip_and_step()
 
                 if validation_barrier and async_builder is not None:
                     # Validation workers are recreated on every pass. Tear down
@@ -1727,8 +1782,24 @@ _AUX_LOSS_MODULE = None
 # Last step's flow/aux loss terms, refreshed by _record_aux_metrics.
 _AUX_LAST_METRICS: dict = {}
 
+# --- joint BigVGAN training (VOCODER_TRAIN=1, off by default) ------------------
+# Unfreezing the vocoder is not a one-line change; see
+# semantic2any/losses/vocoder_gan.py for why (moving MR-STFT target, DDP cannot
+# wrap it, discriminators start from scratch).  Everything below is inert unless
+# VOCODER_TRAIN=1, so a restart of a running job is unaffected.
+_VOCODER_TRAIN = _aux_os.environ.get("VOCODER_TRAIN", "0") == "1"
+_VOCODER_GAN = None
+# The adversarial/feature-matching ramp needs the step count, which
+# forward_loss_with_aux does not otherwise see.
+_GLOBAL_STEP = 0
 
-def _init_aux_loss(cfg, device, dtype):
+
+def _set_global_step(step: int) -> None:
+    global _GLOBAL_STEP
+    _GLOBAL_STEP = int(step)
+
+
+def _init_aux_loss(cfg, device, dtype, world_size: int = 1):
     global _AUX_LOSS_MODULE
     if _AUX_LOSS_MODULE is not None:
         return
@@ -1818,8 +1889,17 @@ def _init_aux_loss(cfg, device, dtype):
             load_kwargs["cache_dir"] = cache_dir
         vocoder = BigVGAN.from_pretrained(model_id, **load_kwargs)
         vocoder = vocoder.to(device=device)
-        vocoder.remove_weight_norm()
-        vocoder.eval()
+        spect = _get(_get(cfg, "preprocess_params"), "spect_params")
+        hop_size = int(_get(spect, "hop_length", 512))
+        if _VOCODER_TRAIN:
+            # BigVGAN is trained *with* weight norm; folding it away first would
+            # train the folded weights and make the result un-resumable, so
+            # remove_weight_norm() is deliberately skipped here.  (.eval() is
+            # skipped for symmetry only -- this net has no BatchNorm/Dropout.)
+            vocoder.train()
+        else:
+            vocoder.remove_weight_norm()
+            vocoder.eval()
         _AUX_LOSS_MODULE = BigVGANMRSTFTLoss(
             vocoder=vocoder,
             sr=int(_get(_get(cfg, "preprocess_params"), "sr", 44100)),
@@ -1828,6 +1908,9 @@ def _init_aux_loss(cfg, device, dtype):
             max_chunk_frames=_AUX_MAX_CHUNK_FRAMES,
             random_chunk_offset=_AUX_CHUNK_RANDOM_OFFSET,
             checkpoint_vocoder=_AUX_VOCODER_CKPT,
+            trainable_vocoder=_VOCODER_TRAIN,
+            vocode_real_mel=_VOCODER_TRAIN,
+            hop_size=hop_size,
         ).to(device)
         print(
             f"[AuxLoss] BigVGANMRSTFTLoss (WaveFM) enabled, weight={_AUX_LOSS_WEIGHT}, "
@@ -1837,6 +1920,98 @@ def _init_aux_loss(cfg, device, dtype):
             f"random_chunk_offset={_AUX_CHUNK_RANDOM_OFFSET}, "
             f"checkpoint_vocoder={_AUX_VOCODER_CKPT}"
         )
+    if _VOCODER_TRAIN:
+        _init_vocoder_gan(cfg, device, world_size)
+
+
+def _mel_args_from_cfg(cfg) -> dict:
+    """The mel contract, read from the same config the dataset reads.
+
+    Must stay identical to semantic2any/data/s2mel_dataset.py's ``mel_args`` --
+    a mel loss computed with a different convention than the training mel would
+    optimise the vocoder against a target the model can never produce.
+    """
+    preprocess = _get(cfg, "preprocess_params")
+    spect = _get(preprocess, "spect_params")
+    # `fmax: None` in the yaml is the *string* "None" -- yaml only spells null as
+    # `null` or `~`.  Same coercion as build_dataset above; getting it wrong
+    # turns fmax into a float and silently changes the filterbank.
+    fmax = _get(spect, "fmax", "None")
+    return {
+        "n_fft": int(_get(spect, "n_fft", 2048)),
+        "num_mels": int(_get(spect, "n_mels", 128)),
+        "sampling_rate": int(_get(preprocess, "sr", 44100)),
+        "hop_size": int(_get(spect, "hop_length", 512)),
+        "win_size": int(_get(spect, "win_length", 2048)),
+        "fmin": float(_get(spect, "fmin", 0.0)),
+        "fmax": None if fmax in (None, "None", "", "null") else float(fmax),
+        "center": False,
+    }
+
+
+def _resume_vocoder_gan(resume_path: Path, accelerator) -> None:
+    """Restore the trained vocoder + discriminators, or refuse to guess.
+
+    Resuming a joint run against the pristine HF vocoder would silently undo
+    every vocoder step taken so far, so a missing file is an error rather than a
+    warning -- except when starting joint training from a frozen-vocoder run,
+    which is the one legitimate case and needs VOCODER_RESUME_FRESH_GAN=1.
+    """
+    # Only the accelerator checkpoint directory carries joint state; a
+    # weights-only s2mel_step*.pth never does.
+    state_path = resume_path / "vocoder_gan.pt"
+    if not state_path.is_file():
+        if _aux_os.environ.get("VOCODER_RESUME_FRESH_GAN", "0") == "1":
+            if accelerator.is_main_process:
+                print(
+                    f"[Vocoder] {state_path.name} absent; starting joint training "
+                    "from the pretrained HF vocoder with fresh discriminators",
+                    flush=True,
+                )
+            return
+        raise FileNotFoundError(
+            f"VOCODER_TRAIN=1 but {state_path} does not exist. Resuming here "
+            "would load the untrained HF vocoder and throw away every vocoder "
+            "step in this run. Set VOCODER_RESUME_FRESH_GAN=1 only if this "
+            "checkpoint really predates joint training."
+        )
+    state = torch.load(state_path, map_location=accelerator.device)
+    _VOCODER_GAN.load_training_state(state)
+    if accelerator.is_main_process:
+        print(f"[Vocoder] restored joint state from {state_path}", flush=True)
+
+
+def _init_vocoder_gan(cfg, device, world_size: int) -> None:
+    """Build the joint-training state around the aux loss's vocoder."""
+    global _VOCODER_GAN
+    if _VOCODER_GAN is not None:
+        return
+    if _AUX_LOSS_TYPE != "bigvgan_mrstft":
+        raise RuntimeError(
+            f"VOCODER_TRAIN=1 needs AUX_LOSS_TYPE=bigvgan_mrstft (got "
+            f"{_AUX_LOSS_TYPE!r}); the other aux types do not expose the "
+            "waveform chunks the vocoder/GAN losses need"
+        )
+    if str(_get(cfg.train, "mixed_precision", "no")).lower() == "fp16":
+        # fp16 puts a GradScaler between the loss and the grads; the
+        # discriminator's backward is ours, outside accelerate, so its gradients
+        # would be unscaled while the vocoder's are scaled.  bf16 needs no
+        # scaler and sidesteps this entirely.
+        raise RuntimeError(
+            "VOCODER_TRAIN=1 requires train.mixed_precision=bf16 (or no); with "
+            "fp16 the discriminator's own backward bypasses accelerate's "
+            "GradScaler and the two halves of the GAN see different gradient "
+            "scales"
+        )
+    from semantic2any.losses.vocoder_gan import VocoderGANTrainer
+
+    _VOCODER_GAN = VocoderGANTrainer.from_env(
+        _AUX_LOSS_MODULE.vocoder,
+        mel_args=_mel_args_from_cfg(cfg),
+        world_size=int(world_size),
+    ).to(device)
+    _VOCODER_GAN.sync_initial_weights()
+    print(_VOCODER_GAN.describe(), flush=True)
 
 
 def forward_loss_with_aux(model, batch):
@@ -1864,6 +2039,18 @@ def forward_loss_with_aux(model, batch):
         else:
             keep, weights = selection
             extra = {} if weights is None else {"sample_weights": weights}
+            if _VOCODER_TRAIN:
+                target_wav = batch.get("target_wav")
+                if target_wav is None:
+                    raise RuntimeError(
+                        "VOCODER_TRAIN=1 but the batch has no 'target_wav'. The "
+                        "dataset only returns real audio when VOCODER_TRAIN is "
+                        "exported to the dataloader workers too."
+                    )
+                extra["target_wav"] = target_wav[keep]
+                wav_lens = batch.get("target_wav_lens")
+                if wav_lens is not None:
+                    extra["target_wav_lens"] = wav_lens[keep]
             aux_loss = _AUX_LOSS_MODULE(
                 x1_hat[keep],
                 batch["mel"][keep],
@@ -1871,9 +2058,35 @@ def forward_loss_with_aux(model, batch):
                 batch["prompt_lens"][keep],
                 **extra,
             )
-        _record_aux_metrics(loss, aux_loss)
+        vocoder_loss = _vocoder_gan_loss()
+        _record_aux_metrics(loss, aux_loss, vocoder_loss)
         loss = _FLOW_LOSS_WEIGHT * loss + _AUX_LOSS_WEIGHT * aux_loss
+        if vocoder_loss is not None:
+            loss = loss + vocoder_loss
     return loss
+
+
+def _vocoder_gan_loss():
+    """Vocoder-side (and discriminator-side) losses for this micro-batch.
+
+    Returns None whenever there is nothing to train on -- joint training off, or
+    the t gate dropped every sample so the aux loss produced no audio.  Note the
+    vocoder terms are *not* scaled by AUX_LOSS_WEIGHT: they carry BigVGAN's own
+    weights (mel 15, fm 2, adv 1) against real audio, independent of how much the
+    flow model is allowed to hear from the aux term.
+    """
+    if _VOCODER_GAN is None or _AUX_LOSS_MODULE is None:
+        return None
+    waveforms = getattr(_AUX_LOSS_MODULE, "last_waveforms", {})
+    if not waveforms or "real_wav" not in waveforms:
+        return None
+    return _VOCODER_GAN.generator_loss(
+        wav_real=waveforms["real_wav"],
+        wav_from_real_mel=waveforms.get("real_mel_wav"),
+        wav_from_pred_mel=waveforms.get("pred_wav"),
+        real_mel_chunk=waveforms.get("real_mel_chunk"),
+        global_step=_GLOBAL_STEP,
+    )
 
 
 def _cfm_module(model):
@@ -1925,11 +2138,18 @@ def _aux_t_selection(model, batch_size: int, device):
     return (keep, weights)
 
 
-def _record_aux_metrics(flow_loss, aux_loss):
+def _record_aux_metrics(flow_loss, aux_loss, vocoder_loss=None):
     """Stash this step's flow/aux loss terms for the next wandb log."""
     metrics = {"flow": flow_loss.detach(), "aux": aux_loss.detach()}
     for name, value in getattr(_AUX_LOSS_MODULE, "last_components", {}).items():
         metrics[f"aux/{name}"] = value
+    if _VOCODER_GAN is not None:
+        zero = flow_loss.detach().new_zeros(())
+        metrics["vocoder/total"] = (
+            zero if vocoder_loss is None else vocoder_loss.detach()
+        )
+        for name, value in _VOCODER_GAN.last_components.items():
+            metrics[f"vocoder/{name}"] = value
     _AUX_LAST_METRICS.clear()
     _AUX_LAST_METRICS.update(metrics)
 
@@ -1941,6 +2161,9 @@ def _aux_log_keys():
         f"aux/{name}"
         for name in getattr(_AUX_LOSS_MODULE, "component_keys", ())
     )
+    if _VOCODER_GAN is not None:
+        keys.append("vocoder/total")
+        keys.extend(f"vocoder/{name}" for name in _VOCODER_GAN.component_keys)
     return keys
 
 

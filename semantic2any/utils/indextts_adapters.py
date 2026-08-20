@@ -395,6 +395,10 @@ class S2MelFeatureAdapter(nn.Module):
             "style",
             "prompt_lens",
             "prompt_semantic_lens",
+            # Only present when VOCODER_TRAIN=1 asks the dataset for the real
+            # target audio; joint BigVGAN training needs it as the aux target.
+            "target_wav",
+            "target_wav_lens",
         ):
             if key in out and isinstance(out[key], torch.Tensor):
                 out[key] = out[key].to(device)
@@ -1154,6 +1158,9 @@ def move_feature_batch_to_device(batch: dict[str, Any], device: torch.device) ->
         "style",
         "prompt_lens",
         "prompt_semantic_lens",
+        # VOCODER_TRAIN=1 only; see finalize_worker_paired_batch.
+        "target_wav",
+        "target_wav_lens",
     ):
         if key in out and isinstance(out[key], torch.Tensor):
             out[key] = out[key].to(device)

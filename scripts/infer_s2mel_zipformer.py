@@ -55,12 +55,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", default=None)
     parser.add_argument("--semantic-codec", choices=("maskgct", "sac"), default=None)
     parser.add_argument("--vocoder-model", default=None)
+    parser.add_argument(
+        "--vocoder-weights",
+        default=None,
+        help=(
+            "Load BigVGAN generator weights from a local file instead of the "
+            "pretrained snapshot -- e.g. a bigvgan_step{N}.pt written by a "
+            "VOCODER_TRAIN=1 run.  Without this the trained vocoder is ignored "
+            "and the frozen HF weights are used."
+        ),
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
         "--dtype",
-        choices=("auto", "float16", "float32"),
+        choices=("auto", "float16", "bfloat16", "float32"),
         default="auto",
-        help="Dtype for the s2mel model and BigVGAN. Feature extraction stays in float32.",
+        help=(
+            "Dtype for the s2mel model and BigVGAN. Feature extraction stays in "
+            "float32.  bfloat16 is measurably worse for this vocoder: 17-21 dB "
+            "SNR against float32 versus 34-40 dB for float16, and gain matching "
+            "recovers only ~1 dB of it, so the error is broadband noise rather "
+            "than a level offset.  Prefer float16."
+        ),
     )
     parser.add_argument(
         "--prompt-seconds",
@@ -121,6 +137,8 @@ def resolve_dtype(device: torch.device, requested: str) -> torch.dtype:
         return torch.float32
     if requested == "float16":
         return torch.float16
+    if requested == "bfloat16":
+        return torch.bfloat16
     return torch.float16 if device.type == "cuda" else torch.float32
 
 
@@ -134,7 +152,9 @@ def iter_audio_paths(path: Path) -> list[Path]:
     return sorted(p for p in path.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS)
 
 
-def load_vocoder(cfg, device: torch.device, dtype: torch.dtype):
+def load_vocoder(
+    cfg, device: torch.device, dtype: torch.dtype, weights_path: str | None = None
+):
     paths_cfg = _get(cfg, "paths")
     model_dir = Path(_get(paths_cfg, "model_dir")).expanduser().resolve()
     if not model_dir.exists():
@@ -179,10 +199,31 @@ def load_vocoder(cfg, device: torch.device, dtype: torch.dtype):
         )
         raise ValueError(f"BigVGAN mel configuration mismatch: {details}")
 
-    vocoder = vocoder.to(device=device, dtype=dtype)
+    trained_step = None
+    if weights_path:
+        path = Path(weights_path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"BigVGAN weights do not exist: {path}")
+        payload = torch.load(path, map_location="cpu")
+        state = payload.get("vocoder", payload) if isinstance(payload, dict) else payload
+        trained_step = payload.get("step") if isinstance(payload, dict) else None
+        # Joint training keeps weight norm on, so the saved tensors are the
+        # weight_g / weight_v pair -- they only load into a model that has not
+        # been folded yet, which is why the fold below happens afterwards.
+        vocoder.load_state_dict(state, strict=True)
+
+    # Fold weight norm in float32, then cast.  Folding after the cast computes
+    # weight_v * weight_g / ||weight_v|| in the low precision and costs 1-3 dB of
+    # SNR against float32 for free.
+    vocoder = vocoder.to(device=device)
     vocoder.remove_weight_norm()
+    vocoder = vocoder.to(dtype=dtype)
     vocoder.eval()
-    print(f">> BigVGAN restored from: {source}")
+    if weights_path:
+        step_note = "" if trained_step is None else f" (step {int(trained_step)})"
+        print(f">> BigVGAN restored from: {weights_path}{step_note}")
+    else:
+        print(f">> BigVGAN restored from: {source}")
     return vocoder
 
 
@@ -410,7 +451,7 @@ def main() -> None:
     feature_adapter = build_feature_adapter(cfg).to(device=device)
     feature_adapter.eval()
 
-    vocoder = load_vocoder(cfg, device, dtype)
+    vocoder = load_vocoder(cfg, device, dtype, weights_path=args.vocoder_weights)
 
     inference_steps = int(args.inference_steps)
     inference_cfg_rate = (

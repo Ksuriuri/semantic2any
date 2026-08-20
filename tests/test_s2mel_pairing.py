@@ -204,6 +204,36 @@ class SpeakerPairDatasetTest(unittest.TestCase):
         self.assertEqual(paired.unusable_target_count, 2)
 
     def test_overlong_audio_can_be_prompt_but_not_target(self) -> None:
+        # 25 s is too long to be a target here but still fits the prompt cap, so
+        # it stays in the prompt pool and only the target pool rejects it.
+        dataset = S2MelInMemoryDataset(
+            [
+                {"id": "long", "speaker_id": "s1", "duration": 25.0},
+                {"id": "target", "speaker_id": "s1", "duration": 10.0},
+            ]
+        )
+        paired = S2MelSpeakerPairedDataset(
+            dataset,
+            min_prompt_seconds=3.0,
+            max_prompt_seconds=30.0,
+            min_target_seconds=3.0,
+            max_target_seconds=20.0,
+            hop_length=1,
+            sample_rate=1,
+        )
+
+        self.assertEqual(len(paired), 1)
+        self.assertEqual(paired[0]["prompt"]["id"], "long")
+        self.assertEqual(paired[0]["target"]["id"], "target")
+        self.assertEqual(paired.overlong_target_count, 1)
+
+    def test_audio_past_both_caps_is_in_neither_pool(self) -> None:
+        """A clip longer than max_prompt_seconds cannot be truncated into a prompt.
+
+        The reference has to be used whole, so a 40 s clip is out of the prompt
+        pool as well as the target pool.  The 10 s clip is then left with no
+        distinct same-speaker reference and can only be a singleton split.
+        """
         dataset = S2MelInMemoryDataset(
             [
                 {"id": "long", "speaker_id": "s1", "duration": 40.0},
@@ -221,9 +251,10 @@ class SpeakerPairDatasetTest(unittest.TestCase):
         )
 
         self.assertEqual(len(paired), 1)
-        self.assertEqual(paired[0]["prompt"]["id"], "long")
-        self.assertEqual(paired[0]["target"]["id"], "target")
         self.assertEqual(paired.overlong_target_count, 1)
+        self.assertTrue(paired[0]["singleton_split"])
+        self.assertEqual(paired[0]["prompt"]["id"], "target")
+        self.assertEqual(paired[0]["target"]["id"], "target")
 
 
 class LengthBucketBatchSamplerTest(unittest.TestCase):

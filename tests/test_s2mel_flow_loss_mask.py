@@ -57,6 +57,10 @@ def _cfm(spike: torch.Tensor) -> CFM:
     cfm.sigma_min = 1e-6
     cfm.criterion = nn.MSELoss()
     cfm.zero_prompt_speech_token = False
+    # Neutral values for the mel-scaling knobs: these tests are about the mask,
+    # and `forward` reads both unconditionally.
+    cfm.feat_scale = 1.0
+    cfm.high_band_mse_extra = 0.0
     cfm.estimator = _InjectingEstimator(spike)
     return cfm
 

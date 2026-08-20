@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from typing import Sequence
 
 import torch
 import torch.nn as nn
@@ -546,6 +547,57 @@ class BigVGANWaveformLoss(nn.Module):
         return loss / (1.0 + len(self.pool_sizes))
 
 
+def slice_target_waveform(
+    target_wav: torch.Tensor,
+    starts: Sequence[int],
+    prompt_lens: torch.Tensor,
+    chunk_len: int,
+    hop: int,
+    target_wav_lens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Cut the real target audio for the mel frames the aux loss picked.
+
+    ``mel_spectrogram`` reflect-pads by ``(n_fft - hop) / 2`` before the STFT, so
+    mel frame ``f`` covers samples ``[f*hop, (f+1)*hop)`` -- the same frame/sample
+    mapping BigVGAN upsamples with, which is what makes this slice sample-aligned
+    with the vocoder output.  ``starts`` are absolute frames in the
+    ``[prompt, target]`` timeline while the waveform covers the target segment
+    only, hence the ``prompt_lens`` offset.
+    """
+    want = int(chunk_len) * int(hop)
+    rows = []
+    for index, start in enumerate(starts):
+        offset = (int(start) - int(prompt_lens[index])) * int(hop)
+        if offset < 0:
+            raise RuntimeError(
+                f"aux chunk for sample {index} starts at frame {int(start)}, "
+                f"before its prompt ends ({int(prompt_lens[index])})"
+            )
+        if target_wav_lens is None:
+            row = target_wav[index, offset : offset + want]
+        else:
+            # Cut at the row's own content, not at the batch's padded width:
+            # `target_wav` is pad_sequence output, so slicing to `want` on a
+            # short row silently returns the padding of a longer neighbour and
+            # nothing looks wrong.  The collator trims the waveform to
+            # target_frames * hop, so the only legitimate shortfall is the tail
+            # of the very last frame; anything larger means the frame/sample
+            # mapping has drifted, and zero-padding it would train the vocoder
+            # to emit silence where the mel has content.
+            available = max(int(target_wav_lens[index]) - offset, 0)
+            if want - available > hop:
+                raise RuntimeError(
+                    f"target_wav row {index} has {available} samples for "
+                    f"{chunk_len} mel frames ({want} samples) at frame "
+                    f"{int(start)}: the waveform and mel are misaligned"
+                )
+            row = target_wav[index, offset : offset + min(want, available)]
+        if row.numel() < want:
+            row = F.pad(row, (0, want - row.numel()))
+        rows.append(row)
+    return torch.stack(rows).float().detach()
+
+
 class BigVGANMRSTFTLoss(nn.Module):
     """WaveFM MR-STFT in the BigVGAN loop.
 
@@ -568,11 +620,24 @@ class BigVGANMRSTFTLoss(nn.Module):
         stft_kwargs: dict | None = None,
         random_chunk_offset: bool = False,
         checkpoint_vocoder: bool = False,
+        trainable_vocoder: bool = False,
+        vocode_real_mel: bool = False,
+        hop_size: int = 512,
     ):
         super().__init__()
         self.vocoder = vocoder
-        for p in self.vocoder.parameters():
-            p.requires_grad_(False)
+        # With a trainable vocoder the MR-STFT target may no longer be
+        # `vocoder(gt_mel)` -- that target would move with the thing being
+        # trained.  `forward` then requires real audio instead.
+        self.trainable_vocoder = bool(trainable_vocoder)
+        # Also vocode the *real* mel chunk with gradients, so the caller can add
+        # BigVGAN's own objectives (mel reconstruction / GAN) on that branch and
+        # stop the vocoder from drifting towards blurry predicted mels.
+        self.vocode_real_mel = bool(vocode_real_mel)
+        self.hop_size = int(hop_size)
+        if not self.trainable_vocoder:
+            for p in self.vocoder.parameters():
+                p.requires_grad_(False)
         self.sr = sr
         self.max_chunk_frames = max_chunk_frames
         self.wave_l1_weight = wave_l1_weight
@@ -588,6 +653,11 @@ class BigVGANMRSTFTLoss(nn.Module):
             + [f"mrstft/{key}" for key in self.stft_loss.component_keys]
         )
         self.last_components: dict[str, torch.Tensor] = {}
+        # What the last forward produced, for a caller that wants to add its own
+        # losses on the same chunk (see semantic2any/losses/vocoder_gan.py).
+        # Keys: pred_wav, real_wav, real_mel_wav, real_mel_chunk.  Cleared at the
+        # top of every forward so a skipped step cannot serve stale audio.
+        self.last_waveforms: dict[str, torch.Tensor] = {}
 
     def _sample_chunk_starts(
         self, mel_lens: torch.Tensor, prompt_lens: torch.Tensor
@@ -620,6 +690,10 @@ class BigVGANMRSTFTLoss(nn.Module):
             key: torch.zeros((), device=device, dtype=dtype)
             for key in self.component_keys
         }
+        # The trainer calls this instead of forward() when the t gate drops the
+        # whole batch; leaving the previous step's audio here would let the
+        # vocoder/GAN losses train on a stale graph.
+        self.last_waveforms = {}
 
     def _record_components(
         self,
@@ -653,7 +727,10 @@ class BigVGANMRSTFTLoss(nn.Module):
         return torch.tanh(x) if voc.use_tanh_at_final else torch.clamp(x, -1, 1)
 
     def _vocoder_forward(self, mel: torch.Tensor) -> torch.Tensor:
-        if not (self.checkpoint_vocoder and torch.is_grad_enabled() and mel.requires_grad):
+        # A trainable vocoder needs its activations kept even when the *input* mel
+        # is a detached real mel, so checkpointing must not key on mel alone.
+        needs_backward = mel.requires_grad or self.trainable_vocoder
+        if not (self.checkpoint_vocoder and torch.is_grad_enabled() and needs_backward):
             return self.vocoder(mel).squeeze(1)
         # Mirror of BigVGAN.forward with one checkpoint segment per upsample
         # stage, plus the post block (which runs at the full 44.1 kHz rate).
@@ -673,7 +750,10 @@ class BigVGANMRSTFTLoss(nn.Module):
         prompt_lens: torch.Tensor,
         gt_wav: torch.Tensor | None = None,
         sample_weights: torch.Tensor | None = None,
+        target_wav: torch.Tensor | None = None,
+        target_wav_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        self.last_waveforms = {}
         B = x1_hat.size(0)
         prompt_frames = prompt_lens[0].item() if B == 1 else int(prompt_lens.max().item())
         mel_end = mel_lens[0].item() if B == 1 else int(mel_lens.max().item())
@@ -700,6 +780,25 @@ class BigVGANMRSTFTLoss(nn.Module):
                 return torch.zeros((), device=x1_hat.device, dtype=x1_hat.dtype)
             x1_hat_chunk = x1_hat[:, :, gen_start:gen_end].float()
             gt_chunk = x1[:, :, gen_start:gen_end].float()
+            starts = [gen_start] * B
+            chunk_len = gen_end - gen_start
+
+        if target_wav is not None:
+            gt_wav = slice_target_waveform(
+                target_wav,
+                starts,
+                prompt_lens,
+                chunk_len,
+                self.hop_size,
+                target_wav_lens=target_wav_lens,
+            )
+        elif self.trainable_vocoder:
+            raise RuntimeError(
+                "trainable_vocoder=True needs real audio: the default target is "
+                "vocoder(gt_mel), which moves with the vocoder being trained, so "
+                "the pair can lower the loss without sounding better. Pass "
+                "target_wav (set VOCODER_TRAIN=1 so the dataset returns it)."
+            )
 
         if gt_wav is None:
             # Vocode only the generated chunk of the ground-truth mel, per
@@ -719,6 +818,12 @@ class BigVGANMRSTFTLoss(nn.Module):
 
         with torch.amp.autocast(device_type="cuda", enabled=False):
             wav_pred = self._vocoder_forward(x1_hat_chunk)
+            # Second vocoder pass on the *real* mel, kept in the graph.  This is
+            # the branch BigVGAN itself trains on, and the only one whose target
+            # (real audio) is independent of the vocoder's current weights.
+            real_mel_wav = (
+                self._vocoder_forward(gt_chunk) if self.vocode_real_mel else None
+            )
 
         # gt_wav is the vocoded chunk for frames [gen_start, gen_end), so its
         # sample axis is already chunk-relative; no absolute-frame offset.
@@ -728,6 +833,13 @@ class BigVGANMRSTFTLoss(nn.Module):
             return torch.zeros((), device=x1_hat.device, dtype=x1_hat.dtype)
         wav_pred = wav_pred[..., :min_len]
         gt_wav_chunk = gt_wav[..., :min_len]
+        self.last_waveforms = {
+            "pred_wav": wav_pred,
+            "real_wav": gt_wav_chunk,
+            "real_mel_chunk": gt_chunk,
+        }
+        if real_mel_wav is not None:
+            self.last_waveforms["real_mel_wav"] = real_mel_wav[..., :min_len]
 
         mrstft = self.stft_loss(
             wav_pred, gt_wav_chunk, sample_weights=sample_weights
