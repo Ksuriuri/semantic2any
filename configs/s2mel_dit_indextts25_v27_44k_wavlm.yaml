@@ -1,0 +1,186 @@
+seed: 1237
+paths:
+  model_dir: checkpoints/feature-extractors
+  semantic_codec_ckpt: ''
+  campplus_ckpt: campplus/campplus_cn_common.bin
+  w2v_bert_dir: w2v-bert-2.0
+  w2v_stat: wav2vec2bert_stats.pt
+semantic_codec:
+  # IndexTTS-2.5 EnhancedCodec: 25 Hz codes, but SEMANTIC_CODEC_FRAMES_PER_CODE=2
+  # so the features s2mel consumes stay 1024-dim / 50 Hz.  Must be set here --
+  # the --semantic-codec CLI flag only accepts maskgct/sac.
+  type: indextts2.5
+vocoder:
+  model_id: nvidia/bigvgan_v2_44khz_128band_512x
+  cache_dir: checkpoints/huggingface
+  local_files_only: true
+data:
+  train_jsonl: /mnt/data_3t_1/datasets/preprocess/s2mel-train-data-v2/indextts25-codes/splits/seed1234_valid2000_spk_holdout/train.jsonl
+  valid_jsonl: /mnt/data_3t_1/datasets/preprocess/s2mel-train-data-v2/indextts25-codes/splits/seed1234_valid2000_spk_holdout/valid.jsonl
+  train_speechdata_dir: ''
+  valid_speechdata_dir: ''
+  speechdata_cache_dir: .cache/speechdata
+  # Hard 3-30 s on both sides of the pair.  Rows outside the window are dropped,
+  # not truncated: max_pair_seconds 60 = 30 + 30 so the pair budget never trims,
+  # and the prompt pool itself is now bounded by max_prompt_seconds.
+  max_audio_seconds: 30.0
+  pair_same_speaker: true
+  random_split_audio: false
+  max_pair_seconds: 60.0
+  min_pair_prompt_seconds: 3.0
+  min_prompt_seconds: 3.0
+  max_prompt_seconds: 30.0
+  min_target_seconds: 3.0
+  max_target_seconds: 30.0
+  # Never cut one utterance into prompt+target: a speaker with no second
+  # utterance is dropped instead (3,010 of 4,700,519 train rows = 0.06%).
+  allow_singleton_split: false
+  min_generated_frames: 8
+  semantic_fps: 50.0
+  sample_rate_16k: 16000
+  sample_rate_mel: 44100
+  num_workers: 8
+  prefetch_factor: 2
+  decode_audio_in_worker: true
+  skip_audio_errors: true
+  feature_batch_size: 16
+  async_feature_extraction: false
+  preload_features: false
+  # Native 44.1 kHz: decode then resample prompt AND target to 44100 before
+  # mel (sample_rate_mel drives both sides).  Training on the whole corpus
+  # including the upsampled rows -- no bandwidth filtering (kusuriuri
+  # 6fef884b); a high-bandwidth subset finetune comes later.
+  prompt_bandwidth_aug_prob: 0.0
+  prompt_bandwidth_aug_rates:
+  - 16000
+  - 22050
+  length_bucketed_batches: true
+  length_bucket_boundaries:
+  - 8
+  - 10
+  - 12
+  - 14
+  - 16
+  - 18
+  - 20
+  - 22
+  - 24
+  - 26
+  - 28
+  - 30
+  - 32
+  - 34
+  - 36
+  - 38
+  - 40
+  - 42
+  - 44
+  - 46
+  - 48
+  - 50
+  - 52
+  - 54
+  - 56
+  - 58
+  - 60
+preprocess_params:
+  # 44.1 kHz, matched to bigvgan_v2_44khz_128band_512x (num_mels 128, n_fft
+  # 2048, hop 512, win 2048, fmin 0, fmax None -- read from its config.json).
+  # hop 512 at 44.1 kHz is the same 86.13 frames/s as hop 256 at 22.05 kHz, so
+  # the 50 Hz semantic features and length_ratio are unaffected.
+  sr: 44100
+  spect_params:
+    n_fft: 2048
+    win_length: 2048
+    hop_length: 512
+    n_mels: 128
+    fmin: 0
+    fmax: None
+s2mel:
+  dit_type: DiT
+  reg_loss_type: l2
+  # Off until this epoch finishes + listen. Then set feat_scale: 0.1
+  # and high_band_mse_extra: 1.0 (top band 2x, quadratic ramp).
+  feat_scale: 1.0
+  high_band_mse_extra: 0.0
+  use_gpt_latent: false
+  inference_steps: 25
+  inference_cfg_rate: 0.2
+  length_ratio: 1.72265625
+  style_encoder:
+    dim: 192
+  length_regulator:
+    channels: 512
+    is_discrete: false
+    in_channels: 1024
+    content_codebook_size: 8192
+    sampling_ratios:
+    - 1
+    - 1
+    - 1
+    - 1
+    n_codebooks: 1
+    quantizer_dropout: 0.0
+    f0_condition: false
+    n_f0_bins: 512
+  DiT:
+    hidden_dim: 512
+    num_heads: 8
+    depth: 13
+    class_dropout_prob: 0.1
+    block_size: 8192
+    in_channels: 128
+    style_condition: false
+    final_layer_type: wavenet
+    content_dim: 512
+    content_codebook_size: 1024
+    content_type: continuous
+    is_causal: false
+    long_skip_connection: true
+    zero_prompt_speech_token: false
+    time_as_token: false
+    style_as_token: false
+    uvit_skip_connection: true
+  wavenet:
+    hidden_dim: 512
+    num_layers: 8
+    kernel_size: 5
+    dilation_rate: 1
+    p_dropout: 0.2
+    style_condition: false
+train:
+  output_dir: exp/s2mel_dit_indextts25_v27_44k_wavlm
+  # 44.1 kHz + BigVGAN aux with t gating.  The aux vocoder now emits 512
+  # samples per mel frame instead of 256, so its activations roughly double at
+  # the same AUX_MAX_CHUNK_FRAMES: start at batch 4 and only raise it after
+  # seeing the real peak (batch 8 + aux + grad ckpt was already 40/49 GiB at
+  # 22 kHz).  AUX_T_MIN also cuts vocoder passes, which buys some of it back.
+  batch_size: 8
+  epochs: 4
+  max_steps: 150000
+  grad_accumulation: 2
+  find_unused_parameters: true
+  # Constant 1e-5 from frozen 68k (kusuriuri 391eb35d / 9732f2c9).
+  learning_rate: 2.0e-05
+  min_learning_rate: 2.0e-05
+  lr_scheduler: cosine
+  weight_decay: 0.01
+  warmup_steps: 0
+  grad_clip: 1.0
+  mixed_precision: bf16
+  log_interval: 20
+  valid_interval: 2000
+  save_interval: 2000
+  archive_save_interval: 20000
+  keep_last: 6
+  fresh_lr_schedule: true
+  # No 44.1 kHz checkpoint exists in the indextts2.5 code space, so this is a
+  # scratch run by default.  For a warm start from the 22 kHz 140k checkpoint
+  # (253 of 256 tensors transfer; only x_embedder / conv2 are mel-shaped) run
+  # t2s_align/convert_ckpt_22k_to_44k.py and point resume_from at its output.
+  resume_from: ""
+  no_wandb: false
+  wandb_entity: haoyuanhuang22-jcxy
+  wandb_project: semantic2mel
+  wandb_run_name: s2mel-dit-indextts25-v27-44k-wavlm-8gpu
+  wandb_run_id: ""

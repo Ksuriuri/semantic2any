@@ -623,6 +623,11 @@ class BigVGANMRSTFTLoss(nn.Module):
         trainable_vocoder: bool = False,
         vocode_real_mel: bool = False,
         hop_size: int = 512,
+        wavlm_weight: float = 0.0,
+        wavlm_model_id: str = "microsoft/wavlm-large",
+        wavlm_cache_dir: str = "",
+        wavlm_layers: tuple[int, ...] = (6, 8, 10, 12),
+        wavlm_local_files_only: bool = False,
     ):
         super().__init__()
         self.vocoder = vocoder
@@ -648,9 +653,20 @@ class BigVGANMRSTFTLoss(nn.Module):
         # Trade vocoder recompute for its retained activations (5.3x less peak).
         self.checkpoint_vocoder = bool(checkpoint_vocoder)
         self.stft_loss = MultiResolutionSTFTLoss(**(stft_kwargs or {}))
+        self.wavlm_weight = float(wavlm_weight)
+        self.wavlm = None
+        if self.wavlm_weight > 0.0:
+            from semantic2any.losses.wavlm_perceptual import WavLMPerceptualLoss
+            self.wavlm = WavLMPerceptualLoss(
+                model_id=wavlm_model_id,
+                cache_dir=wavlm_cache_dir,
+                layers=tuple(wavlm_layers),
+                input_sr=sr,
+                local_files_only=wavlm_local_files_only,
+            )
+        keys = ["total", "mrstft", "wave_l1", "wavlm"]
         self.component_keys = tuple(
-            ["total", "mrstft", "wave_l1"]
-            + [f"mrstft/{key}" for key in self.stft_loss.component_keys]
+            keys + [f"mrstft/{key}" for key in self.stft_loss.component_keys]
         )
         self.last_components: dict[str, torch.Tensor] = {}
         # What the last forward produced, for a caller that wants to add its own
@@ -700,6 +716,7 @@ class BigVGANMRSTFTLoss(nn.Module):
         mrstft: torch.Tensor,
         wave_l1: torch.Tensor,
         total: torch.Tensor,
+        wavlm: torch.Tensor | None = None,
     ) -> None:
         components = {
             f"mrstft/{key}": value
@@ -707,6 +724,10 @@ class BigVGANMRSTFTLoss(nn.Module):
         }
         components["mrstft"] = mrstft.detach()
         components["wave_l1"] = wave_l1.detach()
+        components["wavlm"] = (
+            wavlm.detach() if wavlm is not None
+            else mrstft.detach().new_zeros(())
+        )
         components["total"] = total.detach()
         self.last_components = components
 
@@ -860,5 +881,11 @@ class BigVGANMRSTFTLoss(nn.Module):
             with torch.no_grad():
                 wave_l1 = _wave_l1()
             loss = mrstft
-        self._record_components(mrstft, wave_l1, loss)
+        wavlm = None
+        if self.wavlm is not None and self.wavlm_weight > 0:
+            wavlm = self.wavlm(
+                wav_pred, gt_wav_chunk, sample_weights=sample_weights
+            )
+            loss = loss + self.wavlm_weight * wavlm
+        self._record_components(mrstft, wave_l1, loss, wavlm=wavlm)
         return loss

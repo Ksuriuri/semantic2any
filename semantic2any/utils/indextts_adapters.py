@@ -23,6 +23,7 @@ from semantic2any.data.s2mel_dataset import (
     DEFAULT_MAX_AUDIO_SECONDS,
     DEFAULT_MAX_PAIR_SECONDS,
     DEFAULT_MAX_PROMPT_SECONDS,
+    _RETURN_TARGET_WAVEFORM,
     choose_prompt_len,
     collate_paired_features,
 )
@@ -1114,9 +1115,20 @@ class S2MelFeatureAdapter(nn.Module):
             prompt_features.append(
                 {"mel": prompt_mel, "semantic": prompt_semantic, "style": style}
             )
-            target_features.append(
-                {"mel": target_mel, "semantic": target_semantic, "style": style}
-            )
+            target_feature = {
+                "mel": target_mel,
+                "semantic": target_semantic,
+                "style": style,
+            }
+            if _RETURN_TARGET_WAVEFORM:
+                # Joint vocoder training needs the real audio the target mel came
+                # from -- once the vocoder is being trained its own output is not
+                # a usable target.  This is the main-process twin of the
+                # extract_mel_in_worker branch in s2mel_dataset, and it must hand
+                # over the *same* tensor the mel was computed from or the aux
+                # slice and the mel stop describing the same audio.
+                target_feature["wav"] = mel_inputs[2 * index + 1].reshape(-1).contiguous()
+            target_features.append(target_feature)
 
         duration_budget = self.max_prompt_seconds + max_target_seconds
         return collate_paired_features(

@@ -164,6 +164,124 @@ class CollatedTargetWaveformTest(unittest.TestCase):
         self.assertEqual(batch["target_wav"][1, 123].item(), 123.0)
 
 
+class MainProcessTargetWaveformTest(unittest.TestCase):
+    """The main-process extraction path must hand over the real target audio.
+
+    This is the path v24 and v25 actually use: `data.extract_mel_in_worker`
+    defaults to False, so the worker branch that used to be the only producer of
+    `target_wav` never runs.  Everything expensive here is stubbed -- the point is
+    which fields come out, not what they contain.
+    """
+
+    HOP = 512
+    RATE = 44100
+
+    def _adapter(self):
+        from semantic2any.utils import indextts_adapters as ia
+
+        hop = self.HOP
+        rate = self.RATE
+
+        class _Stub(ia.S2MelFeatureAdapter):
+            def __init__(self) -> None:
+                nn.Module.__init__(self)
+                self.max_audio_seconds = 30.0
+                self.max_prompt_seconds = 30.0
+                self.min_pair_prompt_seconds = 3.0
+                self.min_target_seconds = 3.0
+                self.max_target_seconds = 30.0
+                self.min_generated_frames = 8
+                self.sample_rate_mel = rate
+                self.sample_rate_16k = 16000
+                self.feature_batch_size = 16
+                self.use_style_condition = False
+                self.style_dim = 192
+                self.mel_args = {"hop_size": hop}
+                # Not `mel_spectrogram` itself, so the batched fast path (which
+                # is an identity check on that function) is skipped.
+                self.mel_spectrogram = self._fake_mel
+                self.semantic_decoder = self
+
+            @staticmethod
+            def _fake_mel(waveform, **kwargs):
+                frames = waveform.size(-1) // hop
+                return torch.zeros(1, 128, frames)
+
+            def _module_device(self):
+                return torch.device("cpu")
+
+            def _prepare_audio_batch(self, audio_paths, waveforms, sample_rates, **kw):
+                return list(waveforms), [int(item) for item in sample_rates]
+
+            def _resample_waveform_batch(self, waveforms, sample_rates, target_rates):
+                # Already at the mel rate in this test, so resampling is identity.
+                return {target: list(waveforms) for target in target_rates}
+
+            def _code_rows(self, codes, lengths):
+                return [codes[i, : int(lengths[i])] for i in range(codes.size(0))]
+
+            def decode_sequences(self, sequences):
+                return [torch.zeros(item.numel(), 1024) for item in sequences]
+
+        return _Stub()
+
+    def _run(self, *, prompt_secs: float, target_secs: float):
+        adapter = self._adapter()
+        prompt_samples = int(prompt_secs * self.RATE) // self.HOP * self.HOP
+        target_samples = int(target_secs * self.RATE) // self.HOP * self.HOP
+        # A ramp, so a shifted or truncated row is visible in the values.
+        prompt = torch.arange(prompt_samples, dtype=torch.float32).reshape(1, -1)
+        target = torch.arange(target_samples, dtype=torch.float32).reshape(1, -1)
+        return (
+            adapter.extract_paired_from_audio_paths(
+                ["prompt.wav"],
+                ["target.wav"],
+                prompt_waveforms=[prompt],
+                prompt_sample_rates=[self.RATE],
+                target_waveforms=[target],
+                target_sample_rates=[self.RATE],
+                prompt_semantic_codes=torch.zeros(1, prompt_samples // self.HOP, dtype=torch.long),
+                prompt_semantic_code_lens=torch.tensor([prompt_samples // self.HOP]),
+                target_semantic_codes=torch.zeros(1, target_samples // self.HOP, dtype=torch.long),
+                target_semantic_code_lens=torch.tensor([target_samples // self.HOP]),
+            ),
+            target_samples,
+        )
+
+    def _gate(self, enabled: bool):
+        """Patch the gate in place rather than reloading the module.
+
+        `_RETURN_TARGET_WAVEFORM` is read from the environment at import time, so
+        the obvious way to flip it is `importlib.reload` -- but a reload rebinds
+        the module's classes for the whole process and would quietly break every
+        test that runs after this one.
+        """
+        from semantic2any.utils import indextts_adapters as ia
+
+        return mock.patch.object(ia, "_RETURN_TARGET_WAVEFORM", enabled)
+
+    def test_target_wav_is_absent_unless_vocoder_train_is_set(self) -> None:
+        with self._gate(False):
+            batch, _ = self._run(prompt_secs=5.0, target_secs=6.0)
+        self.assertNotIn("target_wav", batch)
+
+    def test_target_wav_is_present_and_mel_aligned_with_vocoder_train(self) -> None:
+        with self._gate(True):
+            batch, target_samples = self._run(prompt_secs=5.0, target_secs=6.0)
+
+        self.assertIn("target_wav", batch)
+        self.assertIn("target_wav_lens", batch)
+        target_frames = batch["mel_lens"] - batch["prompt_lens"]
+        # One hop of audio per generated mel frame, or the aux slice and the mel
+        # stop describing the same span.
+        self.assertTrue(torch.equal(batch["target_wav_lens"], target_frames * self.HOP))
+        self.assertLessEqual(int(batch["target_wav_lens"][0]), target_samples)
+        # The ramp starts at 0: this is the target's own audio, not the prompt's
+        # and not shifted.
+        self.assertEqual(batch["target_wav"][0, 0].item(), 0.0)
+        self.assertEqual(batch["target_wav"][0, 123].item(), 123.0)
+
+
 def _grad_average_worker(rank: int, world_size: int, init_file: str, out: dict) -> None:
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size

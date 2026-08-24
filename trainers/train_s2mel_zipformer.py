@@ -1754,6 +1754,16 @@ _AUX_CHUNK_RANDOM_OFFSET = _aux_os.environ.get("AUX_CHUNK_RANDOM_OFFSET", "0") =
 # Recompute the frozen vocoder's activations in the backward instead of storing
 # them: 5.3x less aux-loss peak memory, bitwise-identical gradients.
 _AUX_VOCODER_CKPT = _aux_os.environ.get("AUX_VOCODER_CKPT", "0") == "1"
+_AUX_WAVLM_WEIGHT = float(_aux_os.environ.get("AUX_WAVLM_WEIGHT", "0.0"))
+_AUX_WAVLM_MODEL = _aux_os.environ.get(
+    "AUX_WAVLM_MODEL", "microsoft/wavlm-large"
+)
+_AUX_WAVLM_CACHE = _aux_os.environ.get("AUX_WAVLM_CACHE", "")
+_AUX_WAVLM_LAYERS = tuple(
+    int(x) for x in _aux_os.environ.get("AUX_WAVLM_LAYERS", "6,8,10,12").split(",")
+    if x.strip()
+)
+_AUX_WAVLM_LOCAL = _aux_os.environ.get("AUX_WAVLM_LOCAL_ONLY", "0") == "1"
 # The aux loss is computed on `x1_hat`, whose error is (1-t)*(v_pred - velocity).
 # t is uniform, so at small t the one-step estimate is noise dominated and the
 # vocoder-space target is unreachable -- an unlearnable fraction of every batch
@@ -1911,6 +1921,11 @@ def _init_aux_loss(cfg, device, dtype, world_size: int = 1):
             trainable_vocoder=_VOCODER_TRAIN,
             vocode_real_mel=_VOCODER_TRAIN,
             hop_size=hop_size,
+            wavlm_weight=_AUX_WAVLM_WEIGHT,
+            wavlm_model_id=_AUX_WAVLM_MODEL,
+            wavlm_cache_dir=_AUX_WAVLM_CACHE,
+            wavlm_layers=_AUX_WAVLM_LAYERS,
+            wavlm_local_files_only=_AUX_WAVLM_LOCAL,
         ).to(device)
         print(
             f"[AuxLoss] BigVGANMRSTFTLoss (WaveFM) enabled, weight={_AUX_LOSS_WEIGHT}, "
@@ -1918,7 +1933,8 @@ def _init_aux_loss(cfg, device, dtype, world_size: int = 1):
             f"phase_weight={_AUX_MRSTFT_PHASE_WEIGHT}, "
             f"max_chunk_frames={_AUX_MAX_CHUNK_FRAMES}, "
             f"random_chunk_offset={_AUX_CHUNK_RANDOM_OFFSET}, "
-            f"checkpoint_vocoder={_AUX_VOCODER_CKPT}"
+            f"checkpoint_vocoder={_AUX_VOCODER_CKPT}, "
+            f"wavlm_weight={_AUX_WAVLM_WEIGHT} layers={_AUX_WAVLM_LAYERS}"
         )
     if _VOCODER_TRAIN:
         _init_vocoder_gan(cfg, device, world_size)
@@ -2043,9 +2059,14 @@ def forward_loss_with_aux(model, batch):
                 target_wav = batch.get("target_wav")
                 if target_wav is None:
                     raise RuntimeError(
-                        "VOCODER_TRAIN=1 but the batch has no 'target_wav'. The "
-                        "dataset only returns real audio when VOCODER_TRAIN is "
-                        "exported to the dataloader workers too."
+                        "VOCODER_TRAIN=1 but the batch has no 'target_wav'. Both "
+                        "paired extraction paths must attach it: the main-process "
+                        "one in S2MelFeatureAdapter.extract_paired_from_audio_paths "
+                        "(used when data.extract_mel_in_worker is false, which is "
+                        "the default) and the worker one in "
+                        "S2MelPairedDataset._attach_paired_worker_features. Both "
+                        "gate on VOCODER_TRAIN, which must therefore reach the "
+                        "dataloader workers too."
                     )
                 extra["target_wav"] = target_wav[keep]
                 wav_lens = batch.get("target_wav_lens")
