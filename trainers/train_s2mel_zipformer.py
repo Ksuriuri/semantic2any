@@ -35,6 +35,11 @@ from semantic2any.data.s2mel_dataset import (
 )
 from semantic2any.models import Semantic2MelModel
 from semantic2any.utils.checkpoint import load_compatible_checkpoint, save_compatible_checkpoint
+from semantic2any.utils.dots_audiovae import (
+    EXPECTED_HOP_SIZE,
+    EXPECTED_SAMPLE_RATE,
+    is_vae_latent_target,
+)
 from semantic2any.utils.indextts_adapters import (
     S2MelFeatureAdapter,
     build_feature_adapter,
@@ -339,11 +344,23 @@ def make_dataloader(
         dataset = make_source_dataset(cfg, source, speechdata=speechdata)
     spect = cfg.preprocess_params.spect_params
     codec = semantic_codec_info(cfg)
+    vae_target = is_vae_latent_target(cfg)
+    extract_mel_in_worker = bool(_get(cfg.data, "extract_mel_in_worker", False))
+    if vae_target and extract_mel_in_worker:
+        raise ValueError(
+            "data.extract_mel_in_worker is incompatible with target.type=vae_latent"
+        )
+    if vae_target:
+        hop_length = int(EXPECTED_HOP_SIZE)
+        collate_sample_rate = int(_get(cfg.data, "sample_rate_vae", EXPECTED_SAMPLE_RATE))
+    else:
+        hop_length = int(spect.hop_length)
+        collate_sample_rate = int(cfg.preprocess_params.sr)
     mel_fmax = _get(spect, "fmax", "None")
     mel_fmax = None if mel_fmax in (None, "None") else float(mel_fmax)
     collator = S2MelCollator(
-        hop_length=int(spect.hop_length),
-        sample_rate=int(cfg.preprocess_params.sr),
+        hop_length=hop_length,
+        sample_rate=collate_sample_rate,
         min_prompt_seconds=float(cfg.data.min_prompt_seconds),
         max_prompt_seconds=_optional_float(
             _get(cfg.data, "max_prompt_seconds", DEFAULT_MAX_PROMPT_SECONDS)
@@ -362,7 +379,7 @@ def make_dataloader(
         ),
         expected_semantic_codec=codec.name,
         expected_semantic_fingerprint=codec.fingerprint(),
-        extract_mel_in_worker=bool(_get(cfg.data, "extract_mel_in_worker", False)),
+        extract_mel_in_worker=extract_mel_in_worker,
         mel_n_fft=int(_get(spect, "n_fft", 2048)),
         mel_win_length=int(_get(spect, "win_length", 2048)),
         mel_n_mels=int(_get(spect, "n_mels", 128)),
@@ -1416,7 +1433,17 @@ def main() -> None:
         print("[Feature] Asynchronous extraction enabled (one batch ahead)")
     model.train()
     last_saved_step = global_step
-    if _AUX_LOSS_TYPE:
+    vae_target = is_vae_latent_target(cfg)
+    if vae_target:
+        if _VOCODER_TRAIN:
+            raise ValueError(
+                "VOCODER_TRAIN=1 is incompatible with target.type=vae_latent"
+            )
+        if accelerator.is_main_process:
+            print(
+                "[Loss] target.type=vae_latent: flow MSE only; skipping vocoder/aux"
+            )
+    elif _AUX_LOSS_TYPE:
         _init_aux_loss(
             cfg,
             accelerator.device,
@@ -1538,7 +1565,7 @@ def main() -> None:
                     _set_global_step(global_step)
                     if train_batch is None:
                         loss = torch.tensor(float("nan"), device=accelerator.device)
-                    elif _AUX_LOSS_TYPE:
+                    elif _AUX_LOSS_TYPE and not vae_target:
                         loss = forward_loss_with_aux(model, train_batch)
                     else:
                         loss = forward_loss(model, train_batch)

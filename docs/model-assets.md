@@ -127,7 +127,64 @@ uv run hf download nvidia/bigvgan_v2_44khz_128band_512x \
 - [44 kHz / 128 band / 256 hop](https://huggingface.co/nvidia/bigvgan_v2_44khz_128band_256x)
 - [44 kHz / 128 band / 512 hop](https://huggingface.co/nvidia/bigvgan_v2_44khz_128band_512x)
 
-## 3. 启动训练
+## 3. s2vae：只下载 dots.tts AudioVAE vocoder 三件套
+
+s2vae 把回归目标换成冻结 AudioVAE 的 128 维 / 25 Hz latent，推理用官方
+decoder 合成 48 kHz 波形，**不要**把 VAE latent 送进 BigVGAN。也不要
+`pip install dots.tts`（会带上 Qwen / 2B LLM 训练栈）。仓库已 vendoring
+encoder/decoder 源码，只需 vocoder 权重：
+
+```bash
+uv run hf download dots-studio/dots.tts-soar \
+  config.json vocoder.safetensors latent_stats.pt \
+  --local-dir checkpoints/dots-tts
+```
+
+`dots.tts-base` 的同一组 vocoder 文件也可以。在配置中设置：
+
+```yaml
+target:
+  type: vae_latent
+paths:
+  dots_tts_dir: checkpoints/dots-tts
+```
+
+训练入口仍是 `trainers/train_s2mel_zipformer.py`（VAE 模式会跳过
+BigVGAN aux / `VOCODER_TRAIN`）。听音用 `scripts/infer_s2vae.py`。
+许可证见 `semantic2any/third_party/dots_tts/NOTICE.md`（Apache-2.0）。
+
+配方文件是 `configs/s2vae_dit_indextts25.yaml`：复用 IndexTTS-2.5 semantic
+codes（1024-d @ 50 Hz），CFM 目标换成 128-d @ 25 Hz 的归一化 VAE mean
+（`length_regulator.time_align: pack2` 把相邻两帧 50 Hz 拼成 2048-d @ 25 Hz
+再投到 512，避免 nearest 丢奇数帧；`DiT.in_channels: 128`，`feat_scale: 1.0`）。声学波形
+在线 resample 到 48 kHz 后由冻结 AudioVAE encode；`data.extract_mel_in_worker`
+必须为 false。第一版只做 flow MSE，不要设 `AUX_LOSS_TYPE` / `VOCODER_TRAIN=1`。
+不要把 VAE latent 当 mel 喂现有 BigVGAN。现有 s2mel yaml 默认行为不变。
+
+训练：
+
+```bash
+uv run accelerate launch trainers/train_s2mel_zipformer.py \
+  --config configs/s2vae_dit_indextts25.yaml \
+  --model-dir checkpoints/feature-extractors \
+  --output-dir exp/s2vae_dit_indextts25
+```
+
+JSONL 可沿用 IndexTTS-2.5 codes 的 train/valid 路径（yaml 里已填）。听音：
+
+```bash
+uv run python scripts/infer_s2vae.py \
+  --config configs/s2vae_dit_indextts25.yaml \
+  --checkpoint exp/s2vae_dit_indextts25/s2mel_final.pth \
+  --input assets/test \
+  --output-dir outputs/s2vae \
+  --dots-tts-dir checkpoints/dots-tts
+```
+
+输出是 48 kHz wav，只含生成段。VAE latent 预计算（`vae_latent_path`）尚未接入，
+当前一律在线 encode。
+
+## 4. 启动训练
 
 数据 JSONL、输出目录和资产目录均可在新机器上覆盖，不需要修改源码：
 
@@ -154,7 +211,7 @@ fingerprint，不能在 MaskGCT 与 SAC 实验间混用。
 只预提取紧凑 MaskGCT code、训练时通过冻结词表恢复连续 feature 的流程见
 [maskgct-code-precompute.md](maskgct-code-precompute.md)。
 
-## 4. 可选评估资产
+## 5. 可选评估资产
 
 评估脚本集中在 `eval/` 目录，详见 [eval/README.md](../eval/README.md)。
 训练和常规推理不依赖这些工具；只有需要计算 AudioLDM 或说话人相似度指标时才需要准备以下资产。
@@ -173,7 +230,7 @@ fingerprint，不能在 MaskGCT 与 SAC 实验间混用。
 以上工具通过 `VAE` 环境变量传入 `eval/run_eval.sh`；若不设置，脚本仅运行
 SI-SDR 和 LSD，无需额外依赖。
 
-## 5. 离线迁移与校验
+## 6. 离线迁移与校验
 
 联网机器完成下载后，只需传输仓库、所选资产目录、数据 manifest 和需要
 恢复的训练 checkpoint。离线机器应将 `semantic_codec.local_files_only`
@@ -190,9 +247,12 @@ checkpoints/
     wav2vec2bert_stats.pt                    # 仅 MaskGCT
   sac-tokenizer/                             # 仅 SAC
     {config.json,preprocessor_config.json,model.safetensors}
-  vocoders/<所选 BigVGAN>/                   # 仅推理
+  vocoders/<所选 BigVGAN>/                   # 仅 s2mel 推理
     {config.json,bigvgan_generator.pt}
+  dots-tts/                                  # 仅 s2vae；不要下载 2B LLM
+    {config.json,vocoder.safetensors,latent_stats.pt}
 ```
 
 请同时遵守各下载页的模型许可证；仓库内同步源码的来源和许可证记录在
-`semantic2any/third_party/indextts/NOTICE.md`。
+`semantic2any/third_party/indextts/NOTICE.md` 与
+`semantic2any/third_party/dots_tts/NOTICE.md`。

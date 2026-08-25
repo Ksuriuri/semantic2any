@@ -22,6 +22,7 @@ def test_runtime_files_do_not_import_external_indextts_package() -> None:
         root / "semantic2any/utils/indextts_adapters.py",
         root / "semantic2any/utils/semantic_codecs.py",
         root / "scripts/infer_s2mel_zipformer.py",
+        root / "scripts/infer_s2vae.py",
     )
     for path in runtime_files:
         source = path.read_text(encoding="utf-8")

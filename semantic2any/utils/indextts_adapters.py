@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 import torchaudio
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
@@ -31,6 +32,11 @@ from semantic2any.third_party.indextts import (
     CAMPPlus,
     mel_spectrogram,
     mel_spectrogram_batch,
+)
+from semantic2any.utils.dots_audiovae import (
+    DotsAudioVAE,
+    is_vae_latent_target,
+    resolve_dots_tts_dir,
 )
 
 DEFAULT_PROMPT_BANDWIDTH_AUG_PROB = 0.3
@@ -114,6 +120,12 @@ def _check_vocoder_matches_mel(vocoder_cfg, mel_args: dict) -> None:
         )
 
 
+def _acoustic_resample_rates(adapter: "S2MelFeatureAdapter", need_16k: bool) -> tuple[int, ...]:
+    if need_16k:
+        return (adapter.sample_rate_acoustic, adapter.sample_rate_16k)
+    return (adapter.sample_rate_acoustic,)
+
+
 class S2MelFeatureAdapter(nn.Module):
     """Frozen mel/style stack with a selectable semantic codec backend."""
 
@@ -123,6 +135,7 @@ class S2MelFeatureAdapter(nn.Module):
         *,
         semantic_lookup_path: str | Path | None = None,
         semantic_lookup_sha256: str | None = None,
+        audio_vae: DotsAudioVAE | None = None,
     ) -> None:
         super().__init__()
 
@@ -213,12 +226,6 @@ class S2MelFeatureAdapter(nn.Module):
             None if max_target_seconds in (None, "None") else float(max_target_seconds)
         )
         self.min_generated_frames = int(_get(data_cfg, "min_generated_frames", 8))
-        if self.min_target_seconds is None:
-            self.min_target_seconds = (
-                self.min_generated_frames
-                * self.mel_args["hop_size"]
-                / self.mel_args["sampling_rate"]
-            )
         if self.max_target_seconds is None:
             self.max_target_seconds = self.max_audio_seconds
         self.max_pair_seconds = float(
@@ -258,25 +265,73 @@ class S2MelFeatureAdapter(nn.Module):
         self._resampler_cache: dict[
             tuple[int, int, str, torch.dtype], torchaudio.transforms.Resample
         ] = {}
-        if self.sample_rate_mel != self.mel_args["sampling_rate"]:
-            raise ValueError(
-                "data.sample_rate_mel must match preprocess_params.sr "
-                f"({self.sample_rate_mel} != {self.mel_args['sampling_rate']})"
+
+        self.target_type = "vae_latent" if is_vae_latent_target(cfg) else "mel"
+        self.audio_vae: DotsAudioVAE | None = None
+        if self.target_type == "vae_latent":
+            if bool(_get(data_cfg, "extract_mel_in_worker", False)):
+                raise ValueError(
+                    "data.extract_mel_in_worker is incompatible with "
+                    "target.type=vae_latent; AudioVAE encoding must run on the "
+                    "training device"
+                )
+            self.audio_vae = audio_vae or DotsAudioVAE.from_pretrained(
+                resolve_dots_tts_dir(cfg)
             )
+            self.sample_rate_acoustic = int(
+                _get(data_cfg, "sample_rate_vae", self.audio_vae.sample_rate)
+            )
+            if self.sample_rate_acoustic != int(self.audio_vae.sample_rate):
+                raise ValueError(
+                    "data.sample_rate_vae must match the AudioVAE sample rate "
+                    f"({self.sample_rate_acoustic} != {self.audio_vae.sample_rate})"
+                )
+            self.acoustic_hop_size = int(self.audio_vae.hop_size)
+            self.acoustic_channels = int(self.audio_vae.latent_dim)
+            # Keep the legacy name pointing at the acoustic rate so leftover
+            # collate math cannot silently use the unused mel hop.
+            self.sample_rate_mel = self.sample_rate_acoustic
+        else:
+            if audio_vae is not None:
+                raise ValueError(
+                    "audio_vae can only be passed when target.type=vae_latent"
+                )
+            self.sample_rate_acoustic = self.sample_rate_mel
+            self.acoustic_hop_size = int(self.mel_args["hop_size"])
+            self.acoustic_channels = int(self.mel_args["num_mels"])
+            if self.sample_rate_mel != self.mel_args["sampling_rate"]:
+                raise ValueError(
+                    "data.sample_rate_mel must match preprocess_params.sr "
+                    f"({self.sample_rate_mel} != {self.mel_args['sampling_rate']})"
+                )
+            _check_vocoder_matches_mel(_get(cfg, "vocoder"), self.mel_args)
+
+        if self.min_target_seconds is None:
+            self.min_target_seconds = (
+                self.min_generated_frames
+                * self.acoustic_hop_size
+                / self.sample_rate_acoustic
+            )
+
         s2mel_cfg = _get(cfg, "s2mel")
         dit_cfg = _get(s2mel_cfg, "DiT")
-        model_mel_channels = int(_get(dit_cfg, "in_channels", self.mel_args["num_mels"]))
-        if model_mel_channels != self.mel_args["num_mels"]:
+        model_channels = int(_get(dit_cfg, "in_channels", self.acoustic_channels))
+        if model_channels != self.acoustic_channels:
             raise ValueError(
-                "s2mel.DiT.in_channels must match preprocess mel bands "
-                f"({model_mel_channels} != {self.mel_args['num_mels']})"
+                "s2mel.DiT.in_channels must match the acoustic target channels "
+                f"({model_channels} != {self.acoustic_channels})"
             )
-        _check_vocoder_matches_mel(_get(cfg, "vocoder"), self.mel_args)
 
-        for module in (self.semantic_backend, self.semantic_decoder, self.campplus_model):
+        for module in (
+            self.semantic_backend,
+            self.semantic_decoder,
+            self.campplus_model,
+            self.audio_vae,
+        ):
             if module is None:
                 continue
             module.requires_grad_(False)
+            module.eval()
 
     def _module_device(self) -> torch.device:
         anchor = getattr(self, "_device_anchor", None)
@@ -554,6 +609,50 @@ class S2MelFeatureAdapter(nn.Module):
         return simulate_lower_sample_rate(waveform, sample_rate, rate)
 
     @torch.no_grad()
+    def _encode_acoustic_waveforms(
+        self,
+        waveforms: list[torch.Tensor],
+        *,
+        batched: bool = False,
+    ) -> list[torch.Tensor]:
+        """Encode waveforms to [C, T] acoustic targets (mel or VAE latent)."""
+        if not waveforms:
+            return []
+        if self.audio_vae is None:
+            if batched and self.mel_spectrogram is mel_spectrogram:
+                return mel_spectrogram_batch(
+                    waveforms,
+                    batch_size=getattr(self, "mel_batch_size", 2),
+                    **self.mel_args,
+                )
+            return [
+                self.mel_spectrogram(waveform.float(), **self.mel_args).squeeze(0)
+                for waveform in waveforms
+            ]
+        vae = self.audio_vae
+        device = self._module_device()
+        prepared: list[torch.Tensor] = []
+        lengths: list[int] = []
+        for waveform in waveforms:
+            wave = waveform.float()
+            if wave.ndim == 1:
+                wave = wave.unsqueeze(0)
+            prepared.append(wave.to(device))
+            lengths.append(int(wave.size(-1)))
+        max_len = max(lengths)
+        hop = int(vae.hop_size)
+        padded_len = ((max_len + hop - 1) // hop) * hop
+        batch = torch.stack(
+            [F.pad(wave, (0, padded_len - wave.size(-1))) for wave in prepared],
+            dim=0,
+        )
+        latents = vae.encode_mean(batch, sample_lengths=lengths, normalize=True)
+        return [
+            latents[index, :, : max(length // hop, 0)].contiguous()
+            for index, length in enumerate(lengths)
+        ]
+
+    @torch.no_grad()
     def extract_utterance_features(
         self,
         audio_paths: list[str],
@@ -566,7 +665,6 @@ class S2MelFeatureAdapter(nn.Module):
         """Extract per-utterance features. w2v-bert runs batched (chunked by
         ``feature_batch_size``); mel, campplus and codec quantization stay
         per-sample to keep parity with the single-utterance IndexTTS pipeline."""
-        mels = []
         styles = []
         waveforms_16k = []
         if (semantic_codes is None) != (semantic_code_lens is None):
@@ -581,14 +679,10 @@ class S2MelFeatureAdapter(nn.Module):
         resampled = self._resample_waveform_batch(
             source_waveforms,
             source_rates,
-            (
-                (self.sample_rate_mel, self.sample_rate_16k)
-                if need_16k
-                else (self.sample_rate_mel,)
-            ),
+            _acoustic_resample_rates(self, need_16k),
         )
-        for index, audio_mel in enumerate(resampled[self.sample_rate_mel]):
-            mels.append(self.mel_spectrogram(audio_mel.float(), **self.mel_args).squeeze(0))
+        mels = self._encode_acoustic_waveforms(resampled[self.sample_rate_acoustic])
+        for index, audio_mel in enumerate(resampled[self.sample_rate_acoustic]):
             if need_16k:
                 audio_16k = resampled[self.sample_rate_16k][index]
                 styles.append(self._style_from_audio(audio_16k))
@@ -632,8 +726,6 @@ class S2MelFeatureAdapter(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Randomly split each waveform into prompt and target before feature extraction."""
         device = self._module_device()
-        prompt_mels = []
-        target_mels = []
         styles = []
         segment_waveforms = []
         segment_sample_rates = []
@@ -647,7 +739,9 @@ class S2MelFeatureAdapter(nn.Module):
         target_floor_seconds = self.min_target_seconds
         if target_floor_seconds is None:
             target_floor_seconds = (
-                self.min_generated_frames * self.mel_args["hop_size"] / self.sample_rate_mel
+                self.min_generated_frames
+                * self.acoustic_hop_size
+                / self.sample_rate_acoustic
             )
 
         source_waveforms, source_rates = self._prepare_audio_batch(
@@ -681,34 +775,30 @@ class S2MelFeatureAdapter(nn.Module):
         resampled = self._resample_waveform_batch(
             segment_waveforms,
             segment_sample_rates,
-            (
-                (self.sample_rate_mel, self.sample_rate_16k)
-                if need_16k
-                else (self.sample_rate_mel,)
-            ),
+            _acoustic_resample_rates(self, need_16k),
         )
-        segment_waveforms_mel = resampled[self.sample_rate_mel]
+        segment_waveforms_mel = resampled[self.sample_rate_acoustic]
         segment_waveforms_16k = (
             resampled[self.sample_rate_16k] if need_16k else []
         )
+        acoustic_inputs: list[torch.Tensor] = []
         for index in range(len(audio_paths)):
             prompt_audio_mel = self._apply_force_bandwidth(
-                segment_waveforms_mel[2 * index], self.sample_rate_mel
+                segment_waveforms_mel[2 * index], self.sample_rate_acoustic
             )
             target_audio_mel = self._apply_force_bandwidth(
-                segment_waveforms_mel[2 * index + 1], self.sample_rate_mel
+                segment_waveforms_mel[2 * index + 1], self.sample_rate_acoustic
             )
             prompt_audio_mel = self._maybe_limit_prompt_bandwidth(
                 prompt_audio_mel,
-                self.sample_rate_mel,
+                self.sample_rate_acoustic,
                 enabled=apply_prompt_bandwidth_aug,
             )
-            prompt_mels.append(
-                self.mel_spectrogram(prompt_audio_mel.float(), **self.mel_args).squeeze(0)
-            )
-            target_mels.append(
-                self.mel_spectrogram(target_audio_mel.float(), **self.mel_args).squeeze(0)
-            )
+            acoustic_inputs.extend([prompt_audio_mel, target_audio_mel])
+        encoded = self._encode_acoustic_waveforms(acoustic_inputs)
+        prompt_mels = encoded[0::2]
+        target_mels = encoded[1::2]
+        for index in range(len(audio_paths)):
 
             if need_16k:
                 styles.append(self._style_from_audio(segment_waveforms_16k[2 * index]))
@@ -806,8 +896,8 @@ class S2MelFeatureAdapter(nn.Module):
             mel = item["mel"]
             prompt_len = choose_prompt_len(
                 mel.size(-1),
-                hop_length=self.mel_args["hop_size"],
-                sample_rate=self.sample_rate_mel,
+                hop_length=self.acoustic_hop_size,
+                sample_rate=self.sample_rate_acoustic,
                 min_prompt_seconds=self.min_prompt_seconds,
                 max_prompt_seconds=self.max_prompt_seconds,
                 min_generated_frames=self.min_generated_frames,
@@ -999,13 +1089,9 @@ class S2MelFeatureAdapter(nn.Module):
         resampled = self._resample_waveform_batch(
             interleaved_segments,
             segment_rates,
-            (
-                (self.sample_rate_mel, self.sample_rate_16k)
-                if need_16k
-                else (self.sample_rate_mel,)
-            ),
+            _acoustic_resample_rates(self, need_16k),
         )
-        mel_waveforms = resampled[self.sample_rate_mel]
+        mel_waveforms = resampled[self.sample_rate_acoustic]
         waveforms_16k = resampled[self.sample_rate_16k] if need_16k else []
 
         prompt_code_rows: list[torch.Tensor] | None = None
@@ -1041,28 +1127,18 @@ class S2MelFeatureAdapter(nn.Module):
         mel_inputs: list[torch.Tensor] = []
         for index in range(batch_size):
             prompt_mel_waveform = self._apply_force_bandwidth(
-                mel_waveforms[2 * index], self.sample_rate_mel
+                mel_waveforms[2 * index], self.sample_rate_acoustic
             )
             target_mel_waveform = self._apply_force_bandwidth(
-                mel_waveforms[2 * index + 1], self.sample_rate_mel
+                mel_waveforms[2 * index + 1], self.sample_rate_acoustic
             )
             prompt_mel_waveform = self._maybe_limit_prompt_bandwidth(
                 prompt_mel_waveform,
-                self.sample_rate_mel,
+                self.sample_rate_acoustic,
                 enabled=apply_prompt_bandwidth_aug,
             )
             mel_inputs.extend([prompt_mel_waveform, target_mel_waveform])
-        if self.mel_spectrogram is mel_spectrogram:
-            batched_mels = mel_spectrogram_batch(
-                mel_inputs,
-                batch_size=getattr(self, "mel_batch_size", 2),
-                **self.mel_args,
-            )
-        else:
-            batched_mels = [
-                self.mel_spectrogram(waveform.float(), **self.mel_args).squeeze(0)
-                for waveform in mel_inputs
-            ]
+        batched_mels = self._encode_acoustic_waveforms(mel_inputs, batched=True)
         code_sequences: list[torch.Tensor] = []
         for index, singleton_split in enumerate(singleton_splits):
             if not code_mode:
@@ -1134,8 +1210,8 @@ class S2MelFeatureAdapter(nn.Module):
         return collate_paired_features(
             prompt_features,
             target_features,
-            hop_length=self.mel_args["hop_size"],
-            sample_rate=self.sample_rate_mel,
+            hop_length=self.acoustic_hop_size,
+            sample_rate=self.sample_rate_acoustic,
             max_pair_seconds=duration_budget,
             min_prompt_seconds=self.min_pair_prompt_seconds,
             min_generated_frames=self.min_generated_frames,
@@ -1152,11 +1228,13 @@ def build_feature_adapter(
     *,
     semantic_lookup_path: str | Path | None = None,
     semantic_lookup_sha256: str | None = None,
+    audio_vae: DotsAudioVAE | None = None,
 ) -> S2MelFeatureAdapter:
     return S2MelFeatureAdapter(
         cfg,
         semantic_lookup_path=semantic_lookup_path,
         semantic_lookup_sha256=semantic_lookup_sha256,
+        audio_vae=audio_vae,
     )
 
 

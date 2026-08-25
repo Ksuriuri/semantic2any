@@ -51,3 +51,65 @@ def test_vectorized_length_interpolation_matches_nearest_reference() -> None:
     expected = expected * mask.unsqueeze(-1)
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_pack2_exact_double_rate_keeps_both_frames() -> None:
+    torch.manual_seed(0)
+    regulator = InterpolateRegulator(
+        channels=6,
+        sampling_ratios=(1,),
+        in_channels=3,
+        time_align="pack2",
+    ).eval()
+    semantic = torch.randn(2, 8, 3)
+    semantic_lens = torch.tensor([8, 6])
+    latent_lens = torch.tensor([4, 3])
+
+    actual = regulator(semantic, ylens=latent_lens, xlens=semantic_lens)[0]
+
+    packed = semantic.new_zeros(2, 4, 6)
+    for index in range(2):
+        xlen = int(semantic_lens[index])
+        ylen = int(latent_lens[index])
+        packed[index, :ylen] = semantic[index, :xlen].reshape(ylen, 6)
+    projected = regulator.content_in_proj(packed).transpose(1, 2)
+    expected = regulator.model(projected).transpose(1, 2)
+    mask = torch.arange(4).unsqueeze(0) < latent_lens.unsqueeze(1)
+    expected = expected * mask.unsqueeze(-1)
+
+    torch.testing.assert_close(actual, expected)
+    assert regulator.content_in_proj.in_features == 6
+
+
+def test_pack2_off_ratio_matches_per_sample_linear_then_pair() -> None:
+    torch.manual_seed(1)
+    regulator = InterpolateRegulator(
+        channels=4,
+        sampling_ratios=(1,),
+        in_channels=2,
+        time_align="pack2",
+    ).eval()
+    semantic = torch.randn(3, 7, 2)
+    semantic_lens = torch.tensor([7, 5, 3])
+    latent_lens = torch.tensor([4, 3, 2])
+
+    actual = regulator(semantic, ylens=latent_lens, xlens=semantic_lens)[0]
+
+    max_y = int(latent_lens.max())
+    packed = semantic.new_zeros(3, max_y, 4)
+    for index in range(3):
+        xlen = int(semantic_lens[index])
+        ylen = int(latent_lens[index])
+        fine = F.interpolate(
+            semantic[index : index + 1, :xlen].transpose(1, 2),
+            size=2 * ylen,
+            mode="linear",
+            align_corners=False,
+        )[0].transpose(0, 1)
+        packed[index, :ylen] = fine.reshape(ylen, 4)
+    projected = regulator.content_in_proj(packed).transpose(1, 2)
+    expected = regulator.model(projected).transpose(1, 2)
+    mask = torch.arange(max_y).unsqueeze(0) < latent_lens.unsqueeze(1)
+    expected = expected * mask.unsqueeze(-1)
+
+    torch.testing.assert_close(actual, expected)

@@ -32,6 +32,7 @@ class Semantic2MelModel(nn.Module):
             quantizer_dropout=float(_get(lr_cfg, "quantizer_dropout", 0.0)),
             f0_condition=bool(_get(lr_cfg, "f0_condition", False)),
             n_f0_bins=int(_get(lr_cfg, "n_f0_bins", 512)),
+            time_align=str(_get(lr_cfg, "time_align", "nearest")),
         )
 
         modules = {
