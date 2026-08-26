@@ -53,8 +53,8 @@ data:
   prefetch_factor: 2
   decode_audio_in_worker: true
   skip_audio_errors: true
-  feature_batch_size: 16
-  async_feature_extraction: false
+  feature_batch_size: 28
+  async_feature_extraction: true
   preload_features: false
   # Acoustic audio is resampled to 48 kHz for AudioVAE encode. Semantic/style stay 16 kHz.
   prompt_bandwidth_aug_prob: 0.0
@@ -107,7 +107,7 @@ s2mel:
   high_band_mse_extra: 0.0
   use_gpt_latent: false
   inference_steps: 25
-  inference_cfg_rate: 0.2
+  inference_cfg_rate: 0.7
   # 25 Hz latent / 50 Hz IndexTTS-2.5 semantic features.
   # length_ratio is unused in Python; pack2 keeps both 50 Hz frames.
   length_ratio: 0.5
@@ -180,3 +180,4 @@ train:
   wandb_entity: haoyuanhuang22-jcxy
   wandb_project: semantic2mel
   wandb_run_name: s2vae-dit-indextts25-flow-mse
+  wandb_run_id: z97jfp7c

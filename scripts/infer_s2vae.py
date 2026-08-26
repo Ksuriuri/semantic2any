@@ -49,7 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dtype",
         choices=("auto", "float16", "bfloat16", "float32"),
-        default="auto",
+        default="float32",
+        help=(
+            "Full-network dtype for DiT + Euler. float16 collapses VAE latents "
+            "(silent output). auto also resolves to float32. bfloat16 is audible "
+            "but worse than float32."
+        ),
     )
     parser.add_argument("--prompt-seconds", type=float, default=3.0)
     parser.add_argument("--min-generate-frames", type=int, default=8)
@@ -162,7 +167,10 @@ def main() -> None:
         torch.cuda.manual_seed_all(args.seed)
 
     device = torch.device(args.device)
-    dtype = resolve_dtype(device, args.dtype)
+    requested = "float32" if args.dtype == "auto" else args.dtype
+    if requested == "float16":
+        print(">> warning: --dtype float16 collapses s2vae Euler; prefer float32")
+    dtype = resolve_dtype(device, requested)
     input_paths = iter_audio_paths(Path(args.input).expanduser())
     if not input_paths:
         raise ValueError(f"No supported audio files found under {args.input}")
@@ -191,7 +199,7 @@ def main() -> None:
     inference_cfg_rate = (
         args.inference_cfg_rate
         if args.inference_cfg_rate is not None
-        else float(_get(cfg.s2mel, "inference_cfg_rate", 0.2))
+        else float(_get(cfg.s2mel, "inference_cfg_rate", 0.7))
     )
     model.models["cfm"].setup_estimator_caches(
         max_batch_size=2 if inference_cfg_rate > 0 else 1,
