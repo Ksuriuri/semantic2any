@@ -923,6 +923,130 @@ class S2MelFeatureAdapter(nn.Module):
             "prompt_lens": prompt_lens_tensor,
         }
 
+
+    def _latent_frame_rate(self) -> float:
+        hop = int(getattr(self.audio_vae, "hop_length", 1920) or 1920) if self.audio_vae is not None else 1920
+        rate = int(getattr(self, "sample_rate_acoustic", 48000) or 48000)
+        return float(rate) / float(hop)
+
+    def _stored_pair_ready(
+        self,
+        prompt_vae_latents: list[torch.Tensor | None] | None,
+        target_vae_latents: list[torch.Tensor | None] | None,
+        batch_size: int,
+    ) -> bool:
+        return (
+            prompt_vae_latents is not None
+            and target_vae_latents is not None
+            and len(prompt_vae_latents) == batch_size
+            and len(target_vae_latents) == batch_size
+            and all(item is not None for item in prompt_vae_latents)
+            and all(item is not None for item in target_vae_latents)
+        )
+
+    def _crop_prompt_latent_and_code(
+        self,
+        latent: torch.Tensor,
+        code: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hz = self._latent_frame_rate()
+        max_frames = max(1, int(float(self.max_prompt_seconds) * hz))
+        frames = int(latent.size(-1))
+        keep = min(frames, max_frames) if frames else 1
+        cropped = latent[..., :keep]
+        if frames <= 0:
+            keep_code = max(1, min(int(code.numel()), keep))
+        else:
+            keep_code = max(1, min(int(code.numel()), round(int(code.numel()) * keep / frames)))
+        return cropped, code[:keep_code]
+
+    def _split_singleton_latent_and_code(
+        self,
+        latent: torch.Tensor,
+        code: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        hz = self._latent_frame_rate()
+        frames = int(latent.size(-1))
+        min_prompt = math.ceil(float(self.min_pair_prompt_seconds) * hz)
+        min_target = math.ceil(float(self.min_target_seconds) * hz)
+        max_prompt = int(float(self.max_prompt_seconds) * hz)
+        lower = min_prompt
+        upper = min(max_prompt, frames - min_target)
+        if upper < lower:
+            raise ValueError("stored singleton latent is too short to split")
+        split = lower if upper == lower else random.randint(lower, upper)
+        keep_code = max(1, min(int(code.numel()) - 1, round(int(code.numel()) * split / frames)))
+        return latent[..., :split], latent[..., split:], code[:keep_code], code[keep_code:]
+
+    def _extract_paired_from_stored(
+        self,
+        *,
+        prompt_vae_latents: list[torch.Tensor],
+        target_vae_latents: list[torch.Tensor],
+        prompt_semantic_codes: torch.Tensor,
+        prompt_semantic_code_lens: torch.Tensor,
+        target_semantic_codes: torch.Tensor,
+        target_semantic_code_lens: torch.Tensor,
+        singleton_splits: list[bool],
+        batch_size: int,
+    ) -> dict[str, torch.Tensor]:
+        device = self._module_device()
+        assert self.semantic_decoder is not None
+        prompt_code_rows = self._code_rows(prompt_semantic_codes, prompt_semantic_code_lens)
+        target_code_rows = self._code_rows(target_semantic_codes, target_semantic_code_lens)
+        batched_mels: list[torch.Tensor] = []
+        code_sequences: list[torch.Tensor] = []
+        for index, singleton_split in enumerate(singleton_splits):
+            if singleton_split:
+                prompt_mel, target_mel, prompt_code, target_code = (
+                    self._split_singleton_latent_and_code(
+                        target_vae_latents[index],
+                        target_code_rows[index],
+                    )
+                )
+            else:
+                prompt_mel, prompt_code = self._crop_prompt_latent_and_code(
+                    prompt_vae_latents[index],
+                    prompt_code_rows[index],
+                )
+                target_mel = target_vae_latents[index]
+                target_code = target_code_rows[index]
+            batched_mels.extend([prompt_mel.to(device), target_mel.to(device)])
+            code_sequences.extend([prompt_code, target_code])
+        code_semantics = [
+            item.float()
+            for item in self.semantic_decoder.decode_sequences(code_sequences)
+        ]
+        style = torch.zeros(int(getattr(self, "style_dim", 192)), device=device)
+        prompt_features: list[dict[str, torch.Tensor]] = []
+        target_features: list[dict[str, torch.Tensor]] = []
+        for index in range(batch_size):
+            prompt_features.append(
+                {
+                    "mel": batched_mels[2 * index],
+                    "semantic": code_semantics[2 * index],
+                    "style": style,
+                }
+            )
+            target_features.append(
+                {
+                    "mel": batched_mels[2 * index + 1],
+                    "semantic": code_semantics[2 * index + 1],
+                    "style": style,
+                }
+            )
+        duration_budget = self.max_prompt_seconds + self.max_target_seconds
+        return collate_paired_features(
+            prompt_features,
+            target_features,
+            hop_length=self.acoustic_hop_size,
+            sample_rate=self.sample_rate_acoustic,
+            max_pair_seconds=duration_budget,
+            min_prompt_seconds=self.min_pair_prompt_seconds,
+            min_generated_frames=self.min_generated_frames,
+            is_precomputed=False,
+        )
+
     @torch.no_grad()
     def extract_paired_from_audio_paths(
         self,
@@ -938,6 +1062,8 @@ class S2MelFeatureAdapter(nn.Module):
         prompt_semantic_code_lens: torch.Tensor | None = None,
         target_semantic_codes: torch.Tensor | None = None,
         target_semantic_code_lens: torch.Tensor | None = None,
+        prompt_vae_latents: list[torch.Tensor | None] | None = None,
+        target_vae_latents: list[torch.Tensor | None] | None = None,
         apply_prompt_bandwidth_aug: bool = True,
     ) -> dict[str, torch.Tensor]:
         if not prompt_audio_paths or len(prompt_audio_paths) != len(target_audio_paths):
@@ -961,6 +1087,26 @@ class S2MelFeatureAdapter(nn.Module):
         ):
             raise ValueError("All paired semantic code fields must be provided together")
         code_mode = all(item is not None for item in code_fields)
+        if (
+            code_mode
+            and self._stored_pair_ready(prompt_vae_latents, target_vae_latents, batch_size)
+        ):
+            if self.min_target_seconds is None or self.max_target_seconds is None:
+                raise ValueError(
+                    "Paired extraction requires min_target_seconds and max_target_seconds"
+                )
+            if self.max_prompt_seconds is None:
+                raise ValueError("Paired extraction requires max_prompt_seconds")
+            return self._extract_paired_from_stored(
+                prompt_vae_latents=prompt_vae_latents,
+                target_vae_latents=target_vae_latents,
+                prompt_semantic_codes=prompt_semantic_codes,
+                prompt_semantic_code_lens=prompt_semantic_code_lens,
+                target_semantic_codes=target_semantic_codes,
+                target_semantic_code_lens=target_semantic_code_lens,
+                singleton_splits=singleton_splits,
+                batch_size=batch_size,
+            )
         prompt_sources, prompt_rates = self._prepare_audio_batch(
             prompt_audio_paths,
             prompt_waveforms,
@@ -1139,6 +1285,21 @@ class S2MelFeatureAdapter(nn.Module):
             )
             mel_inputs.extend([prompt_mel_waveform, target_mel_waveform])
         batched_mels = self._encode_acoustic_waveforms(mel_inputs, batched=True)
+        if (
+            prompt_vae_latents is not None
+            and target_vae_latents is not None
+            and len(prompt_vae_latents) == batch_size
+            and len(target_vae_latents) == batch_size
+            and all(item is not None for item in prompt_vae_latents)
+            and all(item is not None for item in target_vae_latents)
+            and not any(singleton_splits)
+        ):
+            device = self._module_device()
+            batched_mels = [
+                tensor
+                for prompt, target in zip(prompt_vae_latents, target_vae_latents, strict=True)
+                for tensor in (prompt.to(device), target.to(device))
+            ]
         code_sequences: list[torch.Tensor] = []
         for index, singleton_split in enumerate(singleton_splits):
             if not code_mode:

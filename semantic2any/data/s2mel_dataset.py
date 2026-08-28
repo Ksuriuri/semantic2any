@@ -66,6 +66,98 @@ def _load_semantic_codes(record: dict[str, Any]) -> torch.Tensor:
         )
     return torch.from_numpy(np.array(mmap[offset:end], dtype=np.int64, copy=True))
 
+_VAE_LATENT_JSONL_CACHE: dict[str, dict[str, tuple[int, int]]] = {}
+_VAE_LATENT_MEMMAPS: dict[str, np.memmap] = {}
+
+
+def _vae_paths_from_code_path(code_path: str) -> tuple[Path, Path] | None:
+    path = Path(code_path)
+    if path.suffix != ".bin":
+        return None
+    try:
+        codes_root = path.parent.parent
+        dataset = path.parent.name
+        stem = path.name[:-7] if path.name.endswith(".u2.bin") else path.stem
+    except Exception:
+        return None
+    local_root = codes_root.parent / "dotstts-latents" / dataset
+    return local_root / f"{stem}.f16.bin", local_root / f"{stem}.jsonl"
+
+
+def _vae_index(jsonl_path: Path) -> dict[str, tuple[int, int]]:
+    key = str(jsonl_path)
+    cached = _VAE_LATENT_JSONL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    mapping: dict[str, tuple[int, int]] = {}
+    if jsonl_path.is_file():
+        with jsonl_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if row.get("status") != "encoded":
+                    continue
+                rid = row.get("id")
+                offset = row.get("vae_latent_offset")
+                length = row.get("vae_latent_length")
+                if isinstance(rid, str) and offset is not None and length:
+                    mapping[rid] = (int(offset), int(length))
+    _VAE_LATENT_JSONL_CACHE[key] = mapping
+    return mapping
+
+
+def _load_vae_latent(record: dict[str, Any]) -> torch.Tensor | None:
+    code_path = record.get("semantic_code_path")
+    record_id = record.get("id")
+    if not isinstance(code_path, str) or not isinstance(record_id, str):
+        return None
+    paths = _vae_paths_from_code_path(code_path)
+    if paths is None:
+        return None
+    bin_path, jsonl_path = paths
+    if not bin_path.is_file() or not jsonl_path.is_file():
+        return None
+    loc = _vae_index(jsonl_path).get(record_id)
+    if loc is None:
+        return None
+    offset, length = loc
+    mmap = _VAE_LATENT_MEMMAPS.get(str(bin_path))
+    if mmap is None:
+        mmap = np.memmap(bin_path, mode="r", dtype="<f2")
+        _VAE_LATENT_MEMMAPS[str(bin_path)] = mmap
+    start = offset * 128
+    end = start + length * 128
+    if end > mmap.size:
+        return None
+    frames = np.array(mmap[start:end], dtype=np.float32).reshape(length, 128)
+    return torch.from_numpy(np.ascontiguousarray(frames.T))
+
+
+def _stored_pair_usable(
+    prompt: dict[str, Any],
+    target: dict[str, Any],
+    singleton: bool,
+) -> bool:
+    """True if both latents load and meet the stored-path duration budget.
+
+    Pairing uses metadata `duration`, which can be longer than the VAE frames.
+    `trim_paired_feature_lengths` then raises (68 < 75) and async extract hangs.
+    """
+    prompt_latent = _load_vae_latent(prompt)
+    target_latent = _load_vae_latent(target)
+    if prompt_latent is None or target_latent is None:
+        return False
+    min_prompt = 75  # 3.0s * 48000 / 1920
+    min_target = 13
+    if singleton:
+        return int(prompt_latent.size(-1)) >= min_prompt + min_target
+    return (
+        int(prompt_latent.size(-1)) >= min_prompt
+        and int(target_latent.size(-1)) >= min_target
+    )
+
 
 def _pad_semantic_codes(records: list[dict[str, Any]]) -> tuple[torch.Tensor, torch.Tensor]:
     codes = [_load_semantic_codes(record) for record in records]
@@ -1410,6 +1502,8 @@ class S2MelCollator:
                 "target_semantic_codes": target_codes,
                 "target_semantic_code_lens": target_code_lens,
                 "has_semantic_codes": True,
+                "prompt_vae_latents": [_load_vae_latent(record) for record in prompt_records],
+                "target_vae_latents": [_load_vae_latent(record) for record in target_records],
                 **self._semantic_code_batch_metadata(flattened),
             }
         )
@@ -1537,10 +1631,45 @@ class S2MelCollator:
                 raise ValueError("Both sides of every pair must use the same feature mode")
             if any(partially_semantic_codes) and not all(has_semantic_codes):
                 raise ValueError("Both sides of every pair must provide semantic codes")
-            prompt_audio_paths = [record.get("audio_path") for record in prompt_records]
-            target_audio_paths = [record.get("audio_path") for record in target_records]
-            if any(path is None for path in prompt_audio_paths + target_audio_paths):
+            prompt_audio_paths = [
+                path if isinstance(path := record.get("audio_path"), str) else ""
+                for record in prompt_records
+            ]
+            target_audio_paths = [
+                path if isinstance(path := record.get("audio_path"), str) else ""
+                for record in target_records
+            ]
+            pair_latent_ok = [
+                _stored_pair_usable(
+                    prompt,
+                    target,
+                    bool(record.get("singleton_split", False)),
+                )
+                for prompt, target, record in zip(
+                    prompt_records, target_records, records, strict=True
+                )
+            ]
+            good = [index for index, ok in enumerate(pair_latent_ok) if ok]
+            if not good:
                 raise ValueError("Paired records must contain prompt and target audio_path")
+            replaced = 0
+            for index, ok in enumerate(pair_latent_ok):
+                if ok:
+                    continue
+                donor = good[index % len(good)]
+                records[index] = records[donor]
+                prompt_records[index] = prompt_records[donor]
+                target_records[index] = target_records[donor]
+                prompt_audio_paths[index] = prompt_audio_paths[donor]
+                target_audio_paths[index] = target_audio_paths[donor]
+                replaced += 1
+            if replaced:
+                print(
+                    f"[StoredLatent] replaced {replaced}/{len(records)} "
+                    "pairs without loadable latents",
+                    flush=True,
+                )
+            stored_latents = True
             batch = {
                 "prompt_audio_paths": prompt_audio_paths,
                 "target_audio_paths": target_audio_paths,
@@ -1551,6 +1680,9 @@ class S2MelCollator:
                 "is_precomputed": False,
                 "is_paired": True,
             }
+            if stored_latents:
+                self._attach_paired_semantic_codes(batch, records)
+                return batch
             if self.decode_audio_in_worker:
                 prompt_waveforms, prompt_sample_rates, prompt_indices = self._decode_audio_paths(
                     prompt_audio_paths,

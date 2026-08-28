@@ -789,6 +789,8 @@ def _build_training_batch_impl(
             prompt_semantic_code_lens=batch.get("prompt_semantic_code_lens"),
             target_semantic_codes=batch.get("target_semantic_codes"),
             target_semantic_code_lens=batch.get("target_semantic_code_lens"),
+            prompt_vae_latents=batch.get("prompt_vae_latents"),
+            target_vae_latents=batch.get("target_vae_latents"),
             apply_prompt_bandwidth_aug=apply_prompt_bandwidth_aug,
         )
     if bool(_get(cfg.data, "random_split_audio", False)):
