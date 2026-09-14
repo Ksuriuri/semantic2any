@@ -313,9 +313,7 @@ class DotsAudioVAE(nn.Module):
             mean = self.normalize(mean)
         return mean
 
-    @torch.no_grad()
-    def decode(self, latent: torch.Tensor, *, normalized: bool = True) -> torch.Tensor:
-        """Decode [B, C, T] or [B, T, C] latents to [B, 1, samples] at 48 kHz."""
+    def _decode_impl(self, latent: torch.Tensor, *, normalized: bool = True) -> torch.Tensor:
         if latent.ndim != 3:
             raise ValueError(f"latent must be 3D, got {tuple(latent.shape)}")
         if latent.size(1) == self.latent_dim:
@@ -329,3 +327,19 @@ class DotsAudioVAE(nn.Module):
         if normalized:
             latent_bt = self.denormalize(latent_bt)
         return self.vocoder.inference_from_latents(latent_bt, do_sample=False)
+
+    @torch.no_grad()
+    def decode(self, latent: torch.Tensor, *, normalized: bool = True) -> torch.Tensor:
+        """Decode latents without building an autograd graph (normal inference)."""
+        return self._decode_impl(latent, normalized=normalized)
+
+    def decode_differentiable(
+        self, latent: torch.Tensor, *, normalized: bool = True
+    ) -> torch.Tensor:
+        """Decode while retaining gradients to ``latent``; VAE weights stay frozen."""
+        # cuDNN's RNN backward requires the LSTM forward to run in training
+        # mode even when all its parameters are frozen.  SLSTM has no dropout,
+        # so this changes neither values nor stochasticity; it only asks cuDNN
+        # to retain the reserve buffer needed for a gradient to the input.
+        self.vocoder.dec_mi_layer.train(True)
+        return self._decode_impl(latent, normalized=normalized)

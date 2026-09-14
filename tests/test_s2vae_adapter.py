@@ -48,7 +48,13 @@ def _patch_sac(monkeypatch) -> None:
     )
 
 
-def _vae_cfg(*, in_channels: int, extract_mel_in_worker: bool = False, tmp_path) -> OmegaConf:
+def _vae_cfg(
+    *,
+    in_channels: int,
+    extract_mel_in_worker: bool = False,
+    stored_vae_latents_only: bool = False,
+    tmp_path,
+) -> OmegaConf:
     return OmegaConf.create(
         {
             "target": {"type": "vae_latent"},
@@ -58,6 +64,7 @@ def _vae_cfg(*, in_channels: int, extract_mel_in_worker: bool = False, tmp_path)
             "data": {
                 "sample_rate_vae": 48000,
                 "extract_mel_in_worker": extract_mel_in_worker,
+                "stored_vae_latents_only": stored_vae_latents_only,
             },
             "preprocess_params": {
                 "sr": 22050,
@@ -136,3 +143,40 @@ def test_semantic_50hz_aligns_to_latent_25hz(monkeypatch, tmp_path) -> None:
     assert adapter.acoustic_hop_size == 1920
     assert adapter.sample_rate_acoustic == 48000
     assert adapter.acoustic_channels == 128
+
+
+def test_stored_only_mode_does_not_load_audio_vae(monkeypatch, tmp_path) -> None:
+    _patch_sac(monkeypatch)
+    cfg = _vae_cfg(
+        in_channels=128,
+        stored_vae_latents_only=True,
+        tmp_path=tmp_path,
+    )
+
+    def _unexpected_load(*_args, **_kwargs):
+        raise AssertionError("AudioVAE.from_pretrained must not be called")
+
+    monkeypatch.setattr(DotsAudioVAE, "from_pretrained", _unexpected_load)
+    adapter = S2MelFeatureAdapter(cfg)
+
+    assert adapter.audio_vae is None
+    assert adapter.sample_rate_acoustic == 48000
+    assert adapter.acoustic_hop_size == 1920
+    assert adapter.acoustic_channels == 128
+
+
+def test_stored_only_mode_rejects_online_encode(monkeypatch, tmp_path) -> None:
+    _patch_sac(monkeypatch)
+    cfg = _vae_cfg(
+        in_channels=128,
+        stored_vae_latents_only=True,
+        tmp_path=tmp_path,
+    )
+    adapter = S2MelFeatureAdapter(cfg)
+
+    try:
+        adapter._encode_acoustic_waveforms([torch.randn(1, 48000)])
+    except RuntimeError as exc:
+        assert "stored_vae_latents_only" in str(exc)
+    else:
+        raise AssertionError("expected online AudioVAE fallback to be rejected")

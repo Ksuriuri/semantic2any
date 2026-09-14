@@ -22,8 +22,8 @@ vocoder:
   cache_dir: checkpoints/huggingface
   local_files_only: true
 data:
-  train_jsonl: /mnt/data_3t_1/datasets/preprocess/s2mel-train-data-v2/indextts25-codes/splits/seed1234_valid2000_spk_holdout_20260827/train.jsonl
-  valid_jsonl: /mnt/data_3t_1/datasets/preprocess/s2mel-train-data-v2/indextts25-codes/splits/seed1234_valid2000_spk_holdout_20260827/valid.jsonl
+  train_jsonl: /mnt/data_3t_2/datasets/preprocess/s2vae-train-data/indextts25-codes/splits/seed1234_valid2000_spk_holdout_20260828/train.jsonl
+  valid_jsonl: /mnt/data_3t_2/datasets/preprocess/s2vae-train-data/indextts25-codes/splits/seed1234_valid2000_spk_holdout_20260828/valid.jsonl
   train_speechdata_dir: ''
   valid_speechdata_dir: ''
   speechdata_cache_dir: .cache/speechdata
@@ -37,7 +37,7 @@ data:
   min_pair_prompt_seconds: 3.0
   min_prompt_seconds: 3.0
   max_prompt_seconds: 30.0
-  min_target_seconds: 0.5
+  min_target_seconds: 0.8
   max_target_seconds: 30.0
   # Never cut one utterance into prompt+target: a speaker with no second
   # utterance is dropped instead (3,010 of 4,700,519 train rows = 0.06%).
@@ -49,7 +49,7 @@ data:
   # Acoustic waveform rate for AudioVAE encode (25 Hz latent, hop 1920).
   sample_rate_vae: 48000
   extract_mel_in_worker: false
-  num_workers: 8
+  num_workers: 4
   prefetch_factor: 2
   decode_audio_in_worker: true
   skip_audio_errors: true
@@ -156,14 +156,27 @@ s2mel:
     style_condition: false
 train:
   output_dir: exp/s2vae_dit_indextts25
-  # Flow MSE only. Do not enable AUX_LOSS_TYPE / VOCODER_TRAIN — latents are not mel.
+  # AUX_LOSS_TYPE / VOCODER_TRAIN remain mel-only. This separate optional term
+  # decodes predicted/GT latents through the frozen AudioVAE and compares 12-24 kHz.
+  s2vae_hf_loss_weight: 0.0
+  s2vae_hf_cutoff_hz: 12000
+  s2vae_hf_n_fft: 2048
+  s2vae_hf_hop_length: 512
+  s2vae_hf_chunk_frames: 32
+  s2vae_hf_min_chunk_frames: 16
+  s2vae_hf_max_samples: 4
+  s2vae_hf_t_min: 0.5
+  s2vae_hf_t_power: 2.0
+  s2vae_hf_linear_weight: 0.1
+  s2vae_hf_checkpoint: true
   batch_size: 40
-  epochs: 6
-  max_steps: 150000
+  epochs: 8
+  max_steps: 0
+  scheduler_max_steps: 129942
   grad_accumulation: 1
   find_unused_parameters: true
   learning_rate: 2.0e-04
-  min_learning_rate: 6.0e-05
+  min_learning_rate: 5.0e-05
   lr_scheduler: cosine
   weight_decay: 0.01
   warmup_steps: 2000
@@ -174,10 +187,10 @@ train:
   save_interval: 2000
   archive_save_interval: 20000
   keep_last: 6
-  fresh_lr_schedule: true
+  fresh_lr_schedule: false
   resume_from: ""
   no_wandb: false
   wandb_entity: haoyuanhuang22-jcxy
   wandb_project: semantic2mel
-  wandb_run_name: s2vae-dit-indextts25-b40-2e4
-  wandb_run_id: hf4zm6sy
+  wandb_run_name: s2vae-dit-indextts25-disk2-2e4-5e5
+  wandb_run_id: 8f3mwciz

@@ -32,10 +32,19 @@ from semantic2any.data.s2mel_dataset import (
     S2MelJsonlDataset,
     S2MelSpeakerPairedDataset,
     S2MelSpeechDataDataset,
+    _record_dataset_name,
+    warmup_vae_indexes,
 )
+from semantic2any.losses.s2vae_decoder_feature import S2VAEDecoderFeatureLoss
 from semantic2any.models import Semantic2MelModel
+from semantic2any.losses.s2vae_highfreq import (
+    S2VAEBreathAwareLoss,
+    S2VAEHighFrequencyLoss,
+)
 from semantic2any.utils.checkpoint import load_compatible_checkpoint, save_compatible_checkpoint
 from semantic2any.utils.dots_audiovae import (
+    DotsAudioVAE,
+    resolve_dots_tts_dir,
     EXPECTED_HOP_SIZE,
     EXPECTED_SAMPLE_RATE,
     is_vae_latent_target,
@@ -296,13 +305,23 @@ def _dataset_length_estimates(dataset: Dataset) -> list[float]:
 
 
 
-def _compute_dataset_sample_weights(dataset: Dataset, dataset_weights: dict[str, float]) -> list[float] | None:
-    """Return per-sample weights derived from dataset_weights config, or None if not configured."""
-    if not dataset_weights:
+def _compute_dataset_sample_weights(
+    dataset: Dataset,
+    dataset_weights: dict[str, float],
+    component_weights: dict[str, float] | None = None,
+) -> list[float] | None:
+    """Return per-sample retention weights for dataset/component mixtures."""
+    component_weights = component_weights or {}
+    if not dataset_weights and not component_weights:
         return None
     records = getattr(dataset, "records", None)
     if not isinstance(records, list) or len(records) != len(dataset):
-        return None
+        target_records = getattr(dataset, "target_records", None)
+        target_indices = getattr(dataset, "target_indices", None)
+        if isinstance(target_records, list) and isinstance(target_indices, list):
+            records = [target_records[index] for index in target_indices]
+        if not isinstance(records, list) or len(records) != len(dataset):
+            return None
     weights = []
     for record in records:
         dataset_name = _record_dataset_name(record) if isinstance(record, dict) else ""
@@ -312,6 +331,12 @@ def _compute_dataset_sample_weights(dataset: Dataset, dataset_weights: dict[str,
             if dataset_name == key or dataset_name.startswith(key + "__") or dataset_name.startswith(key + "/"):
                 w = float(val)
                 break
+        if isinstance(record, dict):
+            component = str(record.get("finetune_component") or "")
+            if component in component_weights:
+                w *= float(component_weights[component])
+        if not 0.0 <= w <= 1.0:
+            raise ValueError(f"sample retention weight must be in [0, 1], got {w}")
         weights.append(w)
     return weights
 def _set_loader_epoch(loader: DataLoader, epoch: int) -> None:
@@ -374,6 +399,9 @@ def make_dataloader(
         min_pair_prompt_seconds=float(_get(cfg.data, "min_pair_prompt_seconds", 3.0)),
         decode_audio_in_worker=bool(_get(cfg.data, "decode_audio_in_worker", False)),
         skip_audio_errors=bool(_get(cfg.data, "skip_audio_errors", False)),
+        require_stored_vae_latents=bool(
+            _get(cfg.data, "stored_vae_latents_only", False)
+        ),
         max_audio_seconds=_optional_float(
             _get(cfg.data, "max_audio_seconds", DEFAULT_MAX_AUDIO_SECONDS)
         ),
@@ -410,7 +438,13 @@ def make_dataloader(
             for value in _get(cfg.data, "length_bucket_boundaries", (8, 12, 16, 20, 24, 28, 32, 40, 50))
         ]
         _raw_dataset_weights = _get(cfg.data, "dataset_weights", {}) or {}
-        _sample_weights = _compute_dataset_sample_weights(dataset, dict(_raw_dataset_weights)) if shuffle else None
+        _raw_component_weights = _get(cfg.data, "component_weights", {}) or {}
+        _sample_weights = (
+            _compute_dataset_sample_weights(
+                dataset, dict(_raw_dataset_weights), dict(_raw_component_weights)
+            )
+            if shuffle else None
+        )
         batch_sampler = LengthBucketBatchSampler(
             _dataset_length_estimates(dataset),
             batch_size=int(cfg.train.batch_size),
@@ -760,6 +794,17 @@ def _build_training_batch_impl(
             ),
         ).to(accelerator.device)
         feature_adapter_ref[0].eval()
+        if bool(_get(cfg.data, "stored_vae_latents_only", False)):
+            if feature_adapter_ref[0].audio_vae is not None:
+                raise RuntimeError(
+                    "stored_vae_latents_only invariant violated: AudioVAE was loaded"
+                )
+            if accelerator.is_main_process:
+                print(
+                    "[AudioVAE] encoder/decoder disabled; stored latents only, "
+                    "online fallback forbidden",
+                    flush=True,
+                )
     elif has_semantic_codes:
         decoder = feature_adapter_ref[0].semantic_decoder
         if decoder is None:
@@ -1065,6 +1110,54 @@ def forward_loss(model, batch: dict[str, torch.Tensor]) -> torch.Tensor:
     return loss
 
 
+def forward_loss_with_vae_hf(
+    model,
+    batch: dict[str, torch.Tensor],
+    loss_module: S2VAEHighFrequencyLoss,
+    audio_vae,
+    weight: float,
+) -> torch.Tensor:
+    flow_loss, x1_hat = model(
+        batch["mel"],
+        batch["mel_lens"],
+        batch["prompt_lens"],
+        batch["semantic"],
+        batch["style"],
+        semantic_is_mu=False,
+        semantic_lens=batch.get("semantic_lens"),
+        prompt_semantic_lens=batch.get("prompt_semantic_lens"),
+    )
+    if x1_hat is None:
+        raise RuntimeError("S2VAE high-frequency loss requires the CFM x1 estimate")
+    times = getattr(_cfm_module(model), "last_time", None)
+    if times is None:
+        raise RuntimeError("CFM did not expose its sampled timesteps for S2VAE HF loss")
+    hf_loss = loss_module(
+        x1_hat,
+        batch["mel"],
+        batch["mel_lens"],
+        batch["prompt_lens"],
+        times,
+        lambda latent: audio_vae.decode_differentiable(latent, normalized=True),
+    )
+    loss_module.last_flow = flow_loss.detach()
+    return flow_loss + float(weight) * hf_loss
+
+
+def forward_loss_with_vae_feature(model, batch, loss_module, audio_vae, weight):
+    flow, predicted = model(
+        batch["mel"], batch["mel_lens"], batch["prompt_lens"],
+        batch["semantic"], batch["style"], semantic_is_mu=False,
+        semantic_lens=batch.get("semantic_lens"),
+        prompt_semantic_lens=batch.get("prompt_semantic_lens"),
+    )
+    times = _cfm_module(model).last_time
+    feature = loss_module(predicted, batch["mel"], batch["mel_lens"],
+                          batch["prompt_lens"], times, audio_vae)
+    loss_module.last_flow = flow.detach()
+    return flow + float(weight) * feature
+
+
 @torch.no_grad()
 def validate(model, loader, cfg, accelerator: Accelerator, feature_adapter_ref) -> float:
     """Deterministic validation: fixed RNG so t / noise / prompt lengths are
@@ -1215,6 +1308,7 @@ def main() -> None:
     valid_dataset = (
         make_source_dataset(cfg, valid_source, speechdata=valid_is_speechdata) if valid_source else None
     )
+    preloaded_feature_adapter: S2MelFeatureAdapter | None = None
     if bool(_get(cfg.data, "preload_features", False)):
         if accelerator.is_main_process:
             print(
@@ -1237,7 +1331,13 @@ def main() -> None:
                 adapter=preload_adapter,
                 accelerator=accelerator,
             )
-        del preload_adapter
+        # Decoded S2VAE losses still need the frozen AudioVAE decoder after
+        # feature preloading. Keep this one adapter alive only for those runs;
+        # flow-only preloads can release it as before.
+        if float(_get(cfg.train, "s2vae_hf_loss_weight", 0.0)) > 0.0:
+            preloaded_feature_adapter = preload_adapter
+        else:
+            del preload_adapter
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1270,6 +1370,14 @@ def main() -> None:
                     f"missing-speaker={valid_dataset.missing_speaker_count}, "
                     f"missing-duration={valid_dataset.missing_duration_count}"
                 )
+
+    _warm_records = getattr(train_dataset, "target_records", None) or getattr(
+        train_dataset, "records", None
+    )
+    if _warm_records:
+        _warm_n = warmup_vae_indexes(_warm_records)
+        if accelerator.is_main_process:
+            print(f"[VAEIndex] warmed {_warm_n} shard jsonl indexes before fork", flush=True)
 
     train_loader = make_dataloader(
         cfg,
@@ -1351,7 +1459,7 @@ def main() -> None:
     _base_lr = float(_get(_sched_train, "learning_rate", cfg.train.learning_rate))
     _min_lr = float(_get(_sched_train, "min_learning_rate", _get(cfg.train, "min_learning_rate", 1.0e-5)))
     _warmup_steps = int(_get(_sched_train, "warmup_steps", cfg.train.warmup_steps))
-    _max_steps_sched = int(_get(_sched_train, "max_steps", cfg.train.max_steps))
+    _max_steps_sched = int(_get(_sched_train, "scheduler_max_steps", _get(_sched_train, "max_steps", cfg.train.max_steps)))
     if _base_lr <= 0.0:
         raise ValueError(f"learning_rate must be positive, got {_base_lr}")
     if not 0.0 <= _min_lr <= _base_lr:
@@ -1365,7 +1473,13 @@ def main() -> None:
         weight_decay=float(cfg.train.weight_decay),
     )
     updates_per_epoch = math.ceil(len(train_loader) / int(cfg.train.grad_accumulation))
-    total_steps = int(_max_steps_sched) if int(_max_steps_sched) > 0 else int(cfg.train.epochs) * updates_per_epoch
+    _scheduler_epochs = int(_get(_sched_train, "scheduler_epochs", cfg.train.epochs))
+    if _max_steps_sched <= 0 and _scheduler_epochs < 1:
+        raise ValueError("scheduler_epochs must be positive when scheduler_max_steps is unset")
+    total_steps = int(_max_steps_sched) if int(_max_steps_sched) > 0 else _scheduler_epochs * updates_per_epoch
+    if accelerator.is_main_process:
+        print(f"[LR] schedule_updates={total_steps}, updates_per_epoch={updates_per_epoch}, "
+              f"base={_base_lr:.3e}, min={_min_lr:.3e}, fresh={_fresh_lr}", flush=True)
     # AcceleratedScheduler ticks the LR schedule num_processes times per optimizer step
     # (when split_batches=False, which is the default). Scale num_training_steps and
     # warmup_steps accordingly so the cosine period matches the intended optimizer steps.
@@ -1412,9 +1526,25 @@ def main() -> None:
     # consume ALL of its local batches; cross-rank batch sharding would drop
     # 7/8 of the data per epoch.
 
+    # A directory resume normally restores the scheduler together with model,
+    # optimizer and RNG.  Keep a copy of the freshly-created schedule when the
+    # live config explicitly requests a restart so we can restore optimizer
+    # moments without silently inheriting the old LR position.
+    _fresh_resume_scheduler_state = None
+    _fresh_resume_lrs = None
+    if resume_path is not None and resume_path.is_dir() and _fresh_lr:
+        _fresh_resume_scheduler_state = scheduler.state_dict()
+        _fresh_resume_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+
     if resume_path is not None and resume_path.is_dir():
         start_epoch, global_step, resume_epoch_step = load_training_resume_state(resume_path)
         accelerator.load_state(str(resume_path))
+        if _fresh_resume_scheduler_state is not None:
+            scheduler.load_state_dict(_fresh_resume_scheduler_state)
+            for group, lr in zip(
+                optimizer.param_groups, _fresh_resume_lrs, strict=True
+            ):
+                group["lr"] = lr
         if args.resume_epoch_step is not None:
             resume_epoch_step = args.resume_epoch_step
         if accelerator.is_main_process:
@@ -1422,6 +1552,12 @@ def main() -> None:
                 f"[Resume] Loaded accelerator state {resume_path} "
                 f"at epoch={start_epoch + 1} step={global_step} epoch_step={resume_epoch_step}"
             )
+            if _fresh_resume_scheduler_state is not None:
+                print(
+                    "[Resume] fresh_lr_schedule=True: kept optimizer moments "
+                    f"and reset scheduler/LR to {optimizer.param_groups[0]['lr']:.3e}",
+                    flush=True,
+                )
 
     if _dit_type(cfg) == "DiT":
         accelerator.unwrap_model(model).models["cfm"].setup_estimator_caches(
@@ -1429,22 +1565,117 @@ def main() -> None:
             max_seq_length=int(cfg.s2mel.DiT.block_size),
         )
 
-    feature_adapter_ref: list[S2MelFeatureAdapter | None] = [None]
+    feature_adapter_ref: list[S2MelFeatureAdapter | None] = [
+        preloaded_feature_adapter
+    ]
     use_async_features = async_feature_extraction_enabled(cfg, accelerator)
     if accelerator.is_main_process and use_async_features:
         print("[Feature] Asynchronous extraction enabled (one batch ahead)")
     model.train()
     last_saved_step = global_step
     vae_target = is_vae_latent_target(cfg)
+    vae_feature_loss = None
+    vae_feature_decoder = None
+    vae_feature_weight = float(_get(cfg.train, "s2vae_feature_loss_weight", 0.0))
+    if vae_feature_weight < 0.0:
+        raise ValueError("s2vae_feature_loss_weight must be non-negative")
+    if vae_feature_weight > 0.0:
+        if not vae_target:
+            raise ValueError("decoder feature loss requires target.type=vae_latent")
+        if float(_get(cfg.train, "s2vae_hf_loss_weight", 0.0)) > 0.0:
+            raise ValueError("this feature-only experiment requires s2vae_hf_loss_weight=0")
+        # Separate decoder preserves the stored-only collator/adapter invariant:
+        # missing cached latents still fail, and no online encoder fallback exists.
+        vae_feature_decoder = DotsAudioVAE.from_pretrained(
+            resolve_dots_tts_dir(cfg), map_location=accelerator.device
+        )
+        vae_feature_loss = S2VAEDecoderFeatureLoss(
+            layers=tuple(_get(cfg.train, "s2vae_feature_layers", (2, 3, 4, 5))),
+            weights=tuple(_get(cfg.train, "s2vae_feature_layer_weights", (.15, .25, .35, .25))),
+            chunk_frames=int(_get(cfg.train, "s2vae_feature_chunk_frames", 32)),
+            max_samples=int(_get(cfg.train, "s2vae_feature_max_samples", 2)),
+            eps=float(_get(cfg.train, "s2vae_feature_eps", 1e-4)),
+            use_checkpoint=bool(_get(cfg.train, "s2vae_feature_checkpoint", True)),
+            full_batch_full_length=bool(_get(cfg.train, "s2vae_feature_full_batch_full_length", False)),
+            all_batch_random_crop=bool(_get(cfg.train, "s2vae_feature_all_batch_random_crop", False)),
+            context_frames=int(_get(cfg.train, "s2vae_feature_context_frames", 16)),
+            micro_batch_size=int(_get(cfg.train, "s2vae_feature_micro_batch_size", 1)),
+        ).to(accelerator.device)
+        if accelerator.is_main_process:
+            print(vae_feature_loss.describe(), flush=True)
+            print(f"[Loss] feature weight={vae_feature_weight:g}", flush=True)
+    vae_hf_loss = None
+    vae_hf_weight = float(_get(cfg.train, "s2vae_hf_loss_weight", 0.0))
+    vae_hf_mode = str(_get(cfg.train, "s2vae_hf_mode", "magnitude"))
     if vae_target:
         if _VOCODER_TRAIN:
             raise ValueError(
                 "VOCODER_TRAIN=1 is incompatible with target.type=vae_latent"
             )
+        if vae_hf_weight > 0.0 and vae_hf_mode == "breath_aware":
+            vae_hf_loss = S2VAEBreathAwareLoss(
+                sample_rate=int(_get(cfg.data, "sample_rate_vae", EXPECTED_SAMPLE_RATE)),
+                band_low_hz=float(_get(cfg.train, "s2vae_breath_band_low_hz", 4000.0)),
+                band_high_hz=float(_get(cfg.train, "s2vae_breath_band_high_hz", 18000.0)),
+                n_ffts=tuple(_get(cfg.train, "s2vae_breath_n_ffts", (512, 1024, 2048))),
+                hop_ratio=int(_get(cfg.train, "s2vae_breath_hop_ratio", 4)),
+                chunk_frames=int(_get(cfg.train, "s2vae_hf_chunk_frames", 64)),
+                min_chunk_frames=int(_get(cfg.train, "s2vae_hf_min_chunk_frames", 32)),
+                max_samples=int(_get(cfg.train, "s2vae_hf_max_samples", 4)),
+                t_min=float(_get(cfg.train, "s2vae_hf_t_min", 0.5)),
+                t_power=float(_get(cfg.train, "s2vae_hf_t_power", 2.0)),
+                breath_boost=float(_get(cfg.train, "s2vae_breath_boost", 4.0)),
+                linear_weight=float(_get(cfg.train, "s2vae_hf_linear_weight", 0.1)),
+                periodicity_weight=float(
+                    _get(cfg.train, "s2vae_breath_periodicity_weight", 0.25)
+                ),
+                flatness_weight=float(
+                    _get(cfg.train, "s2vae_breath_flatness_weight", 0.25)
+                ),
+                excess_band_weight=float(
+                    _get(cfg.train, "s2vae_breath_excess_band_weight", 0.5)
+                ),
+                excess_start_hz=float(
+                    _get(cfg.train, "s2vae_breath_excess_start_hz", 12000.0)
+                ),
+                bandwidth_floor_db=float(
+                    _get(cfg.train, "s2vae_breath_bandwidth_floor_db", -35.0)
+                ),
+                excess_margin_db=float(
+                    _get(cfg.train, "s2vae_breath_excess_margin_db", 3.0)
+                ),
+                use_checkpoint=bool(_get(cfg.train, "s2vae_hf_checkpoint", True)),
+            ).to(accelerator.device)
+        elif vae_hf_weight > 0.0 and vae_hf_mode == "magnitude":
+            vae_hf_loss = S2VAEHighFrequencyLoss(
+                sample_rate=int(_get(cfg.data, "sample_rate_vae", EXPECTED_SAMPLE_RATE)),
+                cutoff_hz=float(_get(cfg.train, "s2vae_hf_cutoff_hz", 12000.0)),
+                n_fft=int(_get(cfg.train, "s2vae_hf_n_fft", 2048)),
+                hop_length=int(_get(cfg.train, "s2vae_hf_hop_length", 512)),
+                chunk_frames=int(_get(cfg.train, "s2vae_hf_chunk_frames", 32)),
+                min_chunk_frames=int(_get(cfg.train, "s2vae_hf_min_chunk_frames", 16)),
+                max_samples=int(_get(cfg.train, "s2vae_hf_max_samples", 4)),
+                t_min=float(_get(cfg.train, "s2vae_hf_t_min", 0.5)),
+                t_power=float(_get(cfg.train, "s2vae_hf_t_power", 2.0)),
+                linear_weight=float(_get(cfg.train, "s2vae_hf_linear_weight", 0.1)),
+                use_checkpoint=bool(_get(cfg.train, "s2vae_hf_checkpoint", True)),
+            ).to(accelerator.device)
+        elif vae_hf_weight > 0.0:
+            raise ValueError(
+                "train.s2vae_hf_mode must be 'magnitude' or 'breath_aware', "
+                f"got {vae_hf_mode!r}"
+            )
         if accelerator.is_main_process:
             print(
-                "[Loss] target.type=vae_latent: flow MSE only; skipping vocoder/aux"
+                "[Loss] target.type=vae_latent: flow MSE"
+                + (
+                    f" + {vae_hf_weight:g} * decoded {vae_hf_mode} loss"
+                    if vae_hf_loss is not None
+                    else (" + decoder feature loss" if vae_feature_loss is not None else " only; decoded high-frequency loss is off")
+                )
             )
+            if vae_hf_loss is not None:
+                print(vae_hf_loss.describe(), flush=True)
     elif _AUX_LOSS_TYPE:
         _init_aux_loss(
             cfg,
@@ -1473,6 +1704,7 @@ def main() -> None:
                 "(old .pth had no epoch_step)"
             )
 
+    first_training_step = global_step + 1
     for epoch in range(start_epoch, int(cfg.train.epochs)):
         if int(cfg.train.max_steps) > 0 and global_step >= int(cfg.train.max_steps):
             break
@@ -1567,6 +1799,21 @@ def main() -> None:
                     _set_global_step(global_step)
                     if train_batch is None:
                         loss = torch.tensor(float("nan"), device=accelerator.device)
+                    elif vae_feature_loss is not None:
+                        loss = forward_loss_with_vae_feature(
+                            model, train_batch, vae_feature_loss,
+                            vae_feature_decoder, vae_feature_weight,
+                        )
+                    elif vae_hf_loss is not None:
+                        adapter = feature_adapter_ref[0]
+                        audio_vae = None if adapter is None else adapter.audio_vae
+                        if audio_vae is None:
+                            raise RuntimeError(
+                                "S2VAE HF loss is enabled but the feature adapter has no AudioVAE"
+                            )
+                        loss = forward_loss_with_vae_hf(
+                            model, train_batch, vae_hf_loss, audio_vae, vae_hf_weight
+                        )
                     elif _AUX_LOSS_TYPE and not vae_target:
                         loss = forward_loss_with_aux(model, train_batch)
                     else:
@@ -1666,15 +1913,31 @@ def main() -> None:
                 if accelerator.sync_gradients:
                     global_step += 1
                     epoch_step += 1
-                    if global_step % int(cfg.train.log_interval) == 0:
+                    if (global_step % int(cfg.train.log_interval) == 0
+                            or (vae_feature_loss is not None
+                                and (vae_feature_loss.full_batch_full_length
+                                     or vae_feature_loss.all_batch_random_crop)
+                                and global_step == first_training_step)):
                         reduced_loss = accelerator.gather_for_metrics(loss.detach()).mean().item()
                         lr = scheduler.get_last_lr()[0]
                         # Fractional completed epochs, e.g. 1.0 == first epoch done.
                         epoch_progress = epoch + min(1.0, epoch_step / steps_per_epoch)
                         if accelerator.is_main_process:
+                            hf_suffix = ""
+                            if vae_feature_loss is not None and vae_feature_loss.last_components:
+                                hf_suffix = (
+                                    f" flow={float(vae_feature_loss.last_flow):.5f}"
+                                    f" feature={float(vae_feature_loss.last_components['total']):.5f}"
+                                )
+                            if vae_hf_loss is not None and vae_hf_loss.last_components:
+                                hf_suffix = (
+                                    f" flow={float(vae_hf_loss.last_flow):.5f}"
+                                    f" hf={float(vae_hf_loss.last_components['total']):.5f}"
+                                    f" hf_n={float(vae_hf_loss.last_components['samples']):.0f}"
+                                )
                             print(
                                 f"[Train] epoch={epoch + 1} step={global_step} "
-                                f"loss={reduced_loss:.5f} lr={lr:.3e}"
+                                f"loss={reduced_loss:.5f} lr={lr:.3e}{hf_suffix}"
                             )
                         log_payload = {
                             "train/loss": reduced_loss,
@@ -1683,6 +1946,15 @@ def main() -> None:
                         }
                         # Collective (gather) — every rank must reach this.
                         log_payload.update(_aux_metrics_for_log(accelerator))
+                        log_payload.update(
+                            _vae_hf_metrics_for_log(accelerator, vae_hf_loss)
+                        )
+                        log_payload.update(
+                            _vae_hf_metrics_for_log(
+                                accelerator, vae_feature_loss,
+                                prefix="s2vae_feature", weight=vae_feature_weight,
+                            )
+                        )
                         accelerator.log(log_payload, step=global_step)
 
                     if valid_loader is not None and global_step % int(cfg.train.valid_interval) == 0:
@@ -2231,6 +2503,28 @@ def _aux_metrics_for_log(accelerator):
     )
     gathered = accelerator.gather(values.unsqueeze(0)).reshape(-1, len(keys)).mean(dim=0)
     return {f"train/{key}": float(value) for key, value in zip(keys, gathered)}
+
+
+def _vae_hf_metrics_for_log(accelerator, loss_module, prefix="s2vae_hf", weight=None):
+    """Cross-rank raw metrics and optional weighted contribution for W&B."""
+    if loss_module is None or not loss_module.last_components:
+        return {}
+    keys = ["flow", *loss_module.component_keys]
+    zero = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+    values = [getattr(loss_module, "last_flow", zero)]
+    values.extend(loss_module.last_components.get(key, zero) for key in loss_module.component_keys)
+    packed = torch.stack([value.detach().float().reshape(()) for value in values])
+    gathered = accelerator.gather(packed.unsqueeze(0)).reshape(-1, len(keys)).mean(dim=0)
+    metrics = {
+        ("train/flow" if key == "flow" else f"train/{prefix}/{key}"): float(value)
+        for key, value in zip(keys, gathered)
+    }
+    if weight is not None:
+        metrics[f"train/{prefix}/weight"] = float(weight)
+        metrics[f"train/{prefix}/weighted"] = (
+            float(weight) * metrics[f"train/{prefix}/total"]
+        )
+    return metrics
 # --- end auxiliary loss support ------------------------------------------------
 if __name__ == "__main__":
     main()

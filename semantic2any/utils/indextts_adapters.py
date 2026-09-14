@@ -35,6 +35,9 @@ from semantic2any.third_party.indextts import (
 )
 from semantic2any.utils.dots_audiovae import (
     DotsAudioVAE,
+    EXPECTED_HOP_SIZE,
+    EXPECTED_LATENT_DIM,
+    EXPECTED_SAMPLE_RATE,
     is_vae_latent_target,
     resolve_dots_tts_dir,
 )
@@ -268,6 +271,9 @@ class S2MelFeatureAdapter(nn.Module):
 
         self.target_type = "vae_latent" if is_vae_latent_target(cfg) else "mel"
         self.audio_vae: DotsAudioVAE | None = None
+        self.stored_vae_latents_only = bool(
+            _get(data_cfg, "stored_vae_latents_only", False)
+        )
         if self.target_type == "vae_latent":
             if bool(_get(data_cfg, "extract_mel_in_worker", False)):
                 raise ValueError(
@@ -275,19 +281,51 @@ class S2MelFeatureAdapter(nn.Module):
                     "target.type=vae_latent; AudioVAE encoding must run on the "
                     "training device"
                 )
-            self.audio_vae = audio_vae or DotsAudioVAE.from_pretrained(
-                resolve_dots_tts_dir(cfg)
-            )
-            self.sample_rate_acoustic = int(
-                _get(data_cfg, "sample_rate_vae", self.audio_vae.sample_rate)
-            )
-            if self.sample_rate_acoustic != int(self.audio_vae.sample_rate):
-                raise ValueError(
-                    "data.sample_rate_vae must match the AudioVAE sample rate "
-                    f"({self.sample_rate_acoustic} != {self.audio_vae.sample_rate})"
+            if self.stored_vae_latents_only:
+                if audio_vae is not None:
+                    raise ValueError(
+                        "audio_vae must not be passed when "
+                        "data.stored_vae_latents_only=true"
+                    )
+                self.sample_rate_acoustic = int(
+                    _get(data_cfg, "sample_rate_vae", EXPECTED_SAMPLE_RATE)
                 )
-            self.acoustic_hop_size = int(self.audio_vae.hop_size)
-            self.acoustic_channels = int(self.audio_vae.latent_dim)
+                self.acoustic_hop_size = int(
+                    _get(data_cfg, "vae_hop_size", EXPECTED_HOP_SIZE)
+                )
+                self.acoustic_channels = int(
+                    _get(data_cfg, "vae_latent_dim", EXPECTED_LATENT_DIM)
+                )
+                expected_contract = (
+                    EXPECTED_SAMPLE_RATE,
+                    EXPECTED_HOP_SIZE,
+                    EXPECTED_LATENT_DIM,
+                )
+                live_contract = (
+                    self.sample_rate_acoustic,
+                    self.acoustic_hop_size,
+                    self.acoustic_channels,
+                )
+                if live_contract != expected_contract:
+                    raise ValueError(
+                        "Stored dots.tts latents require sample_rate_vae="
+                        f"{EXPECTED_SAMPLE_RATE}, vae_hop_size={EXPECTED_HOP_SIZE}, "
+                        f"vae_latent_dim={EXPECTED_LATENT_DIM}; got {live_contract}"
+                    )
+            else:
+                self.audio_vae = audio_vae or DotsAudioVAE.from_pretrained(
+                    resolve_dots_tts_dir(cfg)
+                )
+                self.sample_rate_acoustic = int(
+                    _get(data_cfg, "sample_rate_vae", self.audio_vae.sample_rate)
+                )
+                if self.sample_rate_acoustic != int(self.audio_vae.sample_rate):
+                    raise ValueError(
+                        "data.sample_rate_vae must match the AudioVAE sample rate "
+                        f"({self.sample_rate_acoustic} != {self.audio_vae.sample_rate})"
+                    )
+                self.acoustic_hop_size = int(self.audio_vae.hop_size)
+                self.acoustic_channels = int(self.audio_vae.latent_dim)
             # Keep the legacy name pointing at the acoustic rate so leftover
             # collate math cannot silently use the unused mel hop.
             self.sample_rate_mel = self.sample_rate_acoustic
@@ -619,6 +657,12 @@ class S2MelFeatureAdapter(nn.Module):
         if not waveforms:
             return []
         if self.audio_vae is None:
+            if self.target_type == "vae_latent":
+                raise RuntimeError(
+                    "AudioVAE loading is disabled by "
+                    "data.stored_vae_latents_only=true; this batch must provide "
+                    "precomputed prompt and target VAE latents"
+                )
             if batched and self.mel_spectrogram is mel_spectrogram:
                 return mel_spectrogram_batch(
                     waveforms,
@@ -925,7 +969,7 @@ class S2MelFeatureAdapter(nn.Module):
 
 
     def _latent_frame_rate(self) -> float:
-        hop = int(getattr(self.audio_vae, "hop_length", 1920) or 1920) if self.audio_vae is not None else 1920
+        hop = int(getattr(self, "acoustic_hop_size", EXPECTED_HOP_SIZE))
         rate = int(getattr(self, "sample_rate_acoustic", 48000) or 48000)
         return float(rate) / float(hop)
 
@@ -1106,6 +1150,12 @@ class S2MelFeatureAdapter(nn.Module):
                 target_semantic_code_lens=target_semantic_code_lens,
                 singleton_splits=singleton_splits,
                 batch_size=batch_size,
+            )
+        if getattr(self, "stored_vae_latents_only", False):
+            raise RuntimeError(
+                "data.stored_vae_latents_only=true but this batch does not "
+                "contain complete precomputed prompt/target VAE latents; "
+                "online AudioVAE fallback is disabled"
             )
         prompt_sources, prompt_rates = self._prepare_audio_batch(
             prompt_audio_paths,

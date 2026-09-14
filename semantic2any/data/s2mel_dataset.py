@@ -8,7 +8,7 @@ import random
 import shutil
 import tarfile
 import warnings
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +28,7 @@ DEFAULT_MAX_PAIR_SECONDS = 50.0
 DEFAULT_MAX_PROMPT_SECONDS = 20.0
 DEFAULT_PROMPT_BANDWIDTH_AUG_PROB = 0.3
 DEFAULT_PROMPT_BANDWIDTH_AUG_RATES = (16000, 22050)
-_SEMANTIC_CODE_MEMMAPS: dict[str, np.memmap] = {}
+_SEMANTIC_CODE_MEMMAPS: OrderedDict[str, np.memmap] = OrderedDict()
 # Joint BigVGAN training needs the real target audio, not just its mel.  Read
 # from the environment rather than the config because dataloader workers are
 # forked before any config is handed to them, and inherit the environment.
@@ -55,10 +55,12 @@ def _load_semantic_codes(record: dict[str, Any]) -> torch.Tensor:
         raise ValueError(
             f"Invalid semantic code range offset={offset}, length={length}: {path}"
         )
-    mmap = _SEMANTIC_CODE_MEMMAPS.get(path)
-    if mmap is None:
-        mmap = np.memmap(path, mode="r", dtype="<u2")
-        _SEMANTIC_CODE_MEMMAPS[path] = mmap
+    mmap = _lru_get(
+        _SEMANTIC_CODE_MEMMAPS,
+        path,
+        64,
+        lambda: np.memmap(path, mode="r", dtype="<u2"),
+    )
     end = offset + length
     if end > mmap.size:
         raise ValueError(
@@ -66,8 +68,8 @@ def _load_semantic_codes(record: dict[str, Any]) -> torch.Tensor:
         )
     return torch.from_numpy(np.array(mmap[offset:end], dtype=np.int64, copy=True))
 
-_VAE_LATENT_JSONL_CACHE: dict[str, dict[str, tuple[int, int]]] = {}
-_VAE_LATENT_MEMMAPS: dict[str, np.memmap] = {}
+_VAE_LATENT_JSONL_CACHE: OrderedDict[str, dict[str, tuple[int, int]]] = OrderedDict()
+_VAE_LATENT_MEMMAPS: OrderedDict[str, np.memmap] = OrderedDict()
 
 
 def _vae_paths_from_code_path(code_path: str) -> tuple[Path, Path] | None:
@@ -104,8 +106,24 @@ def _vae_index(jsonl_path: Path) -> dict[str, tuple[int, int]]:
                 length = row.get("vae_latent_length")
                 if isinstance(rid, str) and offset is not None and length:
                     mapping[rid] = (int(offset), int(length))
-    _VAE_LATENT_JSONL_CACHE[key] = mapping
+    _lru_put(_VAE_LATENT_JSONL_CACHE, key, mapping, 256)
     return mapping
+
+
+def _lru_put(cache: OrderedDict[str, Any], key: str, value: Any, maxsize: int) -> Any:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > maxsize:
+        cache.popitem(last=False)
+    return value
+
+
+def _lru_get(cache: OrderedDict[str, Any], key: str, maxsize: int, factory):
+    item = cache.get(key)
+    if item is not None:
+        cache.move_to_end(key)
+        return item
+    return _lru_put(cache, key, factory(), maxsize)
 
 
 def _load_vae_latent(record: dict[str, Any]) -> torch.Tensor | None:
@@ -117,22 +135,46 @@ def _load_vae_latent(record: dict[str, Any]) -> torch.Tensor | None:
     if paths is None:
         return None
     bin_path, jsonl_path = paths
-    if not bin_path.is_file() or not jsonl_path.is_file():
+    offset = record.get("vae_latent_offset")
+    length = record.get("vae_latent_length")
+    if not (isinstance(offset, int) and isinstance(length, int) and length > 0):
+        if not bin_path.is_file() or not jsonl_path.is_file():
+            return None
+        loc = _vae_index(jsonl_path).get(record_id)
+        if loc is None:
+            return None
+        offset, length = loc
+    elif not bin_path.is_file():
         return None
-    loc = _vae_index(jsonl_path).get(record_id)
-    if loc is None:
-        return None
-    offset, length = loc
-    mmap = _VAE_LATENT_MEMMAPS.get(str(bin_path))
-    if mmap is None:
-        mmap = np.memmap(bin_path, mode="r", dtype="<f2")
-        _VAE_LATENT_MEMMAPS[str(bin_path)] = mmap
-    start = offset * 128
-    end = start + length * 128
+    mmap = _lru_get(
+        _VAE_LATENT_MEMMAPS,
+        str(bin_path),
+        64,
+        lambda: np.memmap(bin_path, mode="r", dtype="<f2"),
+    )
+    start = int(offset) * 128
+    end = start + int(length) * 128
     if end > mmap.size:
         return None
-    frames = np.array(mmap[start:end], dtype=np.float32).reshape(length, 128)
+    frames = np.array(mmap[start:end], dtype=np.float32).reshape(int(length), 128)
     return torch.from_numpy(np.ascontiguousarray(frames.T))
+
+
+def warmup_vae_indexes(records: list[dict[str, Any]]) -> int:
+    """Parse shard jsonl indexes in the parent before DataLoader fork."""
+    seen: set[str] = set()
+    for record in records:
+        if record.get("vae_latent_offset") is not None and record.get("vae_latent_length"):
+            continue
+        paths = _vae_paths_from_code_path(str(record.get("semantic_code_path") or ""))
+        if paths is None:
+            continue
+        key = str(paths[1])
+        if key in seen:
+            continue
+        seen.add(key)
+        _vae_index(paths[1])
+    return len(seen)
 
 
 def _stored_pair_usable(
@@ -352,6 +394,9 @@ class S2MelJsonlDataset(Dataset):
         "semantic_fps",
         "semantic_codebooks",
         "semantic_max_audio_seconds",
+        "vae_latent_offset",
+        "vae_latent_length",
+        "finetune_component",
     )
 
     # These values repeat across millions of rows (one lookup table and
@@ -367,6 +412,7 @@ class S2MelJsonlDataset(Dataset):
         "semantic_codec",
         "semantic_fingerprint",
         "_manifest_path",
+        "finetune_component",
     )
 
     def __init__(
@@ -1146,6 +1192,7 @@ class S2MelCollator:
         min_pair_prompt_seconds: float = 3.0,
         decode_audio_in_worker: bool = False,
         skip_audio_errors: bool = False,
+        require_stored_vae_latents: bool = False,
         max_audio_seconds: float | None = DEFAULT_MAX_AUDIO_SECONDS,
         expected_semantic_codec: str | None = None,
         expected_semantic_fingerprint: str | None = None,
@@ -1170,6 +1217,7 @@ class S2MelCollator:
         self.min_pair_prompt_seconds = min_pair_prompt_seconds
         self.decode_audio_in_worker = decode_audio_in_worker
         self.skip_audio_errors = skip_audio_errors
+        self.require_stored_vae_latents = bool(require_stored_vae_latents)
         self.max_audio_seconds = max_audio_seconds
         self.expected_semantic_codec = expected_semantic_codec
         self.expected_semantic_fingerprint = expected_semantic_fingerprint
@@ -1649,6 +1697,13 @@ class S2MelCollator:
                     prompt_records, target_records, records, strict=True
                 )
             ]
+            bad_latent_count = pair_latent_ok.count(False)
+            if self.require_stored_vae_latents and bad_latent_count:
+                raise ValueError(
+                    "data.stored_vae_latents_only=true but "
+                    f"{bad_latent_count}/{len(records)} paired samples have "
+                    "missing, unreadable, or too-short stored VAE latents"
+                )
             good = [index for index, ok in enumerate(pair_latent_ok) if ok]
             if not good:
                 raise ValueError("Paired records must contain prompt and target audio_path")
