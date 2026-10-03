@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import pickle
 import random
 import shutil
 import tarfile
@@ -365,6 +366,57 @@ def trim_paired_feature_lengths(
     )
 
 
+
+def _s2mel_index_cache_file(manifest_paths, rank, world_size, drop_unused_fields):
+    if len(manifest_paths) != 1 or not manifest_paths[0].is_file():
+        return None
+    manifest = manifest_paths[0]
+    shard = "all" if rank is None else f"rank{int(rank)}-of{int(world_size)}"
+    return manifest.parent / f"{manifest.name}.s2mel-index" / f"{shard}-drop{int(bool(drop_unused_fields))}.pkl"
+
+
+def _s2mel_index_stamp(manifest_paths):
+    stats = [path.stat() for path in manifest_paths]
+    return {
+        "size": [st.st_size for st in stats],
+        "mtime_ns": [st.st_mtime_ns for st in stats],
+    }
+
+
+def _load_s2mel_index_cache(manifest_paths, rank, world_size, drop_unused_fields):
+    path = _s2mel_index_cache_file(manifest_paths, rank, world_size, drop_unused_fields)
+    if path is None or not path.is_file():
+        return None
+    try:
+        with path.open("rb") as handle:
+            payload = pickle.load(handle)
+    except Exception:
+        return None
+    stamp = _s2mel_index_stamp(manifest_paths)
+    if payload.get("size") != stamp["size"] or payload.get("mtime_ns") != stamp["mtime_ns"]:
+        return None
+    if payload.get("drop") != bool(drop_unused_fields):
+        return None
+    records = payload.get("records")
+    return records if isinstance(records, list) and records else None
+
+
+def _save_s2mel_index_cache(manifest_paths, records, rank, world_size, drop_unused_fields):
+    path = _s2mel_index_cache_file(manifest_paths, rank, world_size, drop_unused_fields)
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = _s2mel_index_stamp(manifest_paths)
+    tmp = path.with_suffix(".pkl.tmp")
+    with tmp.open("wb") as handle:
+        pickle.dump(
+            {"size": stamp["size"], "mtime_ns": stamp["mtime_ns"], "drop": bool(drop_unused_fields), "records": records},
+            handle,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    tmp.replace(path)
+
+
 class S2MelJsonlDataset(Dataset):
     """JSONL manifest dataset for semantic2mel training."""
 
@@ -435,6 +487,13 @@ class S2MelJsonlDataset(Dataset):
         if not self.manifest_paths:
             raise ValueError(f"No JSONL manifests found under {self.manifest_path}")
 
+        cached = _load_s2mel_index_cache(
+            self.manifest_paths, rank, world_size, drop_unused_fields
+        )
+        if cached is not None:
+            self.records = cached
+            return
+
         self.records: list[dict[str, Any]] = []
         interned: dict[str, str] = {}
         for current_manifest in self.manifest_paths:
@@ -479,6 +538,9 @@ class S2MelJsonlDataset(Dataset):
                     self.records.append(record)
         if not self.records:
             raise ValueError(f"No records found in {self.manifest_path}")
+        _save_s2mel_index_cache(
+            self.manifest_paths, self.records, rank, world_size, drop_unused_fields
+        )
 
     def __len__(self) -> int:
         return len(self.records)

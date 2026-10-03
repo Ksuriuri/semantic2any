@@ -36,6 +36,7 @@ from semantic2any.data.s2mel_dataset import (
     warmup_vae_indexes,
 )
 from semantic2any.losses.s2vae_decoder_feature import S2VAEDecoderFeatureLoss
+from semantic2any.losses.s2vae_gated_buzz import S2VAEGatedBuzzLoss
 from semantic2any.models import Semantic2MelModel
 from semantic2any.losses.s2vae_highfreq import (
     S2VAEBreathAwareLoss,
@@ -1145,6 +1146,20 @@ def forward_loss_with_vae_hf(
 
 
 def forward_loss_with_vae_feature(model, batch, loss_module, audio_vae, weight):
+    return forward_loss_with_vae_aux(
+        model, batch, feature_loss=loss_module, feature_vae=audio_vae, feature_weight=weight
+    )
+
+
+def forward_loss_with_vae_aux(
+    model,
+    batch,
+    feature_loss=None,
+    feature_vae=None,
+    feature_weight=0.0,
+    buzz_loss=None,
+    buzz_weight=0.0,
+):
     flow, predicted = model(
         batch["mel"], batch["mel_lens"], batch["prompt_lens"],
         batch["semantic"], batch["style"], semantic_is_mu=False,
@@ -1152,10 +1167,25 @@ def forward_loss_with_vae_feature(model, batch, loss_module, audio_vae, weight):
         prompt_semantic_lens=batch.get("prompt_semantic_lens"),
     )
     times = _cfm_module(model).last_time
-    feature = loss_module(predicted, batch["mel"], batch["mel_lens"],
-                          batch["prompt_lens"], times, audio_vae)
-    loss_module.last_flow = flow.detach()
-    return flow + float(weight) * feature
+    total = flow
+    if feature_loss is not None:
+        feature = feature_loss(
+            predicted, batch["mel"], batch["mel_lens"],
+            batch["prompt_lens"], times, feature_vae,
+        )
+        feature_loss.last_flow = flow.detach()
+        total = total + float(feature_weight) * feature
+    if buzz_loss is not None:
+        if feature_vae is None:
+            raise RuntimeError("gated buzz loss needs the frozen AudioVAE decoder")
+        buzz = buzz_loss(
+            predicted, batch["mel"], batch["mel_lens"],
+            batch["prompt_lens"], times,
+            lambda latent: feature_vae.decode_differentiable(latent, normalized=True),
+        )
+        buzz_loss.last_flow = flow.detach()
+        total = total + float(buzz_weight) * buzz
+    return total
 
 
 @torch.no_grad()
@@ -1577,18 +1607,23 @@ def main() -> None:
     vae_feature_loss = None
     vae_feature_decoder = None
     vae_feature_weight = float(_get(cfg.train, "s2vae_feature_loss_weight", 0.0))
+    vae_buzz_loss = None
+    vae_buzz_weight = float(_get(cfg.train, "s2vae_buzz_loss_weight", 0.0))
     if vae_feature_weight < 0.0:
         raise ValueError("s2vae_feature_loss_weight must be non-negative")
-    if vae_feature_weight > 0.0:
-        if not vae_target:
-            raise ValueError("decoder feature loss requires target.type=vae_latent")
-        if float(_get(cfg.train, "s2vae_hf_loss_weight", 0.0)) > 0.0:
-            raise ValueError("this feature-only experiment requires s2vae_hf_loss_weight=0")
+    if vae_buzz_weight < 0.0:
+        raise ValueError("s2vae_buzz_loss_weight must be non-negative")
+    if (vae_feature_weight > 0.0 or vae_buzz_weight > 0.0) and not vae_target:
+        raise ValueError("decoder feature / gated buzz loss requires target.type=vae_latent")
+    if vae_feature_weight > 0.0 and float(_get(cfg.train, "s2vae_hf_loss_weight", 0.0)) > 0.0:
+        raise ValueError("this feature-only experiment requires s2vae_hf_loss_weight=0")
+    if vae_feature_weight > 0.0 or vae_buzz_weight > 0.0:
         # Separate decoder preserves the stored-only collator/adapter invariant:
         # missing cached latents still fail, and no online encoder fallback exists.
         vae_feature_decoder = DotsAudioVAE.from_pretrained(
             resolve_dots_tts_dir(cfg), map_location=accelerator.device
         )
+    if vae_feature_weight > 0.0:
         vae_feature_loss = S2VAEDecoderFeatureLoss(
             layers=tuple(_get(cfg.train, "s2vae_feature_layers", (2, 3, 4, 5))),
             weights=tuple(_get(cfg.train, "s2vae_feature_layer_weights", (.15, .25, .35, .25))),
@@ -1604,6 +1639,26 @@ def main() -> None:
         if accelerator.is_main_process:
             print(vae_feature_loss.describe(), flush=True)
             print(f"[Loss] feature weight={vae_feature_weight:g}", flush=True)
+    if vae_buzz_weight > 0.0:
+        vae_buzz_loss = S2VAEGatedBuzzLoss(
+            sample_rate=int(_get(cfg.data, "sample_rate_vae", EXPECTED_SAMPLE_RATE)),
+            band_low_hz=float(_get(cfg.train, "s2vae_buzz_band_low_hz", 200.0)),
+            band_high_hz=float(_get(cfg.train, "s2vae_buzz_band_high_hz", 1500.0)),
+            n_fft=int(_get(cfg.train, "s2vae_buzz_n_fft", 2048)),
+            hop_length=int(_get(cfg.train, "s2vae_buzz_hop_length", 512)),
+            chunk_frames=int(_get(cfg.train, "s2vae_buzz_chunk_frames", 32)),
+            min_chunk_frames=int(_get(cfg.train, "s2vae_buzz_min_chunk_frames", 16)),
+            max_samples=int(_get(cfg.train, "s2vae_buzz_max_samples", 16)),
+            max_scan_windows=int(_get(cfg.train, "s2vae_buzz_max_scan_windows", 8)),
+            t_min=float(_get(cfg.train, "s2vae_buzz_t_min", 0.0)),
+            t_power=float(_get(cfg.train, "s2vae_buzz_t_power", 0.0)),
+            gate_peakiness=float(_get(cfg.train, "s2vae_buzz_gate_peakiness", 0.70)),
+            margin=float(_get(cfg.train, "s2vae_buzz_margin", 0.03)),
+            use_checkpoint=bool(_get(cfg.train, "s2vae_buzz_checkpoint", True)),
+        ).to(accelerator.device)
+        if accelerator.is_main_process:
+            print(vae_buzz_loss.describe(), flush=True)
+            print(f"[Loss] gated buzz weight={vae_buzz_weight:g}", flush=True)
     vae_hf_loss = None
     vae_hf_weight = float(_get(cfg.train, "s2vae_hf_loss_weight", 0.0))
     vae_hf_mode = str(_get(cfg.train, "s2vae_hf_mode", "magnitude"))
@@ -1799,10 +1854,14 @@ def main() -> None:
                     _set_global_step(global_step)
                     if train_batch is None:
                         loss = torch.tensor(float("nan"), device=accelerator.device)
-                    elif vae_feature_loss is not None:
-                        loss = forward_loss_with_vae_feature(
-                            model, train_batch, vae_feature_loss,
-                            vae_feature_decoder, vae_feature_weight,
+                    elif vae_feature_loss is not None or vae_buzz_loss is not None:
+                        loss = forward_loss_with_vae_aux(
+                            model, train_batch,
+                            feature_loss=vae_feature_loss,
+                            feature_vae=vae_feature_decoder,
+                            feature_weight=vae_feature_weight,
+                            buzz_loss=vae_buzz_loss,
+                            buzz_weight=vae_buzz_weight,
                         )
                     elif vae_hf_loss is not None:
                         adapter = feature_adapter_ref[0]
@@ -1935,6 +1994,11 @@ def main() -> None:
                                     f" hf={float(vae_hf_loss.last_components['total']):.5f}"
                                     f" hf_n={float(vae_hf_loss.last_components['samples']):.0f}"
                                 )
+                            if vae_buzz_loss is not None and vae_buzz_loss.last_components:
+                                hf_suffix += (
+                                    f" buzz={float(vae_buzz_loss.last_components['total']):.5f}"
+                                    f" gated={float(vae_buzz_loss.last_components['gated']):.2f}"
+                                )
                             print(
                                 f"[Train] epoch={epoch + 1} step={global_step} "
                                 f"loss={reduced_loss:.5f} lr={lr:.3e}{hf_suffix}"
@@ -1953,6 +2017,12 @@ def main() -> None:
                             _vae_hf_metrics_for_log(
                                 accelerator, vae_feature_loss,
                                 prefix="s2vae_feature", weight=vae_feature_weight,
+                            )
+                        )
+                        log_payload.update(
+                            _vae_hf_metrics_for_log(
+                                accelerator, vae_buzz_loss,
+                                prefix="s2vae_buzz", weight=vae_buzz_weight,
                             )
                         )
                         accelerator.log(log_payload, step=global_step)
