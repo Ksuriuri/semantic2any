@@ -23,7 +23,11 @@ def read_codes(record, base=None, max_frames=None):
     if uri.startswith('gs://'):
         from google.cloud import storage
         bucket,key = uri[5:].split('/',1)
-        raw = storage.Client().bucket(bucket).blob(key).download_as_bytes(start=offset,end=offset+size-1)
+        generation = record.get('generation')
+        if generation is not None:
+            generation = int(generation)
+        raw = storage.Client().bucket(bucket).blob(key, generation=generation).download_as_bytes(
+            start=offset,end=offset+size-1,if_generation_match=generation)
     else:
         with open(uri,'rb') as f:
             f.seek(offset);raw=f.read(size)
