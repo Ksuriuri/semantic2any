@@ -238,3 +238,9 @@ masking, paired inference, resume procedure, and reporting checklist.
 See [`docs/backbone-ablation.md`](docs/backbone-ablation.md) for the
 parameter-matched ZipFormer versus IndexTTS2-derived DiT experiment protocol,
 portable launch commands, and checkpoint compatibility rules.
+
+### IndexTTS2.5 → Fish Drama3 codes (experimental)
+
+See [Index–Fish MTP training and alignment](docs/index_fish_mtp.md) for the
+independent discrete-code predictor, raw-code streaming configuration, offline
+decoded-feature comparison, strict paired manifests, and CPU integration tests.

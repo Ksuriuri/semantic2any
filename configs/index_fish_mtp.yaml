@@ -1,0 +1,35 @@
+# Independent experiment: same Fish tokenizer checksum as fish_s2tok.
+index:
+  bundle: /path/to/indextts25_decoder.pt
+  sha256: null  # REQUIRED: pin the bundle used to extract source codes
+codec:
+  sha256: 74fc41c5a7151c6f350af8bd7e5d6e3accfcc7f3dfbfac23afd35af07052bb2f
+data:
+  train_manifest: /path/to/index-fish-train.jsonl
+  valid_manifest: /path/to/index-fish-valid.jsonl
+  max_seconds: 60
+  max_reference_frames: 646
+  num_workers: 4
+model:
+  source_mode: raw
+  lookahead_seconds: 0.08
+  dim: 256
+  heads: 8
+  condition_layers: 2
+  shared_layers: 2
+  index_dim: 1024
+  index_vocab: 8192
+  time_sigma: 0.15
+train:
+  output_dir: /path/to/new-index-fish-mtp-run
+  batch_size: 2
+  gradient_accumulation_steps: 1
+  mixed_precision: bf16
+  seed: 1234
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  epochs: 3
+  save_every: 1000
+  validate_every: 1000
+  validation_batches: 20
