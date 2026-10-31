@@ -13,8 +13,8 @@ data:
 model:
   source_mode: raw
   lookahead_seconds: 0.08
-  dim: 256
-  heads: 8
+  dim: 1024
+  heads: 16
   condition_layers: 2
   shared_layers: 2
   index_dim: 1024

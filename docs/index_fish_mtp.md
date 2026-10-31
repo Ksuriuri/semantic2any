@@ -92,8 +92,11 @@ coverage verification have **not** been performed as part of this code change.
 
 Fill manifest/output paths. For decoded mode also pin `index.bundle` and its SHA256.
 Raw mode needs no decoder weights, but its `index_vocab` must match stored IDs.
-The initial 256-width, 2 condition + 2 shared + 9 residual blocks is an experimental
-small baseline, not a tuned production model. AdamW, constant LR, BF16 (configurable),
+The primary raw-code configuration uses width 1024, 16 attention heads,
+2 condition + 2 shared + 9 residual blocks: 226,637,825 trainable parameters.
+This replaces the initial 256-width canary configuration; capacity and batch size
+still require GPU measurement before a production run. The offline comparison
+configuration remains at width 256 and is not the selected main experiment. AdamW, constant LR, BF16 (configurable),
 Accelerate DDP/accumulation, finite loss/gradient checks, validation and checkpoints
 are supported. All checkpoints are kept; plan storage before a long run.
 
@@ -158,6 +161,8 @@ OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python scripts/smoke_index_fish_mtp.py 
 
 2026-10-31 validation: 8 unit tests passed; raw + decoded training, 2-process CPU
 DDP, validation, exact resume equivalence (maximum parameter difference 0), and
-CLI uint16 `[5,10]` generation passed. Default raw baseline: 20,886,785 parameters.
+CLI uint16 `[5,10]` generation passed. Initial 256-width raw baseline: 20,886,785 parameters. The approved 1024-width
+primary configuration was subsequently counted on meta tensors: 226,637,825.
+The CPU integration canary explicitly overrides width/heads to tiny values.
 No GPU capacity test, real-data quality run, or end-to-end waveform streaming test
 was performed. See the smoke output's `result.json` for the integration receipt.
