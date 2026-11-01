@@ -166,3 +166,20 @@ primary configuration was subsequently counted on meta tensors: 226,637,825.
 The CPU integration canary explicitly overrides width/heads to tiny values.
 No GPU capacity test, real-data quality run, or end-to-end waveform streaming test
 was performed. See the smoke output's `result.json` for the integration receipt.
+
+### Shared manifest offsets for large datasets
+
+Before launching distributed training on a finalized local dataset, run:
+
+```bash
+python scripts/build_index_fish_index.py /path/to/local-dataset
+```
+
+The dataset root must contain `_LOCAL_COMPLETE.json` with the expected train and
+validation row counts. The builder scans each manifest once and atomically
+publishes `<manifest>.idx/offsets.u64` plus `meta.json`. All ranks and forked
+workers memory-map this shared offset array rather than building Python lists.
+Source path, size and nanosecond modification time must match; stale or truncated
+indexes are rejected. Manifests larger than 1 GiB require this prebuilt index.
+The index preserves source order; it does not itself shuffle or change reference
+pairing. Existing per-record code byte offsets remain unchanged.

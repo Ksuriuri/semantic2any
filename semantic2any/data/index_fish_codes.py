@@ -40,15 +40,30 @@ class IndexFishDataset(Dataset):
     def __init__(self, manifest, max_seconds=60, max_reference_frames=646):
         self.path = Path(manifest).resolve()
         self.max_seconds, self.max_reference_frames = max_seconds, max_reference_frames
-        self.offsets = []
-        with self.path.open('rb') as f:
-            while True:
-                offset, line = f.tell(), f.readline()
-                if not line:
-                    break
-                if line.strip():
-                    self.offsets.append(offset)
-        if not self.offsets:
+        index_root = Path(str(self.path) + '.idx')
+        meta_path = index_root / 'meta.json'
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            stat = self.path.stat()
+            expected = dict(path=str(self.path), size=stat.st_size, mtime_ns=stat.st_mtime_ns)
+            if meta.get('version') != 1 or meta.get('source') != expected:
+                raise ValueError('Stale manifest index; rebuild before training')
+            offsets_path = index_root / 'offsets.u64'
+            if meta.get('dtype') != '<u8' or offsets_path.stat().st_size != int(meta['rows']) * 8:
+                raise ValueError('Invalid manifest offset index')
+            self.offsets = np.memmap(offsets_path, dtype='<u8', mode='r')
+        else:
+            if self.path.stat().st_size > 1024**3:
+                raise ValueError('Large manifest requires a prebuilt shared .idx index')
+            self.offsets = []
+            with self.path.open('rb') as f:
+                while True:
+                    offset, line = f.tell(), f.readline()
+                    if not line:
+                        break
+                    if line.strip():
+                        self.offsets.append(offset)
+        if len(self.offsets) == 0:
             raise ValueError('Empty manifest')
     def __len__(self):
         return len(self.offsets)
