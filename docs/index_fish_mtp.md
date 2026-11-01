@@ -183,3 +183,10 @@ Source path, size and nanosecond modification time must match; stale or truncate
 indexes are rejected. Manifests larger than 1 GiB require this prebuilt index.
 The index preserves source order; it does not itself shuffle or change reference
 pairing. Existing per-record code byte offsets remain unchanged.
+
+Set `train.shuffle_block_size: 4096` to shuffle block order and then rows within
+each block, using the training seed and epoch. Every row is covered once before
+distributed loader tail padding. This avoids a full 231-million-row permutation
+and preserves some storage locality. The epoch seed makes order reproducible for
+checkpoint batch skipping; validation retains its fixed order. A value of zero
+keeps the legacy sequential behavior.

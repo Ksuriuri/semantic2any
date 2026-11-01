@@ -9,6 +9,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from semantic2any.data.index_fish_codes import IndexFishDataset, collate_index_fish, prepare_index_batch
 from semantic2any.models.index_fish_mtp import IndexFishMTP
+from semantic2any.data.block_sampler import BlockShuffleSampler
 from semantic2any.utils.semantic_codecs import IndexTTS25CodeDecoder
 
 
@@ -37,9 +38,10 @@ def main():
     opt=torch.optim.AdamW(model.parameters(),lr=float(tr.learning_rate),weight_decay=float(tr.weight_decay))
     def loader(path,shuffle):
         ds=IndexFishDataset(path,float(cfg.data.max_seconds),int(cfg.data.max_reference_frames))
-        # Fixed order permits exact epoch/batch skipping on resume; prepare manifests with a fixed shuffle upstream.
-        return DataLoader(ds,batch_size=int(tr.batch_size),shuffle=False,num_workers=int(cfg.data.num_workers),collate_fn=collate_index_fish,pin_memory=True)
-    train=loader(cfg.data.train_manifest,False);valid=loader(cfg.data.valid_manifest,False)
+        block_size=int(tr.get('shuffle_block_size',0))
+        sampler=BlockShuffleSampler(ds,block_size,int(tr.seed)) if shuffle and block_size else None
+        return DataLoader(ds,batch_size=int(tr.batch_size),shuffle=False,sampler=sampler,num_workers=int(cfg.data.num_workers),collate_fn=collate_index_fish,pin_memory=True)
+    train=loader(cfg.data.train_manifest,True);valid=loader(cfg.data.valid_manifest,False)
     model,opt,train,valid=acc.prepare(model,opt,train,valid)
     acc.print(f'[Model] parameters={sum(p.numel() for p in model.parameters())}')
     manifests={str(Path(path).resolve()): {'size':Path(path).stat().st_size,'mtime_ns':Path(path).stat().st_mtime_ns} for path in (cfg.data.train_manifest,cfg.data.valid_manifest)}
@@ -78,6 +80,7 @@ def main():
         model.train()
     model.train();opt.zero_grad()
     for epoch in range(start_epoch,int(tr.epochs)):
+        if hasattr(train,'set_epoch'):train.set_epoch(epoch)
         iterator=acc.skip_first_batches(train,start_batch) if epoch==start_epoch and start_batch else train
         offset=start_batch if epoch==start_epoch else 0
         for index,batch in enumerate(iterator,start=offset):
