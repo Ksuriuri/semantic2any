@@ -8,7 +8,7 @@ from accelerate.utils import set_seed, DistributedDataParallelKwargs
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from semantic2any.data.index_fish_codes import IndexFishDataset, collate_index_fish, prepare_index_batch
-from semantic2any.models.index_fish_mtp import IndexFishMTP
+from semantic2any.models.index_fish_mtp import build_index_fish_model
 from semantic2any.data.block_sampler import BlockShuffleSampler
 from semantic2any.utils.semantic_codecs import IndexTTS25CodeDecoder
 
@@ -29,7 +29,7 @@ def main():
         out.mkdir(parents=True,exist_ok=True)
         OmegaConf.save(cfg,out/'config.yaml')
     acc.wait_for_everyone()
-    model=IndexFishMTP(**OmegaConf.to_container(cfg.model,resolve=True))
+    model=build_index_fish_model(OmegaConf.to_container(cfg.model,resolve=True),cfg.get("architecture","cross_attention"))
     decoder=None
     if model.source_mode == 'decoded':
         decoder=IndexTTS25CodeDecoder(cfg.index.bundle,expected_sha256=cfg.index.sha256).to(acc.device).eval()
@@ -54,6 +54,8 @@ def main():
         acc.load_state(args.resume);step=info['step'];start_epoch=info['epoch'];start_batch=info['next_batch']
     def loss_for(batch):
         source, ids, lengths = prepare_index_batch(cfg.model.source_mode,decoder,batch['index_codes'],batch['index_lengths'])
+        if hasattr(acc.unwrap_model(model), "validate_alignment_lengths"):
+            acc.unwrap_model(model).validate_alignment_lengths(lengths,batch["target_lengths"])
         with acc.autocast():
             logits=model(source,ids,lengths,batch['reference_codes'],batch['reference_lengths'],batch['target_codes'],batch['target_lengths'])
         loss, per_book=acc.unwrap_model(model).loss(logits,batch['target_codes'],batch['target_lengths'])

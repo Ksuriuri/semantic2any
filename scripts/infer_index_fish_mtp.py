@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch
-from semantic2any.models.index_fish_mtp import IndexFishMTP
+from semantic2any.models.index_fish_mtp import build_index_fish_model
 from semantic2any.data.index_fish_codes import prepare_index_batch, fish_frames_for_duration
 from semantic2any.data.fish_codes import read_codes
 from semantic2any.utils.semantic_codecs import IndexTTS25CodeDecoder
@@ -37,7 +37,7 @@ def main():
     decoder=IndexTTS25CodeDecoder(cfg['index']['bundle'],expected_sha256=cfg['index']['sha256']).to(device).eval() if cfg['model']['source_mode']=='decoded' else None
     refpath=Path(args.reference_record)
     ref=read_codes(json.loads(refpath.read_text()),refpath.parent,cfg['data']['max_reference_frames']).to(device)[None]
-    model=IndexFishMTP(**cfg['model']).to(device).eval()
+    model=build_index_fish_model(cfg['model'],cfg.get('architecture','cross_attention')).to(device).eval()
     model.load_state_dict(state['model'],strict=True)
     with torch.inference_mode():
         source,ids,sl=prepare_index_batch(cfg['model']['source_mode'],decoder,codes,lengths)

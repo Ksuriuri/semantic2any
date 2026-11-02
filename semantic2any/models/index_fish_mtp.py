@@ -194,6 +194,8 @@ class RawCodeStream:
             if duration_seconds is not None:
                 raise ValueError('Duration is only accepted for final chunk')
             end = max(0, math.floor((duration - self.model.lookahead_seconds) * FISH_HZ + 1e-6))
+        if final and hasattr(self.model, "validate_alignment_lengths"):
+            self.model.validate_alignment_lengths(torch.tensor([n], device=self.source.device), torch.tensor([end], device=self.source.device))
         start = self.codes.shape[1]
         if end < start:
             raise ValueError('Final duration would retract emitted frames')
@@ -207,3 +209,13 @@ class RawCodeStream:
                 self.codes[:, t, k] = logits[k][:, -1].argmax(-1)
         self.closed = final
         return self.codes[:, start:].clone()
+
+
+def build_index_fish_model(model_config, architecture="cross_attention"):
+    """Explicit architecture selection; legacy checkpoints retain old behavior."""
+    if architecture == "cross_attention":
+        return IndexFishMTP(**model_config)
+    if architecture == "prefix_aligned":
+        from .index_fish_prefix import IndexFishPrefixMTP
+        return IndexFishPrefixMTP(**model_config)
+    raise ValueError(f"Unknown IndexFish architecture: {architecture}")
