@@ -82,3 +82,19 @@ remain compatible, including optimizer/RNG resume. This flag does not change
 the attention mask or enable FlashAttention. First-use compilation (including
 validation/backward specializations) adds startup time; benchmark representative
 shapes before enabling it for a run.
+
+
+## Checkpoint retention
+
+Set `train.save_every: 2000`, `train.keep_last_checkpoints: 2`, and
+`train.keep_every_steps: 20000` to retain the two newest complete checkpoints
+plus all 20k-step checkpoints. Zero/omitted retention fields disable pruning.
+Both retention fields must be positive when enabled. A checkpoint includes
+model, optimizer, inference export, trainer metadata and every rank RNG state.
+Pruning runs on the main process after all ranks have finished saving; incomplete
+directories and symlinks are skipped. Deleted step IDs are recorded in
+`retention-audit.jsonl`. Epoch-end/final saves still occur.
+
+Exact-state resume permits changes only to these three operational checkpoint
+fields; model, data and other training settings must still match. Archived
+checkpoints preserve the configuration used when they were written.

@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from semantic2any.data.index_fish_codes import IndexFishDataset, collate_index_fish, prepare_index_batch
 from semantic2any.models.index_fish_mtp import build_index_fish_model
 from semantic2any.data.block_sampler import BlockShuffleSampler
+from semantic2any.utils.checkpoint_retention import check_resume_config, prune_checkpoints
 from semantic2any.utils.semantic_codecs import IndexTTS25CodeDecoder
 
 
@@ -20,6 +21,8 @@ def main():
     cfg=OmegaConf.load(args.config);tr=cfg.train
     if cfg.model.source_mode == 'decoded' and (not cfg.index.sha256 or len(str(cfg.index.sha256)) != 64):raise ValueError('Pin the Index decoder SHA256 before training')
     if int(tr.save_every)<=0 or int(tr.validate_every)<=0:raise ValueError('Checkpoint/validation intervals must be positive')
+    keep_last=int(tr.get('keep_last_checkpoints',0));keep_every=int(tr.get('keep_every_steps',0))
+    if keep_last<0 or keep_every<0 or bool(keep_last)!=bool(keep_every):raise ValueError('Set both positive retention values, or neither')
     acc=Accelerator(gradient_accumulation_steps=int(tr.gradient_accumulation_steps),mixed_precision=tr.mixed_precision,kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=False)])
     if int(os.environ.get('WORLD_SIZE','1'))>1 and acc.num_processes==1:
         raise RuntimeError('Distributed launcher was not detected; use accelerate launch (CPU tests need ACCELERATE_USE_CPU=true)')
@@ -56,7 +59,8 @@ def main():
     if args.resume:
         info=json.loads((Path(args.resume)/'trainer.json').read_text())
         if info.get('world_size',1)!=acc.num_processes:raise ValueError('Resume requires unchanged distributed world size')
-        if info['config']!=OmegaConf.to_container(cfg,resolve=True):raise ValueError('Resume config differs from checkpoint')
+        policy_changes=check_resume_config(info['config'],OmegaConf.to_container(cfg,resolve=True))
+        if policy_changes:acc.print(f'[Checkpoint policy] {json.dumps(policy_changes)}')
         if info.get('manifests') != manifests:raise ValueError('Manifest files changed since checkpoint')
         acc.load_state(args.resume);step=info['step'];start_epoch=info['epoch'];start_batch=info['next_batch']
     def loss_for(batch):
@@ -75,6 +79,10 @@ def main():
             info={'world_size':acc.num_processes,'step':step,'epoch':epoch,'next_batch':next_batch,'config':OmegaConf.to_container(cfg,resolve=True),'manifests':manifests}
             (dest/'trainer.json').write_text(json.dumps(info,indent=2))
             torch.save({'model':acc.unwrap_model(model).state_dict(),'config':info['config'],'step':step},dest/'inference.pt')
+        acc.wait_for_everyone()
+        if acc.is_main_process and keep_last:
+            deleted=prune_checkpoints(out,keep_last,keep_every)
+            if deleted:acc.print(f'[Retention] removed checkpoints {deleted}')
         acc.wait_for_everyone()
     def validate():
         model.eval();values=[]
