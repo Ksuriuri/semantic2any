@@ -70,3 +70,15 @@ finite gradients, tiny-set overfit and architecture roundtrip. CPU DDP smoke
 exercises actual trainer, two-rank checkpoint and resume. Dataset clock preflight
 sampled 2,000 training rows and all 939 validation rows: no out-of-range Index
 tails observed; this is not a scan of all 231 million training records.
+
+
+## Optional block compilation
+
+The trainer accepts `--compile-blocks` to compile each Transformer block with
+`nn.Module.compile(fullgraph=True, dynamic=True)`. Length validation and the
+rest of the model stay outside the compiled regions. Compilation is in place:
+parameter names, the serialized training configuration, and eager checkpoints
+remain compatible, including optimizer/RNG resume. This flag does not change
+the attention mask or enable FlashAttention. First-use compilation (including
+validation/backward specializations) adds startup time; benchmark representative
+shapes before enabling it for a run.

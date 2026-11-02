@@ -14,7 +14,9 @@ from semantic2any.utils.semantic_codecs import IndexTTS25CodeDecoder
 
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--config',required=True);p.add_argument('--resume');p.add_argument('--max-steps',type=int);args=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--config',required=True);p.add_argument('--resume');p.add_argument('--max-steps',type=int)
+    p.add_argument('--compile-blocks',action='store_true',help='Compile Transformer blocks in place; checkpoint keys and training config stay compatible')
+    args=p.parse_args()
     cfg=OmegaConf.load(args.config);tr=cfg.train
     if cfg.model.source_mode == 'decoded' and (not cfg.index.sha256 or len(str(cfg.index.sha256)) != 64):raise ValueError('Pin the Index decoder SHA256 before training')
     if int(tr.save_every)<=0 or int(tr.validate_every)<=0:raise ValueError('Checkpoint/validation intervals must be positive')
@@ -30,6 +32,11 @@ def main():
         OmegaConf.save(cfg,out/'config.yaml')
     acc.wait_for_everyone()
     model=build_index_fish_model(OmegaConf.to_container(cfg.model,resolve=True),cfg.get("architecture","cross_attention"))
+    if args.compile_blocks:
+        blocks=list(model.condition)+list(model.shared)+list(model.residual)
+        for block in blocks:
+            block.compile(fullgraph=True,dynamic=True)
+        acc.print(f'[Compile] enabled {len(blocks)} Transformer blocks; fullgraph=True dynamic=True')
     decoder=None
     if model.source_mode == 'decoded':
         decoder=IndexTTS25CodeDecoder(cfg.index.bundle,expected_sha256=cfg.index.sha256).to(acc.device).eval()
