@@ -1,4 +1,5 @@
 from __future__ import annotations
+from semantic2any.data.feature_cache import read_feature_span
 
 import hashlib
 import json
@@ -35,6 +36,65 @@ _SEMANTIC_CODE_MEMMAPS: OrderedDict[str, np.memmap] = OrderedDict()
 # forked before any config is handed to them, and inherit the environment.
 _RETURN_TARGET_WAVEFORM = os.environ.get("VOCODER_TRAIN", "0") == "1"
 
+# Optional root swap so a manifest that still names the CPFS tree reads the NAS mirror.
+# Applied after the index cache is saved, so the on-disk cache keeps the original paths.
+_DATA_ROOT_FROM = os.environ.get("S2VAE_DATA_ROOT_FROM", "")
+_DATA_ROOT_TO = os.environ.get("S2VAE_DATA_ROOT_TO", "")
+_DATA_ROOT_KEYS = (
+    "audio_path",
+    "mel_path",
+    "semantic_path",
+    "style_path",
+    "semantic_code_path",
+    "semantic_lookup_path",
+    "vae_latent_path",
+)
+
+
+def _rewrite_data_root(value: str) -> str:
+    if _DATA_ROOT_FROM and value.startswith(_DATA_ROOT_FROM):
+        return _DATA_ROOT_TO + value[len(_DATA_ROOT_FROM):]
+    return value
+
+
+def _rewrite_record_roots(records: list[dict[str, Any]]) -> int:
+    if not _DATA_ROOT_FROM:
+        return 0
+    interned: dict[str, str] = {}
+    changed = 0
+
+    def walk(record: dict[str, Any]) -> None:
+        nonlocal changed
+        did = False
+        for key in _DATA_ROOT_KEYS:
+            value = record.get(key)
+            if not isinstance(value, str):
+                continue
+            new = interned.get(value)
+            if new is None:
+                new = _rewrite_data_root(value)
+                interned[value] = new
+            if new is not value:
+                record[key] = new
+                did = True
+        if did:
+            changed += 1
+        for nested in ("prompt", "target"):
+            child = record.get(nested)
+            if isinstance(child, dict):
+                walk(child)
+
+    for record in records:
+        walk(record)
+    if changed:
+        print(
+            f"[DataRoot] rewritten {changed} records {_DATA_ROOT_FROM} -> {_DATA_ROOT_TO}",
+            flush=True,
+        )
+    return changed
+
+
+
 
 def _load_tensor(path: str | Path) -> torch.Tensor:
     obj = torch.load(path, map_location="cpu")
@@ -67,7 +127,7 @@ def _load_semantic_codes(record: dict[str, Any]) -> torch.Tensor:
         raise ValueError(
             f"Semantic code range [{offset}, {end}) exceeds {path} ({mmap.size} tokens)"
         )
-    return torch.from_numpy(np.array(mmap[offset:end], dtype=np.int64, copy=True))
+    return torch.from_numpy(read_feature_span(path, mmap, offset, end, np.int64))
 
 _VAE_LATENT_JSONL_CACHE: OrderedDict[str, dict[str, tuple[int, int]]] = OrderedDict()
 _VAE_LATENT_MEMMAPS: OrderedDict[str, np.memmap] = OrderedDict()
@@ -157,7 +217,7 @@ def _load_vae_latent(record: dict[str, Any]) -> torch.Tensor | None:
     end = start + int(length) * 128
     if end > mmap.size:
         return None
-    frames = np.array(mmap[start:end], dtype=np.float32).reshape(int(length), 128)
+    frames = read_feature_span(str(bin_path), mmap, start, end, np.float32).reshape(int(length), 128)
     return torch.from_numpy(np.ascontiguousarray(frames.T))
 
 
@@ -407,7 +467,7 @@ def _save_s2mel_index_cache(manifest_paths, records, rank, world_size, drop_unus
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     stamp = _s2mel_index_stamp(manifest_paths)
-    tmp = path.with_suffix(".pkl.tmp")
+    tmp = path.with_suffix(f".pkl.{os.getpid()}.tmp")
     with tmp.open("wb") as handle:
         pickle.dump(
             {"size": stamp["size"], "mtime_ns": stamp["mtime_ns"], "drop": bool(drop_unused_fields), "records": records},
@@ -492,6 +552,7 @@ class S2MelJsonlDataset(Dataset):
         )
         if cached is not None:
             self.records = cached
+            _rewrite_record_roots(self.records)
             return
 
         self.records: list[dict[str, Any]] = []
@@ -541,6 +602,7 @@ class S2MelJsonlDataset(Dataset):
         _save_s2mel_index_cache(
             self.manifest_paths, self.records, rank, world_size, drop_unused_fields
         )
+        _rewrite_record_roots(self.records)
 
     def __len__(self) -> int:
         return len(self.records)

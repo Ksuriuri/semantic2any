@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+from .guarded_attention import guarded_attention as stable_math_attention, AttentionRangeExceeded, COUNTERS
 
 
 def find_multiple(value: int, divisor: int) -> int:
@@ -121,7 +122,17 @@ class Transformer(nn.Module):
             self.layers_emit_skip = []
             self.layers_receive_skip = []
 
-    def forward(
+    def forward(self, *args, **kwargs):
+        # This Transformer contains no dropout or other random operations.
+        # Retrying it leaves the sampled flow time/noise and outer RNG unchanged.
+        try:
+            return self._forward_impl(*args, **kwargs, force_math=False)
+        except AttentionRangeExceeded:
+            COUNTERS["full_math_retries"] += 1
+        # Outside the exception handler, release the discarded partial graph.
+        return self._forward_impl(*args, **kwargs, force_math=True)
+
+    def _forward_impl(
         self,
         x: Tensor,
         c: Tensor,
@@ -130,6 +141,7 @@ class Transformer(nn.Module):
         context: Tensor | None = None,
         context_input_pos: Tensor | None = None,
         cross_attention_mask: Tensor | None = None,
+        force_math: bool = False,
     ) -> Tensor:
         if self.freqs_cis is None:
             raise RuntimeError("DiT caches are not initialized; call setup_caches before forward")
@@ -154,6 +166,7 @@ class Transformer(nn.Module):
                 context_freqs_cis,
                 cross_attention_mask,
                 skip_input,
+                force_math,
             )
             if idx in self.layers_emit_skip:
                 skip_inputs.append(x)
@@ -182,12 +195,13 @@ class TransformerBlock(nn.Module):
         context_freqs_cis: Tensor | None = None,
         cross_attention_mask: Tensor | None = None,
         skip_in_x: Tensor | None = None,
+        force_math: bool = False,
     ) -> Tensor:
         del input_pos, context, context_freqs_cis, cross_attention_mask
         c = None if self.time_as_token else c
         if self.uvit_skip_connection and skip_in_x is not None:
             x = self.skip_in_linear(torch.cat([x, skip_in_x], dim=-1))
-        h = x + self.attention(self.attention_norm(x, c), freqs_cis, mask)
+        h = x + self.attention(self.attention_norm(x, c), freqs_cis, mask, force_math=force_math)
         return h + self.feed_forward(self.ffn_norm(h, c))
 
 
@@ -210,6 +224,7 @@ class Attention(nn.Module):
         freqs_cis: Tensor,
         mask: Tensor,
         input_pos: Tensor | None = None,
+        force_math: bool = False,
     ) -> Tensor:
         batch, sequence, _ = x.shape
         kv_size = self.n_local_heads * self.head_dim
@@ -226,7 +241,7 @@ class Attention(nn.Module):
             k, v = self.kv_cache.update(input_pos, k, v)
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+        output = stable_math_attention(q, k, v, mask, query_chunk=256, force_math=force_math, allow_retry=True)
         output = output.transpose(1, 2).contiguous().view(batch, sequence, self.head_dim * self.n_head)
         return self.wo(output)
 

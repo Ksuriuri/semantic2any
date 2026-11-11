@@ -17,10 +17,20 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import torch
+
+# Use the same attention backends as the validated BF16 pressure tests.
+torch.backends.cuda.enable_cudnn_sdp(False)
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset
+
+from semantic2any.data.locality_sampler import LocalityBatchSampler, resume_contract
+
+_LOCALITY_CONTRACT = None
 
 from semantic2any.data.s2mel_dataset import (
     DEFAULT_MAX_AUDIO_SECONDS,
@@ -424,6 +434,9 @@ def make_dataloader(
         force_bandwidth_hz=int(_get(cfg.data, "force_bandwidth_hz", 0) or 0),
     )
     kwargs: dict[str, Any] = {}
+    if not shuffle:
+        from semantic2any.data.feature_cache import disable_worker_cache
+        kwargs["worker_init_fn"] = disable_worker_cache
     if int(cfg.data.num_workers) > 0:
         kwargs["prefetch_factor"] = int(cfg.data.prefetch_factor)
         # Validation loaders re-create workers per pass so that the seeded RNG
@@ -456,6 +469,9 @@ def make_dataloader(
             shuffle=True,
             sample_weights=_sample_weights,
         )
+        locality_window = int(_get(cfg.data, "locality_window_batches", 0))
+        if locality_window:
+            batch_sampler = LocalityBatchSampler(batch_sampler, dataset, locality_window)
         return DataLoader(
             dataset,
             batch_sampler=batch_sampler,
@@ -509,6 +525,13 @@ def _next_raw_batch(iterator):
     except Exception as exc:
         print(f"[DataLoader] fetch failed: {type(exc).__name__}: {exc}", flush=True)
         return None, False
+
+
+def _fetch_and_submit(iterator, builder):
+    raw, exhausted = _next_raw_batch(iterator)
+    if raw is not None:
+        builder.submit(raw)
+    return raw is not None, exhausted
 
 
 _BUILD_POOL: ThreadPoolExecutor | None = None
@@ -1233,7 +1256,10 @@ def save_training_checkpoint(
     epoch: int,
     global_step: int,
     epoch_step: int = 0,
+    epoch_microbatch: int = 0,
 ) -> None:
+    if accelerator.step % int(cfg.train.grad_accumulation):
+        raise RuntimeError("Refusing checkpoint with unsaved accumulated gradients")
     save_dir = output_dir / f"checkpoint-{global_step}"
     accelerator.save_state(str(save_dir))
     if accelerator.is_main_process:
@@ -1251,12 +1277,17 @@ def save_training_checkpoint(
                 },
                 output_dir / f"bigvgan_step{global_step}.pt",
             )
+        if _LOCALITY_CONTRACT is not None:
+            (save_dir / "locality_state.json").write_text(
+                json.dumps(_LOCALITY_CONTRACT, indent=2) + "\n", encoding="utf-8")
         with (save_dir / "trainer_state.json").open("w", encoding="utf-8") as f:
             json.dump(
                 {
                     "epoch": int(epoch),
                     "global_step": int(global_step),
                     "epoch_step": int(epoch_step),
+                    "epoch_microbatch": int(epoch_microbatch),
+                    "accumulation_step": int(accelerator.step),
                 },
                 f,
                 indent=2,
@@ -1298,6 +1329,8 @@ def main() -> None:
         log_with=None if bool(cfg.train.no_wandb) else "wandb",
         kwargs_handlers=[ddp_kwargs],
     )
+    if accelerator.is_main_process:
+        print("[AttentionBackend] efficient_if_score_bound_le_128 else_math full_transformer_math_if_bound_gt_8388608 query_chunk=256 recompute=True no_explicit_memory_cap", flush=True)
     # device_specific=True offsets the seed by the process index so DDP ranks
     # draw independent flow-matching timesteps / noise; the data-loader shuffle
     # generator is still synchronized across ranks by accelerate.
@@ -1759,17 +1792,82 @@ def main() -> None:
                 "(old .pth had no epoch_step)"
             )
 
+    # A repaired manifest has a new order, partition and pairing contract.
+    # Explicitly retain training state while resetting ONLY the data cursor.
+    migration_source = str(_get(cfg.train, "reset_data_from_checkpoint", "") or "")
+    reset_data = bool(migration_source and resume_path is not None
+                      and resume_path.resolve() == Path(migration_source).resolve())
+    resume_microbatch = resume_epoch_step * int(cfg.train.grad_accumulation)
+    if reset_data:
+        expected_step = int(cfg.train.reset_data_expected_step)
+        if not resume_path.is_dir() or global_step != expected_step:
+            raise ValueError("data migration checkpoint/step mismatch")
+        if args.resume_epoch_step is not None:
+            raise ValueError("data migration disallows cursor override")
+        start_epoch = resume_epoch_step = resume_microbatch = 0
+        accelerator.step = 0
+        if accelerator.is_main_process:
+            migration = dict(source_checkpoint=str(resume_path.resolve()),
+                retained_global_step=global_step, data_epoch=0, data_microbatch=0,
+                manifest=str(cfg.data.train_jsonl), max_steps=int(cfg.train.max_steps),
+                reason="canonical window speaker IDs; old data cursor is invalid")
+            (output_dir / "data_migration.json").write_text(json.dumps(migration, indent=2))
+            print(f"[DataMigration] {migration}", flush=True)
+    elif resume_path is not None and resume_path.is_dir():
+        cursor = json.loads((resume_path / "trainer_state.json").read_text())
+        if "epoch_microbatch" in cursor:
+            resume_microbatch = int(cursor["epoch_microbatch"])
+            accelerator.step = int(cursor["accumulation_step"])
+            if accelerator.step % int(cfg.train.grad_accumulation):
+                raise ValueError("checkpoint has an incomplete accumulation phase")
+        elif migration_source:
+            raise ValueError("new-data resume is missing its exact microbatch cursor")
+
+    global _LOCALITY_CONTRACT
+    locality_sampler = train_loader.batch_sampler
+    if isinstance(locality_sampler, LocalityBatchSampler):
+        if args.resume_epoch_step is not None:
+            raise ValueError("locality mode disallows --resume-epoch-step overrides")
+        _LOCALITY_CONTRACT = resume_contract(
+            OmegaConf.to_container(cfg, resolve=True), accelerator.num_processes,
+            None if reset_data else resume_path, start_epoch, resume_epoch_step)
+        common_batches = torch.tensor([len(train_loader)], device=accelerator.device,
+                                      dtype=torch.long)
+        if accelerator.num_processes > 1:
+            torch.distributed.all_reduce(common_batches, op=torch.distributed.ReduceOp.MIN)
+        common_batches = int(common_batches.item())
+        if _LOCALITY_CONTRACT.get("common_batches", common_batches) != common_batches:
+            raise ValueError("rank-local epoch lengths changed since locality checkpoint")
+        _LOCALITY_CONTRACT["common_batches"] = common_batches
+        locality_sampler.configure(_LOCALITY_CONTRACT["anchor_epoch"],
+                                   _LOCALITY_CONTRACT["anchor_batch"], common_batches)
+        if accelerator.is_main_process:
+            (output_dir / "locality_state.json").write_text(
+                json.dumps(_LOCALITY_CONTRACT, indent=2) + "\n", encoding="utf-8")
+            print(f"[Locality] {_LOCALITY_CONTRACT}", flush=True)
+    elif resume_path is not None and (resume_path / "locality_state.json").is_file():
+        raise ValueError("cannot disable locality while resuming a locality checkpoint")
+
+    diagnostics = None
+    if bool(_get(cfg.train, "diagnostics", False)):
+        from semantic2any.utils.training_diagnostics import TrainingDiagnostics
+        diagnostics = TrainingDiagnostics(accelerator.unwrap_model(model), optimizer,
+            accelerator, output_dir, interval=int(cfg.train.log_interval),
+            probe_interval=int(_get(cfg.train, "diagnostic_probe_interval", 200)))
+        accelerator.print("[Diagnostics] enabled: per-sample, activations, gradients, Adam updates, replay, fixed probe; pause collectively on nonfinite")
     first_training_step = global_step + 1
     for epoch in range(start_epoch, int(cfg.train.epochs)):
         if int(cfg.train.max_steps) > 0 and global_step >= int(cfg.train.max_steps):
             break
         epoch_step = 0
+        epoch_microbatch = 0
         epoch_loader = train_loader
         _set_loader_epoch(train_loader, epoch)
-        if epoch == start_epoch and resume_epoch_step > 0:
-            skip_batches = resume_epoch_step * int(cfg.train.grad_accumulation)
+        if epoch == start_epoch and resume_microbatch > 0:
+            skip_batches = resume_microbatch
             epoch_loader = accelerator.skip_first_batches(train_loader, skip_batches)
             epoch_step = resume_epoch_step
+            epoch_microbatch = resume_microbatch
             if accelerator.is_main_process:
                 print(f"[Resume] Skipping first {skip_batches} batches of epoch {epoch + 1}")
         # Construct the DataLoader iterator before starting the feature thread.
@@ -1788,6 +1886,9 @@ def main() -> None:
                 device=accelerator.device,
             )
         async_skip_next = False
+        background_fetch = bool(_get(cfg.data, "background_raw_prefetch", False)) and use_async_features
+        fetch_pool = None
+        fetch_future = None
 
         try:
             current_raw_batch, exhausted = _next_raw_batch(raw_iterator)
@@ -1803,6 +1904,7 @@ def main() -> None:
                 int(cfg.train.max_steps) > 0
                 and global_step >= int(cfg.train.max_steps)
             ):
+                epoch_microbatch += 1
                 next_raw_batch = None
                 has_next_batch = False
                 prefetch_barrier = False
@@ -1836,21 +1938,26 @@ def main() -> None:
                             and valid_interval > 0
                             and next_global_step % valid_interval == 0
                         )
+                        if diagnostics is not None and accelerator.sync_gradients and (next_global_step == first_training_step or next_global_step % diagnostics.probe_interval == 0):
+                            prefetch_barrier = True
+                            validation_barrier = True
                         if not prefetch_barrier:
-                            next_raw_batch, next_exhausted = _next_raw_batch(raw_iterator)
-                            if next_raw_batch is not None:
-                                has_next_batch = True
-                                async_builder.submit(next_raw_batch)
+                            if background_fetch:
+                                if fetch_pool is None:
+                                    fetch_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="s2mel-raw")
+                                fetch_future = fetch_pool.submit(_fetch_and_submit, raw_iterator, async_builder)
                             else:
-                                has_next_batch = not next_exhausted
-                                if has_next_batch:
-                                    async_skip_next = True
+                                got_raw, next_exhausted = _fetch_and_submit(raw_iterator, async_builder)
+                                has_next_batch = got_raw or not next_exhausted
+                                async_skip_next = not got_raw and not next_exhausted
                     else:
                         if current_raw_batch is None:
                             train_batch = None
                         else:
                             train_batch = _build_batch_or_none(async_build_fn, current_raw_batch)
 
+                    if diagnostics is not None:
+                        diagnostics.begin(train_batch, global_step, epoch, epoch_microbatch)
                     _set_global_step(global_step)
                     if train_batch is None:
                         loss = torch.tensor(float("nan"), device=accelerator.device)
@@ -1877,6 +1984,8 @@ def main() -> None:
                         loss = forward_loss_with_aux(model, train_batch)
                     else:
                         loss = forward_loss(model, train_batch)
+                    if diagnostics is not None:
+                        diagnostics.after_forward(loss)
                     if train_batch is not None:
                         _spike_track_loss(loss, train_batch, global_step, accelerator)
                     # The skip decision MUST be identical on every rank: a rank
@@ -1917,6 +2026,8 @@ def main() -> None:
                             _VOCODER_GAN.zero_grad_all()
                     else:
                         accelerator.backward(loss)
+                        if diagnostics is not None:
+                            diagnostics.after_backward(accelerator.sync_gradients)
                         if _VOCODER_GAN is not None:
                             # Own graph on detached audio, so it can run after the
                             # main backward has freed its own.
@@ -1927,6 +2038,8 @@ def main() -> None:
                         _do_skip = False
                         if accelerator.sync_gradients and float(cfg.train.grad_clip) > 0:
                             _gn = accelerator.clip_grad_norm_(model.parameters(), float(cfg.train.grad_clip))
+                            if diagnostics is not None:
+                                diagnostics.after_clip(_gn, float(cfg.train.grad_clip))
                             _spike_track_gnorm(_gn, global_step, accelerator)
                             _do_skip = _spike_should_skip_step(_gn)
                         if _do_skip:
@@ -1954,7 +2067,11 @@ def main() -> None:
                                 # the same step to the vocoder either.
                                 _VOCODER_GAN.zero_grad_all()
                         else:
+                            if diagnostics is not None and accelerator.sync_gradients:
+                                diagnostics.before_step()
                             optimizer.step()
+                            if diagnostics is not None and accelerator.sync_gradients:
+                                diagnostics.after_step()
                             scheduler.step()
                             optimizer.zero_grad(set_to_none=True)
                             if _VOCODER_GAN is not None and accelerator.sync_gradients:
@@ -1962,6 +2079,14 @@ def main() -> None:
                                 # all-reduces the vocoder and discriminator grads.
                                 _VOCODER_GAN.clip_and_step()
 
+                if fetch_future is not None:
+                    got_raw, next_exhausted = fetch_future.result(timeout=180.0)
+                    fetch_future = None
+                    has_next_batch = got_raw or not next_exhausted
+                    async_skip_next = not got_raw and not next_exhausted
+                if validation_barrier and fetch_pool is not None:
+                    fetch_pool.shutdown(wait=True)
+                    fetch_pool = None
                 if validation_barrier and async_builder is not None:
                     # Validation workers are recreated on every pass. Tear down
                     # the producer before they fork and synchronously reuse the
@@ -2008,6 +2133,18 @@ def main() -> None:
                             "train/lr": lr,
                             "train/epoch": epoch_progress,
                         }
+                        from semantic2any.models.indextts_dit.gpt_fast.guarded_attention import COUNTERS
+                        routing = torch.tensor([[COUNTERS["fast_calls"], COUNTERS["math_calls"], COUNTERS["max_score_bound"], COUNTERS["full_math_retries"]]], device=accelerator.device, dtype=torch.float64)
+                        routing = accelerator.gather(routing)
+                        fast = routing[:, 0].sum().item()
+                        slow = routing[:, 1].sum().item()
+                        fraction = fast / max(fast + slow, 1)
+                        log_payload["attention/fast_call_fraction"] = fraction
+                        log_payload["attention/max_score_bound"] = routing[:, 2].max().item()
+                        log_payload["attention/full_math_retries"] = routing[:, 3].sum().item()
+                        if accelerator.is_main_process:
+                            print(f"[AttentionRouting] step={global_step} fast_fraction={fraction:.4f} max_bound={routing[:, 2].max().item():.6g} full_math_retries={routing[:, 3].sum().item():.0f}", flush=True)
+                        COUNTERS.update(fast_calls=0, math_calls=0, max_score_bound=0.0, full_math_retries=0)
                         # Collective (gather) — every rank must reach this.
                         log_payload.update(_aux_metrics_for_log(accelerator))
                         log_payload.update(
@@ -2025,7 +2162,12 @@ def main() -> None:
                                 prefix="s2vae_buzz", weight=vae_buzz_weight,
                             )
                         )
+                        if diagnostics is not None:
+                            log_payload.update(diagnostics.metrics())
                         accelerator.log(log_payload, step=global_step)
+
+                    if diagnostics is not None and (global_step == first_training_step or global_step % diagnostics.probe_interval == 0):
+                        diagnostics.probe(forward_loss)
 
                     if valid_loader is not None and global_step % int(cfg.train.valid_interval) == 0:
                         val_loss = validate(model, valid_loader, cfg, accelerator, feature_adapter_ref)
@@ -2046,6 +2188,7 @@ def main() -> None:
                             epoch=epoch,
                             global_step=global_step,
                             epoch_step=epoch_step,
+                            epoch_microbatch=epoch_microbatch,
                         )
                         last_saved_step = global_step
 
@@ -2074,6 +2217,8 @@ def main() -> None:
                     current_raw_batch, exhausted = _next_raw_batch(raw_iterator)
                     has_batch = _sync_has_batch(accelerator, not exhausted)
         finally:
+            if fetch_pool is not None:
+                fetch_pool.shutdown(wait=True, cancel_futures=True)
             if async_builder is not None:
                 async_builder.close()
 
@@ -2081,14 +2226,28 @@ def main() -> None:
             break
 
     if global_step > 0 and last_saved_step != global_step:
-        save_training_checkpoint(
-            accelerator=accelerator,
-            model=model,
-            cfg=cfg,
-            output_dir=output_dir,
-            epoch=int(cfg.train.epochs),
-            global_step=global_step,
-        )
+        pending_microbatches = accelerator.step % int(cfg.train.grad_accumulation)
+        if pending_microbatches:
+            # save_state does not serialize .grad. Keep the last complete
+            # resumable checkpoint; still export the current model below.
+            # Do not call this a resumable save or silently discard gradients.
+            accelerator.print(
+                f"[FinalSave] {pending_microbatches} pending accumulated microbatches; "
+                f"keeping complete checkpoint at step={last_saved_step}. "
+                "Exporting inference-only s2mel_final.pth; resume from the "
+                "last complete checkpoint, not the final weight export."
+            )
+        else:
+            save_training_checkpoint(
+                accelerator=accelerator,
+                model=model,
+                cfg=cfg,
+                output_dir=output_dir,
+                epoch=epoch,
+                global_step=global_step,
+                epoch_step=epoch_step,
+                epoch_microbatch=epoch_microbatch,
+            )
     if accelerator.is_main_process:
         unwrapped = accelerator.unwrap_model(model)
         save_compatible_checkpoint(
