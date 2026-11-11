@@ -343,3 +343,61 @@ class DotsAudioVAE(nn.Module):
         # to retain the reserve buffer needed for a gradient to the input.
         self.vocoder.dec_mi_layer.train(True)
         return self._decode_impl(latent, normalized=normalized)
+
+
+class LatentStreamDecoder:
+    """Inference decoder that keeps left context and withholds the lookahead.
+
+    AudioVAE is not trained. Each push re-decodes the latents seen so far, emits
+    only the frames whose right context is complete, and releases the withheld
+    tail when ``flush`` is set. The default lookahead is the checkpoint value,
+    which is 2 frames for the released dots.tts vocoder.
+    """
+
+    def __init__(self, vae: DotsAudioVAE, lookahead_frames: int | None = None) -> None:
+        if lookahead_frames is None:
+            lookahead_frames = int(getattr(vae.vocoder, "decoder_lookahead", 2))
+        if int(lookahead_frames) < 0:
+            raise ValueError("decoder lookahead cannot be negative")
+        self.vae = vae
+        self.lookahead_frames = int(lookahead_frames)
+        self._latents: torch.Tensor | None = None
+        self._emitted_frames = 0
+
+    def push(self, latent: torch.Tensor, *, flush: bool = False) -> torch.Tensor:
+        latent = self._as_bct(latent)
+        if self._latents is None:
+            self._latents = latent
+        else:
+            if latent.size(0) != self._latents.size(0) or latent.size(1) != self._latents.size(1):
+                raise ValueError("streaming latent batch and channel must stay fixed")
+            self._latents = torch.cat((self._latents, latent), dim=-1)
+        seen = int(self._latents.size(-1))
+        stable = seen if flush else max(0, seen - self.lookahead_frames)
+        if stable <= self._emitted_frames:
+            return self._latents.new_zeros(self._latents.size(0), 1, 0)
+        audio = self.vae.decode(self._latents)
+        hop = self._samples_per_frame(audio, seen)
+        start = self._emitted_frames * hop
+        end = stable * hop
+        self._emitted_frames = stable
+        return audio[..., start:end]
+
+    def _as_bct(self, latent: torch.Tensor) -> torch.Tensor:
+        if latent.ndim != 3:
+            raise ValueError(f"latent must be [B, C, T], got {tuple(latent.shape)}")
+        if latent.size(1) == self.vae.latent_dim:
+            return latent
+        if latent.size(-1) == self.vae.latent_dim:
+            return latent.transpose(1, 2)
+        raise ValueError(
+            f"latent channel count must be {self.vae.latent_dim}, got {tuple(latent.shape)}"
+        )
+
+    @staticmethod
+    def _samples_per_frame(audio: torch.Tensor, frames: int) -> int:
+        if frames <= 0 or audio.size(-1) % frames != 0:
+            raise ValueError(
+                f"decoded audio length {audio.size(-1)} is not divisible by {frames} latent frames"
+            )
+        return int(audio.size(-1) // frames)

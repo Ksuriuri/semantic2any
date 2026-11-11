@@ -13,6 +13,7 @@ from semantic2any.defaults import DEFAULT_MEL_CHANNELS
 from semantic2any.models.common import sequence_mask
 from semantic2any.models.indextts_dit.gpt_fast.model import ModelArgs, Transformer
 from semantic2any.models.indextts_dit.wavenet import WN
+from semantic2any.models.stream_layout import stream_block_mask
 
 
 def _get(obj, name: str, default=None):
@@ -80,6 +81,11 @@ class DiTEstimator(nn.Module):
         self.final_layer_type = str(_get(dit_cfg, "final_layer_type", "wavenet"))
         self.class_dropout_prob = float(_get(dit_cfg, "class_dropout_prob", 0.0))
         self.is_causal = bool(_get(dit_cfg, "is_causal", False))
+        self.streaming = bool(_get(args, "streaming", False))
+        if self.streaming and self.is_causal:
+            raise ValueError("streaming uses a block mask; leave DiT.is_causal false")
+        if self.streaming and (self.time_as_token or self.style_as_token):
+            raise ValueError("streaming does not prepend time or style tokens")
         self.long_skip_connection = bool(_get(dit_cfg, "long_skip_connection", True))
         if self.block_size <= 0:
             raise ValueError("DiT.block_size must be positive")
@@ -124,7 +130,7 @@ class DiTEstimator(nn.Module):
                 n_layers=int(_get(wavenet_cfg, "num_layers", 8)),
                 gin_channels=wavenet_hidden,
                 p_dropout=float(_get(wavenet_cfg, "p_dropout", 0.0)),
-                causal=False,
+                causal=self.streaming,
             )
             self.final_layer = FinalLayer(wavenet_hidden, wavenet_hidden)
             self.res_projection = nn.Linear(self.hidden_dim, wavenet_hidden)
@@ -165,8 +171,9 @@ class DiTEstimator(nn.Module):
         cond: Tensor,
         prompt_lens: Tensor | None = None,
         drop_style: bool = False,
+        stream_history_lens: Tensor | None = None,
+        stream_chunk_lens: Tensor | None = None,
     ) -> Tensor:
-        del prompt_lens
         batch, _, frames = x.shape
         if frames > self.block_size:
             raise ValueError(
@@ -193,7 +200,13 @@ class DiTEstimator(nn.Module):
             parts.append(style.unsqueeze(1).expand(-1, frames, -1))
         x_in = torch.cat(parts, dim=-1)
         if class_dropout:
-            x_in[..., self.in_channels :] = 0
+            if self.streaming:
+                # Drop the semantic condition only. The reference prompt stays,
+                # and history is not stored in that prompt.
+                cond_start = self.in_channels * 2
+                x_in[..., cond_start : cond_start + self.hidden_dim] = 0
+            else:
+                x_in[..., self.in_channels :] = 0
         x_in = self.cond_x_merge_linear(x_in)
 
         token_count = frames
@@ -212,7 +225,13 @@ class DiTEstimator(nn.Module):
         x_mask = sequence_mask(x_lens + int(self.style_as_token) + int(self.time_as_token)).unsqueeze(1)
         input_pos = self.input_pos[:token_count]
         attention_mask = None
-        if not self.is_causal:
+        if self.streaming:
+            if prompt_lens is None or stream_history_lens is None or stream_chunk_lens is None:
+                raise ValueError("streaming DiT requires prompt, history, and chunk lengths")
+            attention_mask = stream_block_mask(
+                prompt_lens, stream_history_lens, stream_chunk_lens, token_count
+            )
+        elif not self.is_causal:
             attention_mask = x_mask[:, None, :].expand(-1, 1, token_count, -1)
         x_res = self.transformer(x_in, time_condition.unsqueeze(1), input_pos, attention_mask)
         if self.time_as_token:

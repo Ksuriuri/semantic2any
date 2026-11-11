@@ -1507,6 +1507,12 @@ def main() -> None:
             resume_epoch_step = args.resume_epoch_step
         if accelerator.is_main_process:
             print(f"[Resume] Loaded compatible checkpoint {resume_path} at step={global_step}")
+        if bool(_get(cfg.train, "restart_run", False)):
+            start_epoch = 0
+            global_step = 0
+            resume_epoch_step = 0
+            if accelerator.is_main_process:
+                print("[Resume] restart_run: loaded weights only; step and optimizer start fresh")
 
     _fresh_lr = bool(_get(cfg.train, "fresh_lr_schedule", False))
     _sched_src = cfg
@@ -1599,6 +1605,15 @@ def main() -> None:
         _fresh_resume_scheduler_state = scheduler.state_dict()
         _fresh_resume_lrs = [float(group["lr"]) for group in optimizer.param_groups]
 
+    if (
+        resume_path is not None
+        and resume_path.is_dir()
+        and bool(_get(cfg.train, "restart_run", False))
+    ):
+        raise ValueError(
+            "restart_run loads a weights .pth and starts a fresh optimizer. "
+            "Do not pass an accelerator checkpoint directory."
+        )
     if resume_path is not None and resume_path.is_dir():
         start_epoch, global_step, resume_epoch_step = load_training_resume_state(resume_path)
         accelerator.load_state(str(resume_path))

@@ -8,6 +8,7 @@ from torch import nn
 from tqdm.auto import tqdm
 
 from semantic2any.defaults import DEFAULT_MEL_CHANNELS
+from semantic2any.models.stream_layout import assemble_stream_batch, plan_stream_windows
 
 
 def _get(obj, name: str, default=None):
@@ -40,6 +41,14 @@ class BASECFM(nn.Module, ABC):
             raise ValueError(f"feat_scale must be positive, got {self.feat_scale}")
         # Extra weight on the highest mel band (lowest stays 1). 0 = off.
         self.high_band_mse_extra = float(_get(args, "high_band_mse_extra", 0.0) or 0.0)
+        self.streaming = bool(_get(args, "streaming", False))
+        self.stream_chunk_frames = int(_get(args, "stream_chunk_frames", 25))
+        self.stream_history_frames = int(_get(args, "stream_history_frames", 150))
+        if self.stream_chunk_frames < 1 or self.stream_history_frames < 0:
+            raise ValueError(
+                "stream_chunk_frames must be positive and stream_history_frames cannot be negative, "
+                f"got {self.stream_chunk_frames} and {self.stream_history_frames}"
+            )
 
     @torch.inference_mode()
     def inference(
@@ -62,7 +71,8 @@ class BASECFM(nn.Module, ABC):
         if self.feat_scale != 1.0:
             prompt = prompt * self.feat_scale
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
-        x = self.solve_euler(
+        solver = self.solve_euler_stream if getattr(self, "streaming", False) else self.solve_euler
+        x = solver(
             z,
             x_lens,
             prompt,
@@ -150,6 +160,283 @@ class BASECFM(nn.Module, ABC):
 
         return x
 
+    def solve_euler_stream(
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor,
+        prompt: torch.Tensor,
+        mu: torch.Tensor,
+        style: torch.Tensor,
+        t_span: torch.Tensor,
+        inference_cfg_rate: float = 0.5,
+        show_progress: bool = False,
+        drop_style: bool = False,
+    ) -> torch.Tensor:
+        """Denoise the target in fixed chunks. Euler updates only the current chunk."""
+        if self.estimator is None:
+            raise RuntimeError("CFM estimator has not been initialized")
+        prompt_len = int(prompt.size(-1))
+        batch, channels, total = x.shape
+        if mu.size(1) != total:
+            raise ValueError(f"streaming mu has {mu.size(1)} frames but x has {total}")
+        target_lens = (x_lens - prompt_len).clamp_min(0)
+        max_target = int(target_lens.max().item()) if batch else 0
+        generated = x.new_zeros(batch, channels, max_target)
+        source = x.clone()
+        mu = mu.clone()
+        if self.zero_prompt_speech_token and prompt_len:
+            mu[:, :prompt_len] = 0
+        cursor = 0
+        while cursor < max_target:
+            remain = (target_lens - cursor).clamp_min(0)
+            chunk_lens = torch.minimum(
+                remain, torch.full_like(remain, self.stream_chunk_frames)
+            )
+            if int(chunk_lens.max().item()) == 0:
+                break
+            history_lens = torch.where(
+                chunk_lens > 0,
+                torch.full_like(chunk_lens, min(self.stream_history_frames, cursor)),
+                torch.zeros_like(chunk_lens),
+            )
+            prompt_lens = torch.full_like(chunk_lens, prompt_len)
+            assembled = prompt_lens + history_lens + chunk_lens
+            width = int(assembled.max().item())
+            flow = x.new_zeros(batch, channels, width)
+            prompt_x = x.new_zeros(batch, channels, width)
+            cond = mu.new_zeros(batch, width, mu.size(-1))
+            if prompt_len:
+                prompt_x[:, :, :prompt_len] = prompt[:, :, :prompt_len]
+                cond[:, :prompt_len] = mu[:, :prompt_len]
+            for index in range(batch):
+                hist = int(history_lens[index])
+                chunk = int(chunk_lens[index])
+                if hist:
+                    hist_src = cursor - hist
+                    flow[index, :, prompt_len : prompt_len + hist] = generated[
+                        index, :, hist_src:cursor
+                    ]
+                    cond[index, prompt_len : prompt_len + hist] = mu[
+                        index, prompt_len + hist_src : prompt_len + cursor
+                    ]
+                if chunk:
+                    chunk_src = prompt_len + cursor
+                    flow[index, :, prompt_len + hist : prompt_len + hist + chunk] = source[
+                        index, :, chunk_src : chunk_src + chunk
+                    ]
+                    cond[index, prompt_len + hist : prompt_len + hist + chunk] = mu[
+                        index, chunk_src : chunk_src + chunk
+                    ]
+            t = t_span[0]
+            iterator = range(1, len(t_span))
+            if show_progress:
+                iterator = tqdm(iterator, desc="CFM stream sampling")
+            positions = torch.arange(width, device=x.device)
+            chunk_begin = (prompt_lens + history_lens).unsqueeze(1)
+            chunk_end = chunk_begin + chunk_lens.unsqueeze(1)
+            region = (positions.unsqueeze(0) >= chunk_begin) & (positions.unsqueeze(0) < chunk_end)
+            region = region.unsqueeze(1)
+            for step in iterator:
+                dt = t_span[step] - t_span[step - 1]
+                dphi = self._stream_velocity(
+                    flow,
+                    prompt_x,
+                    assembled,
+                    t,
+                    style,
+                    cond,
+                    prompt_lens,
+                    history_lens,
+                    chunk_lens,
+                    inference_cfg_rate,
+                    drop_style,
+                )
+                flow = flow + dt * dphi * region.to(dphi.dtype)
+                t = t + dt
+            for index in range(batch):
+                chunk = int(chunk_lens[index])
+                hist = int(history_lens[index])
+                if chunk:
+                    begin = prompt_len + hist
+                    generated[index, :, cursor : cursor + chunk] = flow[
+                        index, :, begin : begin + chunk
+                    ]
+            cursor += int(chunk_lens.max().item())
+        output = x.new_zeros(batch, channels, total)
+        if max_target:
+            output[:, :, prompt_len : prompt_len + max_target] = generated
+        return output
+
+    def _stream_velocity(
+        self,
+        flow: torch.Tensor,
+        prompt_x: torch.Tensor,
+        x_lens: torch.Tensor,
+        t: torch.Tensor,
+        style: torch.Tensor,
+        mu: torch.Tensor,
+        prompt_lens: torch.Tensor,
+        history_lens: torch.Tensor,
+        chunk_lens: torch.Tensor,
+        inference_cfg_rate: float,
+        drop_style: bool,
+    ) -> torch.Tensor:
+        step = t.reshape(1).expand(flow.size(0))
+        if inference_cfg_rate > 0:
+            # Training dropout clears only the semantic condition, so the
+            # unconditional branch keeps the reference prompt and the style.
+            zeros_mu = torch.zeros_like(mu)
+            dphi, uncond = self.estimator(
+                torch.cat([flow, flow], dim=0),
+                torch.cat([prompt_x, prompt_x], dim=0),
+                torch.cat([x_lens, x_lens], dim=0),
+                step.repeat(2),
+                torch.cat([style, style], dim=0),
+                torch.cat([mu, zeros_mu], dim=0),
+                prompt_lens=torch.cat([prompt_lens, prompt_lens], dim=0),
+                stream_history_lens=torch.cat([history_lens, history_lens], dim=0),
+                stream_chunk_lens=torch.cat([chunk_lens, chunk_lens], dim=0),
+                drop_style=drop_style,
+            ).chunk(2, dim=0)
+            return (1.0 + inference_cfg_rate) * dphi - inference_cfg_rate * uncond
+        return self.estimator(
+            flow,
+            prompt_x,
+            x_lens,
+            step,
+            style,
+            mu,
+            prompt_lens=prompt_lens,
+            stream_history_lens=history_lens,
+            stream_chunk_lens=chunk_lens,
+            drop_style=drop_style,
+        )
+
+    def _reduce_flow_loss(
+        self,
+        estimator_out: torch.Tensor,
+        velocity: torch.Tensor,
+        loss_mask: torch.Tensor,
+        valid_samples: torch.Tensor,
+    ) -> torch.Tensor:
+        difference = (estimator_out - velocity).float()
+        element_loss = (
+            difference.square()
+            if isinstance(self.criterion, nn.MSELoss)
+            else difference.abs()
+        )
+        if self.high_band_mse_extra != 0.0:
+            n_mels = element_loss.size(1)
+            ramp = torch.linspace(
+                0.0, 1.0, n_mels, device=element_loss.device, dtype=element_loss.dtype
+            )
+            band_w = 1.0 + self.high_band_mse_extra * ramp.square()
+            element_loss = element_loss * band_w.view(1, n_mels, 1)
+        masked_loss = torch.where(
+            loss_mask.unsqueeze(1), element_loss, element_loss.new_zeros(())
+        )
+        denominators = (
+            loss_mask.sum(dim=1).clamp_min(1).to(element_loss.dtype)
+            * estimator_out.size(1)
+        )
+        per_sample_loss = masked_loss.sum(dim=(1, 2)) / denominators
+        return torch.where(
+            valid_samples, per_sample_loss, per_sample_loss.new_zeros(())
+        ).sum() / valid_samples.sum().clamp_min(1)
+
+    def _overlay_chunk_estimate(
+        self,
+        base: torch.Tensor,
+        estimate: torch.Tensor,
+        prompt_lens: torch.Tensor,
+        starts: torch.Tensor,
+        history_lens: torch.Tensor,
+        chunk_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        rows = []
+        for index in range(base.size(0)):
+            row = base[index].detach()
+            chunk = int(chunk_lens[index])
+            if chunk:
+                src = int(prompt_lens[index]) + int(starts[index])
+                assembled_at = int(prompt_lens[index]) + int(history_lens[index])
+                value = estimate[index, :, assembled_at : assembled_at + chunk]
+                row = torch.cat((row[:, :src], value, row[:, src + chunk :]), dim=-1)
+            rows.append(row)
+        return torch.stack(rows, dim=0)
+
+    def _forward_streaming(
+        self,
+        x1: torch.Tensor,
+        x_lens: torch.Tensor,
+        prompt_lens: torch.Tensor,
+        mu: torch.Tensor,
+        style: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.estimator is None:
+            raise RuntimeError("CFM estimator has not been initialized")
+        x1_raw = x1
+        if self.feat_scale != 1.0:
+            x1 = x1 * self.feat_scale
+        batch = x1.shape[0]
+        time = torch.rand(batch, 1, 1, device=x1.device, dtype=x1.dtype)
+        self.last_time = time.detach().reshape(-1)
+        target_lens = x_lens - prompt_lens
+        starts, history_lens, chunk_lens = plan_stream_windows(
+            prompt_lens,
+            target_lens,
+            self.stream_chunk_frames,
+            self.stream_history_frames,
+        )
+        flow, prompt, cond, velocity, noise, assembled = assemble_stream_batch(
+            x1,
+            mu,
+            prompt_lens,
+            starts,
+            history_lens,
+            chunk_lens,
+            sigma_min=self.sigma_min,
+            time=time,
+        )
+        if self.zero_prompt_speech_token:
+            ref_positions = torch.arange(cond.size(1), device=cond.device)
+            ref_mask = ref_positions.unsqueeze(0) < prompt_lens.unsqueeze(1)
+            cond = cond.masked_fill(ref_mask.unsqueeze(-1), 0)
+        estimator_out = self.estimator(
+            flow,
+            prompt,
+            assembled,
+            time.squeeze(2).squeeze(1),
+            style,
+            cond,
+            prompt_lens=prompt_lens,
+            stream_history_lens=history_lens,
+            stream_chunk_lens=chunk_lens,
+        )
+        positions = torch.arange(flow.size(-1), device=flow.device)
+        chunk_begin = prompt_lens + history_lens
+        loss_mask = (positions.unsqueeze(0) >= chunk_begin.unsqueeze(1)) & (
+            positions.unsqueeze(0) < (chunk_begin + chunk_lens).unsqueeze(1)
+        )
+        loss = self._reduce_flow_loss(estimator_out, velocity, loss_mask, chunk_lens > 0)
+        if _X1HAT_MODE == "onestep":
+            estimate = flow + (1 - time) * estimator_out
+        else:
+            estimate = estimator_out + (1 - self.sigma_min) * noise
+        if self.feat_scale != 1.0:
+            estimate = estimate / self.feat_scale
+        # Only the chunk is a real x1 estimate. Other frames stay the detached
+        # target so an auxiliary loss does not train the reference or history.
+        x1_hat = self._overlay_chunk_estimate(
+            x1_raw,
+            estimate,
+            prompt_lens,
+            starts,
+            history_lens,
+            chunk_lens,
+        )
+        return loss, x1_hat
+
     def forward(
         self,
         x1: torch.Tensor,
@@ -160,6 +447,8 @@ class BASECFM(nn.Module, ABC):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.estimator is None:
             raise RuntimeError("CFM estimator has not been initialized")
+        if getattr(self, "streaming", False):
+            return self._forward_streaming(x1, x_lens, prompt_lens, mu, style)
 
         if self.feat_scale != 1.0:
             x1 = x1 * self.feat_scale
@@ -202,39 +491,10 @@ class BASECFM(nn.Module, ABC):
             (positions.unsqueeze(0) >= prompt_lens.unsqueeze(1))
             & (positions.unsqueeze(0) < x_lens.unsqueeze(1))
         )
-        # fp32 for the residual and everything downstream: under fp16 autocast
-        # |d| > 256 already overflows on squaring (max 65504), and one inf
-        # inside the loss mask is enough to lose the whole step.
-        difference = (estimator_out - velocity).float()
-        element_loss = (
-            difference.square()
-            if isinstance(self.criterion, nn.MSELoss)
-            else difference.abs()
-        )
-        if self.high_band_mse_extra != 0.0:
-            n_mels = element_loss.size(1)
-            ramp = torch.linspace(
-                0.0, 1.0, n_mels, device=element_loss.device, dtype=element_loss.dtype
-            )
-            band_w = 1.0 + self.high_band_mse_extra * ramp.square()
-            element_loss = element_loss * band_w.view(1, n_mels, 1)
-        # Select, do not multiply: under fp16 `element_loss` can be inf in a
-        # region this mask excludes (the unconstrained prompt segment, or the
-        # padding tail), and `inf * 0 = nan` would poison the whole batch.
-        masked_loss = torch.where(
-            loss_mask.unsqueeze(1), element_loss, element_loss.new_zeros(())
-        )
-        denominators = (
-            loss_mask.sum(dim=1).clamp_min(1).to(element_loss.dtype)
-            * estimator_out.size(1)
-        )
-        per_sample_loss = masked_loss.sum(dim=(1, 2)) / denominators
+        # fp32 select, not a multiply: under fp16 an excluded prompt or padding
+        # frame can overflow, and `inf * 0 = nan` would poison the batch.
         valid_samples = x_lens > prompt_lens
-        # Same reason as above: a degenerate sample (x_lens <= prompt_lens) is
-        # excluded, so its loss must be dropped rather than multiplied by zero.
-        loss = torch.where(
-            valid_samples, per_sample_loss, per_sample_loss.new_zeros(())
-        ).sum() / valid_samples.sum().clamp_min(1)
+        loss = self._reduce_flow_loss(estimator_out, velocity, loss_mask, valid_samples)
 
         # One-step estimate of x1, consumed only by the auxiliary loss.
         #   y + (1-t) * v_pred  == x1 + sigma_min * noise  when v_pred is exact,
@@ -256,6 +516,8 @@ class CFM(BASECFM):
         super().__init__(args)
         dit_type = _get(args, "dit_type", "ZipFormer")
         if dit_type == "ZipFormer":
+            if self.streaming:
+                raise NotImplementedError("streaming is implemented for the DiT estimator only")
             from semantic2any.models.zipformer_estimator import ZipFormerEstimator
 
             self.estimator = ZipFormerEstimator(args)
