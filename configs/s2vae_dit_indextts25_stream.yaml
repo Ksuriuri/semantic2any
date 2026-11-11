@@ -200,5 +200,5 @@ train:
   no_wandb: false
   wandb_entity: haoyuanhuang22-jcxy
   wandb_project: semantic2mel
-  wandb_run_name: s2vae-dit-indextts25-disk2-2e4-5e5
-  wandb_run_id: 8f3mwciz
+  wandb_run_name: s2vae-dit-stream-c25-h150
+  wandb_run_id: nufb4a91
